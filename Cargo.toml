@@ -1,0 +1,20 @@
+[package]
+name = "hydra"
+version = "0.1.0"
+edition = "2021"
+description = "A tmux popup overseer for Claude Code agents"
+
+[[bin]]
+name = "hydra"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+dirs = "5"
+
+[profile.release]
+strip = true
+lto = true
