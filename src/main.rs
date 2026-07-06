@@ -8,6 +8,7 @@
 //!   hydra uninstall    Remove them.
 
 mod agent;
+mod alert;
 mod hook;
 mod install;
 mod state;
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
 }
 
 /// Resolve the current socket/session and collect agents. Shared by `ls` and the TUI.
-pub fn current_agents(cache: &mut worktree::WorktreeCache) -> Vec<agent::Agent> {
+pub fn current_agents(caches: &mut worktree::Caches) -> Vec<agent::Agent> {
     let socket = match tmux::current_socket() {
         Some(s) => s,
         None => return Vec::new(),
@@ -67,12 +68,12 @@ pub fn current_agents(cache: &mut worktree::WorktreeCache) -> Vec<agent::Agent> 
         .into_iter()
         .filter(|s| s.socket == socket)
         .collect();
-    agent::collect(&socket, &session, states, now_secs(), cache)
+    agent::collect(&socket, &session, states, now_secs(), caches)
 }
 
 fn list_command() -> std::io::Result<()> {
-    let mut cache = worktree::WorktreeCache::default();
-    let agents = current_agents(&mut cache);
+    let mut caches = worktree::Caches::default();
+    let agents = current_agents(&mut caches);
     if agents.is_empty() {
         println!("(no agents in this session)");
         return Ok(());

@@ -38,6 +38,94 @@ impl WorktreeCache {
     }
 }
 
+/// Re-check a worktree's uncommitted-change count at most every `DIRTY_TTL_SECS`.
+/// Running `git status` on every 250 ms refresh tick would be wasteful, and the count
+/// changes slowly relative to that.
+const DIRTY_TTL_SECS: u64 = 3;
+
+/// cwd → (checked_at, count) throttled cache of uncommitted-change counts.
+#[derive(Default)]
+pub struct DirtyCache {
+    map: HashMap<String, (u64, usize)>,
+}
+
+impl DirtyCache {
+    /// Uncommitted-change count for `cwd`, recomputed only when older than the TTL.
+    pub fn count(&mut self, cwd: &str, now: u64) -> usize {
+        if let Some((checked_at, count)) = self.map.get(cwd) {
+            if now.saturating_sub(*checked_at) < DIRTY_TTL_SECS {
+                return *count;
+            }
+        }
+        let count = git_dirty_count(cwd);
+        self.map.insert(cwd.to_string(), (now, count));
+        count
+    }
+}
+
+/// The caches the agent pipeline threads through: stable worktree identity + volatile
+/// dirty counts. Bundled so callers pass one thing.
+#[derive(Default)]
+pub struct Caches {
+    pub worktree: WorktreeCache,
+    pub dirty: DirtyCache,
+}
+
+/// The repo's default branch, resolved from `origin/HEAD`, falling back to a local
+/// `main`/`master`, then to `"main"`. Used as the base for spawned worktrees.
+pub fn default_branch(cwd: &str) -> String {
+    if let Some(head) = git(
+        cwd,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    ) {
+        if let Some(branch) = head.rsplit('/').next() {
+            if !branch.is_empty() {
+                return branch.to_string();
+            }
+        }
+    }
+    for candidate in ["main", "master"] {
+        if git(cwd, &["rev-parse", "--verify", "--quiet", candidate]).is_some() {
+            return candidate.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+/// Create a new worktree at `path` on a new branch `branch` based on `base_branch`,
+/// run from `base_cwd` (any existing worktree of the repo). Errors carry git's stderr.
+pub fn create_worktree(
+    base_cwd: &str,
+    path: &str,
+    branch: &str,
+    base_branch: &str,
+) -> std::io::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base_cwd)
+        .args(["worktree", "add", "-b", branch, path, base_branch])
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+fn git_dirty_count(cwd: &str) -> usize {
+    match git(cwd, &["status", "--porcelain"]) {
+        Some(out) => out.lines().filter(|l| !l.is_empty()).count(),
+        None => 0,
+    }
+}
+
 fn resolve_uncached(cwd: &str) -> Option<WorktreeInfo> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"])?;
     let common_dir = git(cwd, &["rev-parse", "--git-common-dir"])?;

@@ -35,13 +35,18 @@ Module map (`src/`):
 - `tmux.rs` — all `tmux` CLI wrappers, **parameterized by socket path** so nested
   servers work. `list_panes`, `current_socket/session`, `jump_to`, `send_key`,
   `send_text`. Shells out (no libtmux).
-- `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`).
+- `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`). Also
+  `DirtyCache` (throttled uncommitted-change counts), the `Caches` bundle, and
+  `default_branch`/`create_worktree` for spawning.
 - `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, filter to session,
-  staleness, sort) and `collect` (adds worktree). Also `group_by_repo`, `matches_filter`.
-- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send), vim keys, repo-grouped
-  rows, 250 ms refresh tick.
+  staleness, sort) and `collect` (adds worktree + dirty). Also `group_by_repo`,
+  `matches_filter`, `format_age`.
+- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn), vim keys, repo-grouped
+  rows with age/dirty, a `capture-pane` preview, and a 250 ms refresh tick.
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
   indicator (tmux polls it from `status-right`).
+- `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT
+  (fired from `hook.rs`); fire-and-forget, `HYDRA_ALERTS=0` disables.
 - `install.rs` — merges hooks into `~/.claude/settings.json` and a marked block into
   `~/.tmux.conf`; both idempotent and reversible.
 
@@ -71,6 +76,9 @@ Module map (`src/`):
 
 ## Roadmap notes
 
-Phases 1–4 are done. Not yet verified: the interactive popup driven by a real human
-keypress, and the cross-socket jump against a real nested tmux (its matching logic is
-unit-tested via `match_pane_by_tty`).
+Phases 1–4 plus the extra features (attention alerts, spawn `n`, triage age/`Δ`/`Tab`,
+preview pane) are done. `git status` for dirty counts is throttled via `DirtyCache`
+(`DIRTY_TTL_SECS`) so it doesn't run on every 250 ms tick — keep it that way. Not yet
+verified: the cross-socket jump against a real nested tmux (matching logic unit-tested
+via `match_pane_by_tty`). The command *forms* for send-keys, spawn (worktree +
+new-window) and status are verified against live tmux.

@@ -7,7 +7,7 @@
 
 use crate::state::{AgentState, Status};
 use crate::tmux::Pane;
-use crate::worktree::{WorktreeCache, WorktreeInfo};
+use crate::worktree::{Caches, WorktreeInfo};
 
 /// A working agent that is joined to a live pane and ready to display.
 #[derive(Debug, Clone)]
@@ -17,6 +17,8 @@ pub struct Agent {
     /// Status after applying the staleness rule (see `join_and_sort`).
     pub effective_status: Status,
     pub worktree: Option<WorktreeInfo>,
+    /// Count of uncommitted changes in the worktree (throttled; 0 if unknown/clean).
+    pub dirty: usize,
 }
 
 /// A working agent whose `WORKING` status hasn't refreshed in this many seconds is
@@ -48,6 +50,7 @@ pub fn join_and_sort(
                 pane,
                 effective_status,
                 worktree: None,
+                dirty: 0,
             })
         })
         .collect();
@@ -61,20 +64,34 @@ pub fn join_and_sort(
 }
 
 /// Full pipeline: read live panes on `socket`, join with `states`, and resolve each
-/// surviving agent's worktree via the cache.
+/// surviving agent's worktree and (throttled) uncommitted-change count.
 pub fn collect(
     socket: &str,
     session_name: &str,
     states: Vec<AgentState>,
     now: u64,
-    cache: &mut WorktreeCache,
+    caches: &mut Caches,
 ) -> Vec<Agent> {
     let panes = crate::tmux::list_panes(socket);
     let mut agents = join_and_sort(states, &panes, session_name, now, STALE_AFTER_SECS);
     for agent in &mut agents {
-        agent.worktree = cache.resolve(&agent.pane.cwd);
+        agent.worktree = caches.worktree.resolve(&agent.pane.cwd);
+        agent.dirty = caches.dirty.count(&agent.pane.cwd, now);
     }
     agents
+}
+
+/// Format an age in seconds compactly: `12s`, `4m`, `2h`, `3d`.
+pub fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
 /// A repo header plus the indices (into the agent slice passed to `group_by_repo`) of
@@ -202,7 +219,16 @@ mod tests {
                 repo_name: name.into(),
                 branch: branch.map(String::from),
             }),
+            dirty: 0,
         }
+    }
+
+    #[test]
+    fn format_age_uses_compact_units() {
+        assert_eq!(format_age(5), "5s");
+        assert_eq!(format_age(90), "1m");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(90_000), "1d");
     }
 
     #[test]

@@ -10,7 +10,8 @@
 use crate::agent::{self, Agent};
 use crate::state::Status;
 use crate::tmux;
-use crate::worktree::WorktreeCache;
+use crate::worktree::Caches;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
@@ -27,7 +28,11 @@ pub fn run() -> std::io::Result<()> {
         return Ok(());
     }
     let mut terminal = ratatui::init();
-    let result = App::default().run(&mut terminal);
+    let mut app = App {
+        show_preview: true,
+        ..App::default()
+    };
+    let result = app.run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -61,11 +66,15 @@ enum Mode {
     Filter,
     /// Editing a message to send to the selected agent.
     Send,
+    /// Editing the name/branch for a new agent to spawn.
+    Spawn,
 }
 
 #[derive(Default)]
 struct App {
-    cache: WorktreeCache,
+    caches: Caches,
+    /// Whether the preview pane is shown.
+    show_preview: bool,
     /// All agents this tick (status-sorted), before filtering.
     agents: Vec<Agent>,
     /// Agents passing the current filter — what `Row::Agent` indexes into.
@@ -78,6 +87,8 @@ struct App {
     filter: String,
     /// Buffer for the message being composed in Send mode.
     send_input: String,
+    /// Buffer for the name/branch being composed in Spawn mode.
+    spawn_input: String,
     /// Pane id of the selected agent, so selection survives reordering/rebuilds.
     selected_pane: Option<String>,
     /// Transient status line (e.g. "✓ approved win 4"); cleared on the next keypress.
@@ -115,7 +126,7 @@ impl App {
 
     /// Re-read agents from disk + tmux (the expensive step). Filtering is separate.
     fn fetch(&mut self) {
-        self.agents = crate::current_agents(&mut self.cache);
+        self.agents = crate::current_agents(&mut self.caches);
     }
 
     /// Rebuild the filtered view and the header/agent rows from `self.agents`, then
@@ -184,6 +195,10 @@ impl App {
                 self.handle_send_key(code);
                 Action::None
             }
+            Mode::Spawn => {
+                self.handle_spawn_key(code);
+                Action::None
+            }
             Mode::Normal => self.handle_normal_key(code),
         }
     }
@@ -217,6 +232,12 @@ impl App {
                 self.fetch();
                 self.rebuild_rows();
             }
+            KeyCode::Char('p') => self.show_preview = !self.show_preview,
+            KeyCode::Char('n') => {
+                self.spawn_input.clear();
+                self.mode = Mode::Spawn;
+            }
+            KeyCode::Tab => self.select_next_needs_input(),
             // Interaction (Phase 3): approve/deny a pending prompt, or compose a message.
             KeyCode::Char('a') => self.respond(Response::Approve),
             KeyCode::Char('d') => self.respond(Response::Deny),
@@ -274,6 +295,66 @@ impl App {
             KeyCode::Char(c) => self.send_input.push(c),
             _ => {}
         }
+    }
+
+    fn handle_spawn_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.spawn_input.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                let name = std::mem::take(&mut self.spawn_input);
+                self.mode = Mode::Normal;
+                let name = name.trim();
+                if !name.is_empty() {
+                    self.spawn_agent(name);
+                }
+            }
+            KeyCode::Backspace => {
+                self.spawn_input.pop();
+            }
+            KeyCode::Char(c) => self.spawn_input.push(c),
+            _ => {}
+        }
+    }
+
+    /// Create a worktree + tmux window running `claude` for a new agent. Uses an
+    /// existing agent (selected, else first) to infer the repo, socket and session —
+    /// so spawning needs at least one agent already present to anchor the project.
+    fn spawn_agent(&mut self, name: &str) {
+        let Some((socket, session, cwd)) = self.spawn_context() else {
+            self.message = Some("spawn needs an existing agent to anchor the repo".into());
+            return;
+        };
+        let path = worktree_root().join(sanitize(name));
+        let path_str = path.display().to_string();
+        let base = crate::worktree::default_branch(&cwd);
+
+        if let Err(e) = crate::worktree::create_worktree(&cwd, &path_str, name, &base) {
+            self.message = Some(format!("worktree failed: {e}"));
+            return;
+        }
+        self.message = match crate::tmux::new_window(
+            &socket,
+            &session,
+            &sanitize(name),
+            &path_str,
+            "claude",
+        ) {
+            Ok(()) => Some(format!("✓ spawned {name}")),
+            Err(e) => Some(format!("window failed: {e}")),
+        };
+    }
+
+    /// Socket/session/cwd of the agent used to anchor a spawn (selected, else first).
+    fn spawn_context(&self) -> Option<(String, String, String)> {
+        let a = self.selected_agent().or_else(|| self.view.first())?;
+        Some((
+            a.state.socket.clone(),
+            a.pane.session_name.clone(),
+            a.pane.cwd.clone(),
+        ))
     }
 
     /// Approve (accept the highlighted default) or deny (Escape) a pending prompt on the
@@ -343,6 +424,32 @@ impl App {
         self.selected_pane = self.selected_agent().map(|a| a.pane.pane_id.clone());
     }
 
+    /// Cycle selection to the next agent that needs input (wrapping). No-op with a hint
+    /// when none are waiting.
+    fn select_next_needs_input(&mut self) {
+        let waiting: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| match r {
+                Row::Agent(i) => self.view[*i].effective_status == Status::NeedsInput,
+                Row::Header { .. } => false,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if waiting.is_empty() {
+            self.message = Some("no agents need input".into());
+            return;
+        }
+        let cur = self.list_state.selected().unwrap_or(0);
+        let next = waiting
+            .iter()
+            .find(|&&r| r > cur)
+            .copied()
+            .unwrap_or(waiting[0]);
+        self.set_selected_row(Some(next));
+    }
+
     fn jump(&mut self) -> std::io::Result<()> {
         if let Some(a) = self.selected_agent() {
             tmux::jump_to(
@@ -359,6 +466,16 @@ impl App {
         let chunks =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
 
+        // Split the body into list + preview when the preview is on and there's room.
+        let preview_on = self.show_preview && self.selected_agent().is_some();
+        let (list_area, preview_area) = if preview_on {
+            let cols = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
+                .split(chunks[0]);
+            (cols[0], Some(cols[1]))
+        } else {
+            (chunks[0], None)
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .title(self.title())
@@ -371,14 +488,15 @@ impl App {
                 "  no agents match filter"
             };
             let empty = List::new([ListItem::new(Line::from(Span::raw(msg).dim()))]).block(block);
-            frame.render_widget(empty, chunks[0]);
+            frame.render_widget(empty, list_area);
         } else {
+            let now = now_secs();
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
                 .map(|row| match row {
                     Row::Header { label, count } => header_row(label, *count),
-                    Row::Agent(i) => agent_row(&self.view[*i]),
+                    Row::Agent(i) => agent_row(&self.view[*i], now),
                 })
                 .collect();
             let list = List::new(items).block(block).highlight_style(
@@ -386,10 +504,39 @@ impl App {
                     .bg(Color::Rgb(50, 50, 60))
                     .add_modifier(Modifier::BOLD),
             );
-            frame.render_stateful_widget(list, chunks[0], &mut self.list_state);
+            frame.render_stateful_widget(list, list_area, &mut self.list_state);
+        }
+
+        if let Some(area) = preview_area {
+            self.draw_preview(frame, area);
         }
 
         frame.render_widget(self.footer(), chunks[1]);
+    }
+
+    fn draw_preview(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let Some(a) = self.selected_agent() else {
+            return;
+        };
+        let title = format!(" preview · win {} ", a.pane.window_index);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_style(Style::default().add_modifier(Modifier::DIM));
+        // Show the tail of the agent's visible screen (the most recent output/prompt).
+        let content = tmux::capture_pane(&a.state.socket, &a.pane.pane_id);
+        let rows = area.height.saturating_sub(2) as usize;
+        let tail: Vec<Line> = content
+            .lines()
+            .rev()
+            .take(rows)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|l| Line::from(Span::raw(l.to_string())))
+            .collect();
+        let para = ratatui::widgets::Paragraph::new(tail).block(block);
+        frame.render_widget(para, area);
     }
 
     fn title(&self) -> String {
@@ -428,6 +575,13 @@ impl App {
                 Span::raw("  ").dim(),
                 Span::raw("⏎ send  Esc cancel").dim(),
             ]),
+            Mode::Spawn => Line::from(vec![
+                Span::styled("spawn › ", Style::default().fg(Color::Blue)),
+                Span::raw(self.spawn_input.clone()),
+                Span::styled("▊", Style::default().fg(Color::Blue)),
+                Span::raw("  ").dim(),
+                Span::raw("⏎ create worktree+claude  Esc cancel").dim(),
+            ]),
             Mode::Normal => {
                 // A transient action result takes over the footer until the next key.
                 if let Some(msg) = &self.message {
@@ -447,8 +601,14 @@ impl App {
                     Span::raw("✗  "),
                     Span::raw("i ").dim(),
                     Span::raw("send  "),
+                    Span::raw("n ").dim(),
+                    Span::raw("new  "),
+                    Span::raw("⇥ ").dim(),
+                    Span::raw("next⚠  "),
                     Span::raw("/ ").dim(),
                     Span::raw("filter  "),
+                    Span::raw("p ").dim(),
+                    Span::raw("preview  "),
                     Span::raw("q ").dim(),
                     Span::raw("quit"),
                 ];
@@ -478,7 +638,7 @@ fn header_row(label: &str, count: usize) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-fn agent_row(a: &Agent) -> ListItem<'static> {
+fn agent_row(a: &Agent, now: u64) -> ListItem<'static> {
     let (color, glyph) = match a.effective_status {
         Status::NeedsInput => (Color::Yellow, a.effective_status.glyph()),
         Status::Working => (Color::Green, a.effective_status.glyph()),
@@ -492,17 +652,71 @@ fn agent_row(a: &Agent) -> ListItem<'static> {
         .and_then(|w| w.branch.clone())
         .unwrap_or_else(|| a.pane.window_name.clone());
 
+    let age = agent::format_age(now.saturating_sub(a.state.updated_at));
     let summary = a.state.task_summary.clone().unwrap_or_default();
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled(
             glyph.to_string(),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" win {:>2}  ", a.pane.window_index)),
+        Span::styled(format!(" {age:>3} "), Style::default().fg(color)),
+        Span::raw(format!("win {:>2}  ", a.pane.window_index)),
         Span::styled(format!("{branch:<24}"), Style::default().fg(Color::Cyan)),
-        Span::raw(summary).dim(),
-    ]);
-    ListItem::new(line)
+    ];
+    if a.dirty > 0 {
+        spans.push(Span::styled(
+            format!("Δ{} ", a.dirty),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    spans.push(Span::raw(summary).dim());
+    ListItem::new(Line::from(spans))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Directory new worktrees are created under. `$HYDRA_WORKTREE_ROOT` overrides the
+/// default of `~/work/tree`.
+fn worktree_root() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("HYDRA_WORKTREE_ROOT") {
+        if !root.is_empty() {
+            return std::path::PathBuf::from(root);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("work")
+        .join("tree")
+}
+
+/// Make a name safe as a single path segment (slashes/whitespace → `-`). The branch
+/// keeps the original name; only the worktree directory leaf is sanitized.
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '/' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize;
+
+    #[test]
+    fn sanitize_makes_a_safe_path_segment() {
+        assert_eq!(sanitize("feat/pagination api"), "feat-pagination-api");
+        assert_eq!(sanitize("simple"), "simple");
+    }
 }
