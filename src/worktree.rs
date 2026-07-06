@@ -63,16 +63,33 @@ impl WorktreeCache {
 const DIRTY_TTL_SECS: u64 = 3;
 
 /// cwd → (checked_at, count) throttled cache of uncommitted-change counts.
-#[derive(Default)]
 pub struct DirtyCache {
     map: HashMap<String, (u64, usize)>,
+    ttl: u64,
+}
+
+impl Default for DirtyCache {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl: DIRTY_TTL_SECS,
+        }
+    }
 }
 
 impl DirtyCache {
+    /// Construct with an explicit TTL (from config).
+    pub fn with_ttl(ttl: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl,
+        }
+    }
+
     /// Uncommitted-change count for `cwd`, recomputed only when older than the TTL.
     pub fn count(&mut self, cwd: &str, now: u64) -> usize {
         if let Some((checked_at, count)) = self.map.get(cwd) {
-            if now.saturating_sub(*checked_at) < DIRTY_TTL_SECS {
+            if now.saturating_sub(*checked_at) < self.ttl {
                 return *count;
             }
         }
@@ -92,10 +109,21 @@ pub struct Caches {
 }
 
 impl Caches {
-    /// Drop all cached data so the next fetch re-reads git/tmux from scratch. Called
-    /// after a mutation (spawn/remove) so the change shows immediately, not after a TTL.
+    /// Build caches with config-derived TTLs.
+    pub fn new(dirty_ttl: u64, wt_list_ttl: u64) -> Self {
+        Self {
+            worktree: WorktreeCache::default(),
+            dirty: DirtyCache::with_ttl(dirty_ttl),
+            wt_list: WorktreeListCache::with_ttl(wt_list_ttl),
+        }
+    }
+
+    /// Drop all cached data so the next fetch re-reads git/tmux from scratch, while
+    /// PRESERVING the configured TTLs (a bare `Default` would reset them to the built-in
+    /// constants). Called after a mutation (spawn/remove) so the change shows immediately.
     pub fn invalidate(&mut self) {
-        *self = Caches::default();
+        let (dirty_ttl, wt_list_ttl) = (self.dirty.ttl, self.wt_list.ttl);
+        *self = Caches::new(dirty_ttl, wt_list_ttl);
     }
 }
 
@@ -269,15 +297,32 @@ fn parse_worktree_porcelain(out: &str) -> Vec<(String, Option<String>)> {
 const WORKTREE_LIST_TTL_SECS: u64 = 5;
 
 /// cwd → (checked_at, worktrees) throttled cache of `git worktree list` output.
-#[derive(Default)]
 pub struct WorktreeListCache {
     map: HashMap<String, (u64, Option<ProjectWorktrees>)>,
+    ttl: u64,
+}
+
+impl Default for WorktreeListCache {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl: WORKTREE_LIST_TTL_SECS,
+        }
+    }
 }
 
 impl WorktreeListCache {
+    /// Construct with an explicit TTL (from config).
+    pub fn with_ttl(ttl: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl,
+        }
+    }
+
     pub fn get(&mut self, cwd: &str, now: u64) -> Option<ProjectWorktrees> {
         if let Some((checked_at, value)) = self.map.get(cwd) {
-            if now.saturating_sub(*checked_at) < WORKTREE_LIST_TTL_SECS {
+            if now.saturating_sub(*checked_at) < self.ttl {
                 return value.clone();
             }
         }
@@ -370,5 +415,20 @@ mod tests {
         let out = "worktree /repo/bare\nbare\n\nworktree /wt/a\nHEAD x\nbranch refs/heads/a\n";
         let entries = parse_worktree_porcelain(out);
         assert_eq!(entries, vec![("/wt/a".to_string(), Some("a".to_string()))]);
+    }
+
+    #[test]
+    fn invalidate_preserves_configured_ttls_and_clears_data() {
+        let mut caches = Caches::new(11, 22);
+        caches.dirty.map.insert("x".into(), (0, 5));
+        caches.wt_list.map.insert("y".into(), (0, None));
+        caches.invalidate();
+        assert_eq!(caches.dirty.ttl, 11, "dirty TTL must survive invalidate");
+        assert_eq!(
+            caches.wt_list.ttl, 22,
+            "wt_list TTL must survive invalidate"
+        );
+        assert!(caches.dirty.map.is_empty(), "cached data must be cleared");
+        assert!(caches.wt_list.map.is_empty(), "cached data must be cleared");
     }
 }
