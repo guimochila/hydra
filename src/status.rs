@@ -33,50 +33,47 @@ pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
         }
     }
 
-    let indicator = format_indicator(needs, working, idle, unknown);
+    let theme = crate::config::load().theme.status;
+    let indicator = format_indicator(needs, working, idle, unknown, &theme);
     if !indicator.is_empty() {
         print!("{indicator}");
     }
     Ok(())
 }
 
-// Palette, matched to the user's dracula-lotus tmux theme. Tweak these to re-skin the
-// indicator (or point them at another theme's colours).
-const CREAM: &str = "#f2ecbc";
-const ROSE: &str = "#b35b79"; // battery segment / label
-const TEAL: &str = "#5e857a"; // working
-const PEACH: &str = "#d9a594"; // idle
-const ALERT_BG: &str = "#d7474b"; // needs-input block (the theme's own red)
-
-/// Build the status string with tmux `#[...]` styling, in the theme palette above. When
-/// any agent needs input the indicator leads with a soft-red "⚠ N NEEDS INPUT" block
-/// that stands out without shouting; otherwise it's a compact `hydra ●N ○N ?N`. Empty
-/// when there are no agents. `#[default]` at the end restores the bar's own style.
-fn format_indicator(needs: usize, working: usize, idle: usize, unknown: usize) -> String {
+/// Build the status string with tmux `#[...]` styling from the configured palette. When
+/// any agent needs input the indicator leads with an attention block (alert_fg on
+/// alert_bg); otherwise it's a compact `hydra ●N ○N ?N`. Empty when there are no agents.
+fn format_indicator(
+    needs: usize,
+    working: usize,
+    idle: usize,
+    unknown: usize,
+    theme: &crate::config::ThemeStatus,
+) -> String {
     if needs + working + idle + unknown == 0 {
         return String::new();
     }
 
     let mut out = String::new();
     if needs > 0 {
-        // Attention block: cream-on-theme-red, bold, padded — the "handle me" signal.
         out.push_str(&format!(
-            "#[fg={CREAM},bg={ALERT_BG},bold] ⚠ {needs} NEEDS INPUT #[default]"
+            "#[fg={},bg={},bold] ⚠ {needs} NEEDS INPUT #[default]",
+            theme.alert_fg, theme.alert_bg
         ));
     } else {
-        out.push_str(&format!("#[fg={ROSE},bold]hydra#[default]"));
+        out.push_str(&format!("#[fg={},bold]hydra#[default]", theme.label));
     }
 
-    // Compact counts for the non-urgent states (needs is already in the block above).
     let mut parts = Vec::new();
     if working > 0 {
-        parts.push(format!("#[fg={TEAL}]●{working}"));
+        parts.push(format!("#[fg={}]●{working}", theme.working));
     }
     if idle > 0 {
-        parts.push(format!("#[fg={PEACH}]○{idle}"));
+        parts.push(format!("#[fg={}]○{idle}", theme.idle));
     }
     if unknown > 0 {
-        parts.push(format!("#[fg={ROSE}]?{unknown}"));
+        parts.push(format!("#[fg={}]?{unknown}", theme.unknown));
     }
     if !parts.is_empty() {
         out.push(' ');
@@ -96,15 +93,16 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThemeStatus;
 
     #[test]
     fn empty_when_no_agents() {
-        assert_eq!(format_indicator(0, 0, 0, 0), "");
+        assert_eq!(format_indicator(0, 0, 0, 0, &ThemeStatus::default()), "");
     }
 
     #[test]
     fn shows_each_present_status_with_counts() {
-        let s = format_indicator(1, 2, 3, 4);
+        let s = format_indicator(1, 2, 3, 4, &ThemeStatus::default());
         assert!(s.contains("⚠ 1 NEEDS INPUT"));
         assert!(s.contains("●2"));
         assert!(s.contains("○3"));
@@ -113,7 +111,7 @@ mod tests {
 
     #[test]
     fn omits_zero_categories() {
-        let s = format_indicator(0, 2, 0, 0);
+        let s = format_indicator(0, 2, 0, 0, &ThemeStatus::default());
         assert!(s.contains("●2"));
         assert!(!s.contains('⚠'));
         assert!(!s.contains('○'));
@@ -122,26 +120,34 @@ mod tests {
 
     #[test]
     fn needs_input_shows_a_prominent_block_with_background() {
-        let s = format_indicator(2, 0, 0, 0);
+        let theme = ThemeStatus::default();
+        let s = format_indicator(2, 0, 0, 0, &theme);
         assert!(s.contains("⚠ 2 NEEDS INPUT"));
         assert!(
-            s.contains(&format!("bg={ALERT_BG}")),
-            "should use an attention background"
+            s.contains(&format!("bg={}", theme.alert_bg)),
+            "should use the configured attention background"
         );
     }
 
     #[test]
     fn stale_only_session_still_shows() {
-        // A session whose agents are all stale must not render blank.
-        let s = format_indicator(0, 0, 0, 2);
+        let s = format_indicator(0, 0, 0, 2, &ThemeStatus::default());
         assert!(s.contains("?2"));
     }
 
     #[test]
     fn needs_input_comes_first() {
-        let s = format_indicator(1, 1, 1, 1);
+        let s = format_indicator(1, 1, 1, 1, &ThemeStatus::default());
         let warn = s.find('⚠').unwrap();
         let work = s.find('●').unwrap();
         assert!(warn < work, "needs-input should render before working");
+    }
+
+    #[test]
+    fn honors_a_custom_palette() {
+        let mut theme = ThemeStatus::default();
+        theme.working = "cyan".to_string();
+        let s = format_indicator(0, 1, 0, 0, &theme);
+        assert!(s.contains("fg=cyan"));
     }
 }
