@@ -27,7 +27,7 @@ pub fn run() -> std::io::Result<()> {
         eprintln!("hydra: not running inside tmux — open me from a tmux popup");
         return Ok(());
     }
-    let config = crate::config::load();
+    let (config, config_notice) = crate::config::load_reporting();
     let colors = TuiColors::from_config(&config.theme.tui);
     let mut terminal = ratatui::init();
     let mut app = App {
@@ -38,6 +38,7 @@ pub fn run() -> std::io::Result<()> {
         ),
         colors,
         config,
+        message: config_notice,
         ..App::default()
     };
     let result = app.run(&mut terminal);

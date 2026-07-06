@@ -142,8 +142,22 @@ impl Default for Alerts {
 impl Config {
     /// Parse TOML into a `Config`, filling missing fields from defaults. On a syntax or
     /// type error, fall back to all defaults (the config must never break Hydra).
+    /// Production call sites now go through `parse_reporting`/`load_reporting` directly,
+    /// so this is only reachable from tests (hence the `allow`); kept as the simple,
+    /// notice-free entry point the tests exercise.
+    #[allow(dead_code)]
     pub fn parse(toml_str: &str) -> Config {
-        toml::from_str(toml_str).unwrap_or_default()
+        Self::parse_reporting(toml_str).0
+    }
+
+    /// Like `parse`, but also reports whether parsing FAILED. On a syntax/type error
+    /// returns `(Config::default(), true)`; valid or empty input returns `(cfg, false)`.
+    /// Lets the TUI surface a notice while the silent paths keep using `parse`/`load`.
+    pub fn parse_reporting(toml_str: &str) -> (Config, bool) {
+        match toml::from_str(toml_str) {
+            Ok(cfg) => (cfg, false),
+            Err(_) => (Config::default(), true),
+        }
     }
 
     /// Fold env-var overrides into the config so use sites never re-check env.
@@ -211,16 +225,37 @@ pub fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config").join("hydra").join("config.toml"))
 }
 
-/// Load the effective config: read the file (defaults if missing/unreadable/unparseable),
-/// then fold in env overrides. Never fails.
-pub fn load() -> Config {
-    let cfg = default_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| Config::parse(&s))
-        .unwrap_or_default();
+/// Load the effective config, also returning a human notice when the config file
+/// existed but could not be parsed (so the TUI can surface it). `None` when there was no
+/// file or it parsed cleanly. Env overrides are folded in either way.
+pub fn load_reporting() -> (Config, Option<String>) {
+    let path = default_config_path();
+    let (cfg, notice) = match path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(contents) => {
+            let (cfg, failed) = Config::parse_reporting(&contents);
+            let notice = failed.then(|| {
+                format!(
+                    "config at {} couldn't be parsed — using defaults",
+                    path.as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                )
+            });
+            (cfg, notice)
+        }
+        None => (Config::default(), None),
+    };
     let root = std::env::var("HYDRA_WORKTREE_ROOT").ok();
     let alerts = std::env::var("HYDRA_ALERTS").ok();
-    cfg.with_env_overrides(root.as_deref(), alerts.as_deref())
+    (
+        cfg.with_env_overrides(root.as_deref(), alerts.as_deref()),
+        notice,
+    )
+}
+
+/// Load the effective config (defaults if missing/unreadable/unparseable), env folded in.
+pub fn load() -> Config {
+    load_reporting().0
 }
 
 #[cfg(test)]
@@ -272,6 +307,17 @@ mod tests {
     #[test]
     fn syntax_error_falls_back_to_defaults() {
         assert_eq!(Config::parse("this is not = = toml"), Config::default());
+    }
+
+    #[test]
+    fn parse_reporting_flags_unparseable_but_not_empty_or_valid() {
+        assert_eq!(Config::parse_reporting(""), (Config::default(), false));
+        let (cfg, failed) = Config::parse_reporting("[agent]\ncommand = \"x\"\n");
+        assert_eq!(cfg.agent.command, "x");
+        assert!(!failed);
+        let (cfg, failed) = Config::parse_reporting("this = = not toml");
+        assert_eq!(cfg, Config::default());
+        assert!(failed);
     }
 
     #[test]

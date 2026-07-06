@@ -13,12 +13,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// colour directives and is empty when the session has no agents (so the status line
 /// stays clean).
 pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
+    let cfg = crate::config::load();
     let states: Vec<_> = state::read_all()
         .into_iter()
         .filter(|s| s.socket == socket)
         .collect();
     let panes = crate::tmux::list_panes(socket);
-    let agents = agent::join_and_sort(states, &panes, session, now_secs(), agent::STALE_AFTER_SECS);
+    let agents = agent::join_and_sort(
+        states,
+        &panes,
+        session,
+        now_secs(),
+        cfg.timings.stale_after_secs,
+    );
 
     let mut needs = 0;
     let mut working = 0;
@@ -33,7 +40,7 @@ pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
         }
     }
 
-    let theme = crate::config::load().theme.status;
+    let theme = cfg.theme.status;
     let indicator = format_indicator(needs, working, idle, unknown, &theme);
     if !indicator.is_empty() {
         print!("{indicator}");
