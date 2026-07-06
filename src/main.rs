@@ -9,6 +9,7 @@
 
 mod agent;
 mod alert;
+mod config;
 mod hook;
 mod install;
 mod state;
