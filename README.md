@@ -65,7 +65,7 @@ Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
 | `j` / `k`, arrows | move |
 | `gg` / `G` | first / last |
 | `Tab` | jump selection to the next agent needing input |
-| `Enter` | jump to the agent's window |
+| `Enter` | jump to the agent's window — or, on an idle worktree, start `claude` there |
 | `a` | approve a pending prompt (accept the highlighted default) |
 | `d` | deny a pending prompt (Escape) |
 | `i` | send a message to the agent |
@@ -80,6 +80,11 @@ Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
 Each row shows the agent's status glyph, how long it's been in that state (`4m`),
 its window number, branch, an uncommitted-change count (`Δ3`), and its last prompt.
 The preview pane (right) shows a live snapshot of the selected agent's screen.
+
+The list also includes the project's **existing worktrees that have no agent yet**,
+shown dimmed under their repo. Press `Enter` on one to start `claude` in it — so you
+can pick up a worktree you created earlier without leaving Hydra. `git worktree list`
+is the source, so worktrees are found wherever they live.
 
 ### Notifications
 

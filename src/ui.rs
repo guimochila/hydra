@@ -10,7 +10,7 @@
 use crate::agent::{self, Agent};
 use crate::state::Status;
 use crate::tmux;
-use crate::worktree::Caches;
+use crate::worktree::{Caches, IdleWorktree};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -40,7 +40,10 @@ pub fn run() -> std::io::Result<()> {
 enum Action {
     None,
     Quit,
+    /// Jump to the selected agent's window, then exit.
     Jump,
+    /// Start `claude` in the selected idle worktree, then exit.
+    Start,
 }
 
 /// A quick reply to a pending prompt.
@@ -51,10 +54,12 @@ enum Response {
     Deny,
 }
 
-/// A rendered line: a repo header, or an agent at `view` index.
+/// A rendered line: a repo header, a running agent (`view` index), or an idle
+/// worktree you can start an agent in (`idle_view` index).
 enum Row {
     Header { label: String, count: usize },
     Agent(usize),
+    Worktree(usize),
 }
 
 /// What keystrokes currently do.
@@ -77,8 +82,12 @@ struct App {
     show_preview: bool,
     /// All agents this tick (status-sorted), before filtering.
     agents: Vec<Agent>,
+    /// All idle worktrees this tick, before filtering.
+    idle: Vec<IdleWorktree>,
     /// Agents passing the current filter — what `Row::Agent` indexes into.
     view: Vec<Agent>,
+    /// Idle worktrees passing the current filter — what `Row::Worktree` indexes into.
+    idle_view: Vec<IdleWorktree>,
     rows: Vec<Row>,
     list_state: ListState,
     pending_g: bool,
@@ -89,8 +98,9 @@ struct App {
     send_input: String,
     /// Buffer for the name/branch being composed in Spawn mode.
     spawn_input: String,
-    /// Pane id of the selected agent, so selection survives reordering/rebuilds.
-    selected_pane: Option<String>,
+    /// Stable key of the selection (agent pane id, or `wt:<path>`) so it survives
+    /// reordering/rebuilds.
+    selected_key: Option<String>,
     /// Transient status line (e.g. "✓ approved win 4"); cleared on the next keypress.
     message: Option<String>,
 }
@@ -116,6 +126,10 @@ impl App {
                             self.jump()?;
                             break;
                         }
+                        Action::Start => {
+                            self.start_selected_worktree()?;
+                            break;
+                        }
                         Action::None => {}
                     }
                 }
@@ -124,13 +138,15 @@ impl App {
         Ok(())
     }
 
-    /// Re-read agents from disk + tmux (the expensive step). Filtering is separate.
+    /// Re-read agents + idle worktrees from disk/tmux/git (the expensive step).
     fn fetch(&mut self) {
-        self.agents = crate::current_agents(&mut self.caches);
+        let overview = crate::current_overview(&mut self.caches);
+        self.agents = overview.agents;
+        self.idle = overview.idle;
     }
 
-    /// Rebuild the filtered view and the header/agent rows from `self.agents`, then
-    /// restore the selection onto the same agent (by pane id) where possible.
+    /// Rebuild the filtered views and the header/agent/worktree rows, grouped by repo
+    /// (agents first, then idle worktrees), then restore the selection by key.
     fn rebuild_rows(&mut self) {
         self.view = self
             .agents
@@ -138,49 +154,111 @@ impl App {
             .filter(|a| agent::matches_filter(a, &self.filter))
             .cloned()
             .collect();
+        self.idle_view = self
+            .idle
+            .iter()
+            .filter(|w| agent::worktree_matches_filter(w, &self.filter))
+            .cloned()
+            .collect();
 
-        self.rows.clear();
-        for group in agent::group_by_repo(&self.view) {
-            self.rows.push(Row::Header {
-                label: group.label,
-                count: group.indices.len(),
-            });
-            for idx in group.indices {
-                self.rows.push(Row::Agent(idx));
+        self.rows = self.build_grouped_rows();
+        self.restore_selection(self.selected_key.clone());
+    }
+
+    /// Group agents and idle worktrees under repo headers. Repo order: repos holding
+    /// agents first (in the status-sorted order agents appear), then repos with only
+    /// idle worktrees. Agents with no worktree fall under a "no worktree" group.
+    fn build_grouped_rows(&self) -> Vec<Row> {
+        // Ordered list of (repo_key, label). None repo_key = the "no worktree" group.
+        let mut order: Vec<(Option<String>, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<Option<String>> = std::collections::HashSet::new();
+        for a in &self.view {
+            let key = a.worktree.as_ref().map(|w| w.repo_key.clone());
+            let label = a
+                .worktree
+                .as_ref()
+                .map(|w| w.repo_name.clone())
+                .unwrap_or_else(|| "no worktree".into());
+            if seen.insert(key.clone()) {
+                order.push((key, label));
+            }
+        }
+        for w in &self.idle_view {
+            let key = Some(w.repo_key.clone());
+            if seen.insert(key.clone()) {
+                order.push((key, w.repo_name.clone()));
             }
         }
 
-        self.select_pane(self.selected_pane.clone());
+        let mut rows = Vec::new();
+        for (key, label) in order {
+            let agent_idxs: Vec<usize> = self
+                .view
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.worktree.as_ref().map(|w| w.repo_key.clone()) == key)
+                .map(|(i, _)| i)
+                .collect();
+            let wt_idxs: Vec<usize> = self
+                .idle_view
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| Some(w.repo_key.clone()) == key)
+                .map(|(i, _)| i)
+                .collect();
+            rows.push(Row::Header {
+                label,
+                count: agent_idxs.len() + wt_idxs.len(),
+            });
+            rows.extend(agent_idxs.into_iter().map(Row::Agent));
+            rows.extend(wt_idxs.into_iter().map(Row::Worktree));
+        }
+        rows
     }
 
-    /// Point the selection at the agent with `pane`, else the first agent row.
-    fn select_pane(&mut self, pane: Option<String>) {
-        let target = pane.and_then(|p| {
-            self.rows.iter().position(|r| match r {
-                Row::Agent(i) => self
-                    .view
-                    .get(*i)
-                    .map(|a| a.pane.pane_id == p)
-                    .unwrap_or(false),
-                Row::Header { .. } => false,
-            })
-        });
-        let row = target.or_else(|| self.first_agent_row());
+    /// Point the selection at the row whose key matches, else the first selectable row.
+    fn restore_selection(&mut self, key: Option<String>) {
+        let target = key.and_then(|k| self.rows.iter().position(|r| self.row_key(r) == Some(&k)));
+        let row = target.or_else(|| self.first_selectable_row());
         self.list_state.select(row);
-        self.selected_pane = self.selected_agent().map(|a| a.pane.pane_id.clone());
+        let new_key = row
+            .and_then(|r| self.rows.get(r))
+            .and_then(|row| self.row_key(row))
+            .cloned();
+        self.selected_key = new_key;
     }
 
-    fn first_agent_row(&self) -> Option<usize> {
-        self.rows.iter().position(|r| matches!(r, Row::Agent(_)))
+    /// Stable key for a row (agent pane id, or `wt:<path>`); `None` for headers.
+    fn row_key<'a>(&'a self, row: &Row) -> Option<&'a String> {
+        match row {
+            Row::Agent(i) => self.view.get(*i).map(|a| &a.pane.pane_id),
+            Row::Worktree(i) => self.idle_view.get(*i).map(|w| &w.path),
+            Row::Header { .. } => None,
+        }
     }
 
-    fn last_agent_row(&self) -> Option<usize> {
-        self.rows.iter().rposition(|r| matches!(r, Row::Agent(_)))
+    fn is_selectable(row: &Row) -> bool {
+        matches!(row, Row::Agent(_) | Row::Worktree(_))
+    }
+
+    fn first_selectable_row(&self) -> Option<usize> {
+        self.rows.iter().position(Self::is_selectable)
+    }
+
+    fn last_selectable_row(&self) -> Option<usize> {
+        self.rows.iter().rposition(Self::is_selectable)
     }
 
     fn selected_agent(&self) -> Option<&Agent> {
         match self.list_state.selected().and_then(|r| self.rows.get(r)) {
             Some(Row::Agent(i)) => self.view.get(*i),
+            _ => None,
+        }
+    }
+
+    fn selected_worktree(&self) -> Option<&IdleWorktree> {
+        match self.list_state.selected().and_then(|r| self.rows.get(r)) {
+            Some(Row::Worktree(i)) => self.idle_view.get(*i),
             _ => None,
         }
     }
@@ -220,10 +298,10 @@ impl App {
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
-            KeyCode::Char('G') => self.set_selected_row(self.last_agent_row()),
+            KeyCode::Char('G') => self.set_selected_row(self.last_selectable_row()),
             KeyCode::Char('g') => {
                 if g_was_pending {
-                    self.set_selected_row(self.first_agent_row());
+                    self.set_selected_row(self.first_selectable_row());
                 } else {
                     self.pending_g = true;
                 }
@@ -248,6 +326,7 @@ impl App {
                 }
             }
             KeyCode::Enter if self.selected_agent().is_some() => return Action::Jump,
+            KeyCode::Enter if self.selected_worktree().is_some() => return Action::Start,
             _ => {}
         }
         Action::None
@@ -401,27 +480,30 @@ impl App {
         })
     }
 
-    /// Move selection by `delta` agent rows (skipping headers).
+    /// Move selection by `delta` selectable rows (agents + worktrees, skipping headers).
     fn move_by(&mut self, delta: isize) {
-        let agent_rows: Vec<usize> = self
+        let selectable: Vec<usize> = self
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| matches!(r, Row::Agent(_)))
+            .filter(|(_, r)| Self::is_selectable(r))
             .map(|(i, _)| i)
             .collect();
-        if agent_rows.is_empty() {
+        if selectable.is_empty() {
             return;
         }
-        let cur_row = self.list_state.selected().unwrap_or(agent_rows[0]);
-        let cur_pos = agent_rows.iter().position(|&r| r == cur_row).unwrap_or(0) as isize;
-        let next_pos = (cur_pos + delta).clamp(0, agent_rows.len() as isize - 1) as usize;
-        self.set_selected_row(Some(agent_rows[next_pos]));
+        let cur_row = self.list_state.selected().unwrap_or(selectable[0]);
+        let cur_pos = selectable.iter().position(|&r| r == cur_row).unwrap_or(0) as isize;
+        let next_pos = (cur_pos + delta).clamp(0, selectable.len() as isize - 1) as usize;
+        self.set_selected_row(Some(selectable[next_pos]));
     }
 
     fn set_selected_row(&mut self, row: Option<usize>) {
         self.list_state.select(row);
-        self.selected_pane = self.selected_agent().map(|a| a.pane.pane_id.clone());
+        self.selected_key = row
+            .and_then(|r| self.rows.get(r))
+            .and_then(|row| self.row_key(row))
+            .cloned();
     }
 
     /// Cycle selection to the next agent that needs input (wrapping). No-op with a hint
@@ -433,7 +515,7 @@ impl App {
             .enumerate()
             .filter(|(_, r)| match r {
                 Row::Agent(i) => self.view[*i].effective_status == Status::NeedsInput,
-                Row::Header { .. } => false,
+                _ => false,
             })
             .map(|(i, _)| i)
             .collect();
@@ -448,6 +530,25 @@ impl App {
             .copied()
             .unwrap_or(waiting[0]);
         self.set_selected_row(Some(next));
+    }
+
+    /// Start `claude` in the selected idle worktree: open a new window (named after the
+    /// branch) in the current session, in the worktree's directory. The new agent then
+    /// appears via its own SessionStart hook. `new-window` switches to it, so exiting
+    /// the popup lands the user on the new agent.
+    fn start_selected_worktree(&mut self) -> std::io::Result<()> {
+        let Some(wt) = self.selected_worktree() else {
+            return Ok(());
+        };
+        let name = sanitize(&wt.branch.clone().unwrap_or_else(|| wt.path.clone()));
+        let path = wt.path.clone();
+        let Some(socket) = tmux::current_socket() else {
+            return Ok(());
+        };
+        let Some(session) = tmux::current_session(&socket) else {
+            return Ok(());
+        };
+        tmux::new_window(&socket, &session, &name, &path, "claude")
     }
 
     fn jump(&mut self) -> std::io::Result<()> {
@@ -497,6 +598,7 @@ impl App {
                 .map(|row| match row {
                     Row::Header { label, count } => header_row(label, *count),
                     Row::Agent(i) => agent_row(&self.view[*i], now),
+                    Row::Worktree(i) => worktree_row(&self.idle_view[*i]),
                 })
                 .collect();
             let list = List::new(items).block(block).highlight_style(
@@ -594,7 +696,7 @@ impl App {
                     Span::raw(" j/k ").dim(),
                     Span::raw("move  "),
                     Span::raw("⏎ ").dim(),
-                    Span::raw("jump  "),
+                    Span::raw("start/jump  "),
                     Span::raw("a ").dim(),
                     Span::raw("✓  "),
                     Span::raw("d ").dim(),
@@ -634,6 +736,21 @@ fn header_row(label: &str, count: usize) -> ListItem<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" ({count})")).dim(),
+    ]);
+    ListItem::new(line)
+}
+
+/// An idle worktree with no agent: dimmed, with a "start ⏎" affordance.
+fn worktree_row(w: &IdleWorktree) -> ListItem<'static> {
+    let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
+    let line = Line::from(vec![
+        Span::styled("  ○", Style::default().fg(Color::DarkGray)),
+        Span::raw("  —   —      "),
+        Span::styled(
+            format!("{branch:<24}"),
+            Style::default().fg(Color::Cyan).dim(),
+        ),
+        Span::styled("start ⏎", Style::default().fg(Color::DarkGray)),
     ]);
     ListItem::new(line)
 }

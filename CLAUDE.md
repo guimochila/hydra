@@ -25,7 +25,8 @@ joins against live tmux. See `README.md` "How it works" for the high-level pictu
 Module map (`src/`):
 
 - `main.rs` — CLI dispatch (`hydra`, `ls`, `status`, `hook`, `install`, `uninstall`)
-  and `current_agents()`, the shared "resolve socket+session → agents" helper.
+  and `current_overview()`, the shared "resolve socket+session → agents + idle
+  worktrees" helper.
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
   (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files.
   **The only shared contract between the hook writer and the TUI reader.**
@@ -36,13 +37,18 @@ Module map (`src/`):
   servers work. `list_panes`, `current_socket/session`, `jump_to`, `send_key`,
   `send_text`. Shells out (no libtmux).
 - `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`). Also
-  `DirtyCache` (throttled uncommitted-change counts), the `Caches` bundle, and
-  `default_branch`/`create_worktree` for spawning.
+  `DirtyCache` (throttled uncommitted-change counts), `WorktreeListCache` +
+  `list_worktrees` (throttled `git worktree list` for idle-worktree discovery), the
+  `Caches` bundle, and `default_branch`/`create_worktree` for spawning. Repo identity
+  (`repo_key`) is the canonicalized common git dir (`abs_common_dir`) so main and
+  linked worktrees share one key.
 - `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, filter to session,
-  staleness, sort) and `collect` (adds worktree + dirty). Also `group_by_repo`,
-  `matches_filter`, `format_age`.
-- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn), vim keys, repo-grouped
-  rows with age/dirty, a `capture-pane` preview, and a 250 ms refresh tick.
+  staleness, sort) and `collect` (adds worktree + dirty). Also `idle_from` (project
+  worktrees − occupied), `matches_filter`/`worktree_matches_filter`, `format_age`.
+- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn), vim keys, a unified
+  repo-grouped list of both running agents (age/dirty) and idle worktrees (`Enter`
+  starts `claude`), a `capture-pane` preview, and a 250 ms refresh tick. Selection is
+  tracked by a stable key (agent pane id or worktree path).
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
   indicator (tmux polls it from `status-right`).
 - `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT
