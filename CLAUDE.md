@@ -30,6 +30,12 @@ Module map (`src/`):
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
   (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files.
   **The only shared contract between the hook writer and the TUI reader.**
+- `config.rs` — the optional TOML config contract (`~/.config/hydra/config.toml`, or
+  `$HYDRA_CONFIG`). `Config` = section structs, each with a `Default` matching a built-in
+  constant, so a missing/partial/unparseable file yields today's exact behavior. Loaded at
+  the entry points (`ui`/`status`/`hook`/`install`) and threaded as plain values into the
+  pure core — no globals. Env vars (`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) are folded into
+  `Config` at load, so use sites never re-check env.
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file. No
   tmux or git calls here.
@@ -74,6 +80,10 @@ Module map (`src/`):
 - **`install`/`uninstall` stay non-destructive.** Hooks merge alongside existing ones
   (identified by a command containing both `hydra` and `hook`); the tmux block is
   marker-delimited; status-right uses `set -ga` (append). Uninstall must fully reverse.
+- **Config is read at two points.** Everything is runtime-read (live on rebuild) EXCEPT
+  the `[popup]` key/size, which `install` bakes into `~/.tmux.conf` — changing those needs
+  a re-`install`. `Caches::invalidate()` must preserve configured TTLs (don't reset via
+  `Default`). The starter config is write-if-absent only; `uninstall` never deletes it.
 - Run `cargo fmt` before committing.
 
 ## Status state machine
