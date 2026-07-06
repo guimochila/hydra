@@ -52,6 +52,8 @@ working      = "green"
 needs_input  = "yellow"
 idle         = "gray"
 unknown      = "darkgray"
+footer_key   = "green"         # shortcut keys in the footer keybar
+footer_label = "gray"          # the descriptions next to each footer key
 
 [theme.status]                 # status-bar palette (tmux color names or "#rrggbb")
 label    = "#b35b79"
