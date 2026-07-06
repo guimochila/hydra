@@ -54,31 +54,53 @@ fn main() -> ExitCode {
     }
 }
 
-/// Resolve the current socket/session and collect agents. Shared by `ls` and the TUI.
-pub fn current_agents(caches: &mut worktree::Caches) -> Vec<agent::Agent> {
+/// The current session's running agents plus the project's idle worktrees.
+#[derive(Default)]
+pub struct Overview {
+    pub agents: Vec<agent::Agent>,
+    pub idle: Vec<worktree::IdleWorktree>,
+}
+
+/// Resolve the current socket/session, collect agents, and list the project's idle
+/// worktrees. Shared by `ls` and the TUI.
+pub fn current_overview(caches: &mut worktree::Caches) -> Overview {
     let socket = match tmux::current_socket() {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Overview::default(),
     };
     let session = match tmux::current_session(&socket) {
         Some(s) => s,
-        None => return Vec::new(),
+        None => return Overview::default(),
     };
     let states: Vec<_> = state::read_all()
         .into_iter()
         .filter(|s| s.socket == socket)
         .collect();
-    agent::collect(&socket, &session, states, now_secs(), caches)
+    let now = now_secs();
+    let agents = agent::collect(&socket, &session, states, now, caches);
+
+    // Anchor worktree listing at the popup's cwd, falling back to an agent's cwd.
+    let anchor = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .filter(|p| caches.worktree.resolve(p).is_some())
+        .or_else(|| agents.first().map(|a| a.pane.cwd.clone()));
+    let idle = anchor
+        .and_then(|cwd| caches.wt_list.get(&cwd, now))
+        .map(|project| agent::idle_from(&agents, &project))
+        .unwrap_or_default();
+
+    Overview { agents, idle }
 }
 
 fn list_command() -> std::io::Result<()> {
     let mut caches = worktree::Caches::default();
-    let agents = current_agents(&mut caches);
-    if agents.is_empty() {
-        println!("(no agents in this session)");
+    let overview = current_overview(&mut caches);
+    if overview.agents.is_empty() && overview.idle.is_empty() {
+        println!("(no agents or worktrees in this session)");
         return Ok(());
     }
-    for a in &agents {
+    for a in &overview.agents {
         let branch = a
             .worktree
             .as_ref()
@@ -86,13 +108,17 @@ fn list_command() -> std::io::Result<()> {
             .unwrap_or_else(|| "-".into());
         let summary = a.state.task_summary.clone().unwrap_or_default();
         println!(
-            "{} win {:>2}  {:<12} {:<28} {}",
+            "{} win {:>2}  {:<20} {:<28} {}",
             a.effective_status.glyph(),
             a.pane.window_index,
             branch,
             a.pane.window_name,
             summary
         );
+    }
+    for w in &overview.idle {
+        let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
+        println!("○ idle    {:<20} {}  start", branch, w.path);
     }
     Ok(())
 }

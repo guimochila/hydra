@@ -7,7 +7,7 @@
 
 use crate::state::{AgentState, Status};
 use crate::tmux::Pane;
-use crate::worktree::{Caches, WorktreeInfo};
+use crate::worktree::{Caches, IdleWorktree, ProjectWorktrees, WorktreeInfo};
 
 /// A working agent that is joined to a live pane and ready to display.
 #[derive(Debug, Clone)]
@@ -94,43 +94,42 @@ pub fn format_age(secs: u64) -> String {
     }
 }
 
-/// A repo header plus the indices (into the agent slice passed to `group_by_repo`) of
-/// the agents beneath it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoGroup {
-    pub label: String,
-    pub indices: Vec<usize>,
+/// Worktrees of the project that have no agent running in them. `project.entries` paths
+/// are already canonical; agent worktree roots are canonicalized here to match.
+pub fn idle_from(agents: &[Agent], project: &ProjectWorktrees) -> Vec<IdleWorktree> {
+    let occupied: std::collections::HashSet<String> = agents
+        .iter()
+        .filter_map(|a| a.worktree.as_ref().map(|w| canon(&w.root)))
+        .collect();
+    project
+        .entries
+        .iter()
+        .filter(|(path, _)| !occupied.contains(path))
+        .map(|(path, branch)| IdleWorktree {
+            path: path.clone(),
+            branch: branch.clone(),
+            repo_key: project.repo_key.clone(),
+            repo_name: project.repo_name.clone(),
+        })
+        .collect()
 }
 
-/// Group agents under their owning repo, preserving first-appearance order so the
-/// group holding the most urgent agent (agents arrive already status-sorted) comes
-/// first. Grouped by the repo's common git dir; labelled by the repo name. Agents with
-/// no resolvable worktree fall under a "no worktree" group.
-pub fn group_by_repo(agents: &[Agent]) -> Vec<RepoGroup> {
-    use std::collections::HashMap;
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, RepoGroup> = HashMap::new();
-    for (i, a) in agents.iter().enumerate() {
-        let (key, label) = match &a.worktree {
-            Some(w) => (w.repo_key.clone(), w.repo_name.clone()),
-            None => ("\u{0}none".to_string(), "no worktree".to_string()),
-        };
-        if !groups.contains_key(&key) {
-            order.push(key.clone());
-        }
-        groups
-            .entry(key)
-            .or_insert_with(|| RepoGroup {
-                label,
-                indices: Vec::new(),
-            })
-            .indices
-            .push(i);
+/// Filter predicate for an idle worktree (branch / repo / path).
+pub fn worktree_matches_filter(wt: &IdleWorktree, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
     }
-    order
-        .into_iter()
-        .filter_map(|k| groups.remove(&k))
-        .collect()
+    let q = query.to_lowercase();
+    let branch = wt.branch.as_deref().unwrap_or("");
+    [branch, wt.repo_name.as_str(), wt.path.as_str()]
+        .iter()
+        .any(|field| field.to_lowercase().contains(&q))
+}
+
+fn canon(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Case-insensitive substring match against branch, repo, task summary and window name.
@@ -224,53 +223,30 @@ mod tests {
     }
 
     #[test]
+    fn idle_from_excludes_worktrees_with_a_running_agent() {
+        // Agent occupies /wt/a; /wt/b and /repo/main are idle.
+        let mut occupied_agent = agent_with("%1", Status::Idle, 1, Some(("/k", "proj", Some("a"))));
+        occupied_agent.worktree.as_mut().unwrap().root = "/wt/a".into();
+        let project = ProjectWorktrees {
+            repo_key: "/k".into(),
+            repo_name: "proj".into(),
+            entries: vec![
+                ("/repo/main".into(), Some("main".into())),
+                ("/wt/a".into(), Some("a".into())),
+                ("/wt/b".into(), Some("b".into())),
+            ],
+        };
+        let idle = idle_from(&[occupied_agent], &project);
+        let paths: Vec<&str> = idle.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(paths, vec!["/repo/main", "/wt/b"]);
+    }
+
+    #[test]
     fn format_age_uses_compact_units() {
         assert_eq!(format_age(5), "5s");
         assert_eq!(format_age(90), "1m");
         assert_eq!(format_age(3600), "1h");
         assert_eq!(format_age(90_000), "1d");
-    }
-
-    #[test]
-    fn groups_agents_by_repo_common_dir() {
-        let agents = vec![
-            agent_with(
-                "%1",
-                Status::NeedsInput,
-                1,
-                Some(("/a/.git", "alpha", Some("feat"))),
-            ),
-            agent_with(
-                "%2",
-                Status::Working,
-                2,
-                Some(("/b/.git", "beta", Some("main"))),
-            ),
-            agent_with(
-                "%3",
-                Status::Idle,
-                3,
-                Some(("/a/.git", "alpha", Some("fix"))),
-            ),
-        ];
-        let groups = group_by_repo(&agents);
-        // alpha appears first (holds the NeedsInput agent) and gathers %1 and %3.
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "alpha");
-        assert_eq!(groups[0].indices, vec![0, 2]);
-        assert_eq!(groups[1].label, "beta");
-        assert_eq!(groups[1].indices, vec![1]);
-    }
-
-    #[test]
-    fn agents_without_worktree_group_separately() {
-        let agents = vec![
-            agent_with("%1", Status::Idle, 1, None),
-            agent_with("%2", Status::Idle, 2, Some(("/a/.git", "alpha", None))),
-        ];
-        let groups = group_by_repo(&agents);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "no worktree");
     }
 
     #[test]
