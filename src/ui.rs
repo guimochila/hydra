@@ -28,6 +28,7 @@ pub fn run() -> std::io::Result<()> {
         return Ok(());
     }
     let config = crate::config::load();
+    let colors = TuiColors::from_config(&config.theme.tui);
     let mut terminal = ratatui::init();
     let mut app = App {
         show_preview: true,
@@ -35,6 +36,7 @@ pub fn run() -> std::io::Result<()> {
             config.timings.dirty_ttl_secs,
             config.timings.worktree_list_ttl_secs,
         ),
+        colors,
         config,
         ..App::default()
     };
@@ -97,10 +99,46 @@ struct RemoveTarget {
     dirty: bool,
 }
 
+/// TUI colors resolved from config strings once at startup.
+struct TuiColors {
+    highlight_bg: Color,
+    working: Color,
+    needs_input: Color,
+    idle: Color,
+    unknown: Color,
+}
+
+impl Default for TuiColors {
+    fn default() -> Self {
+        Self {
+            highlight_bg: Color::Rgb(50, 50, 60),
+            working: Color::Green,
+            needs_input: Color::Yellow,
+            idle: Color::Gray,
+            unknown: Color::DarkGray,
+        }
+    }
+}
+
+impl TuiColors {
+    fn from_config(t: &crate::config::ThemeTui) -> Self {
+        use crate::config::parse_color;
+        let d = TuiColors::default();
+        Self {
+            highlight_bg: parse_color(&t.highlight_bg, d.highlight_bg),
+            working: parse_color(&t.working, d.working),
+            needs_input: parse_color(&t.needs_input, d.needs_input),
+            idle: parse_color(&t.idle, d.idle),
+            unknown: parse_color(&t.unknown, d.unknown),
+        }
+    }
+}
+
 #[derive(Default)]
 struct App {
     caches: Caches,
     config: crate::config::Config,
+    colors: TuiColors,
     /// Whether the preview pane is shown.
     show_preview: bool,
     /// All agents this tick (status-sorted), before filtering.
@@ -439,7 +477,7 @@ impl App {
             self.message = Some("spawn needs an existing agent to anchor the repo".into());
             return;
         };
-        let path = worktree_root().join(sanitize(name));
+        let path = worktree_root(&self.config).join(sanitize(name));
         let path_str = path.display().to_string();
         let base = crate::worktree::default_branch(&cwd);
 
@@ -452,7 +490,7 @@ impl App {
             &session,
             &sanitize(name),
             &path_str,
-            "claude",
+            &self.config.agent.command,
         ) {
             Ok(_window_id) => Some(format!("✓ spawned {name}")),
             Err(e) => Some(format!("window failed: {e}")),
@@ -574,6 +612,7 @@ impl App {
     /// footer message and returns `false` so the popup stays open with the reason
     /// visible, rather than closing silently.
     fn start_selected_worktree(&mut self) -> bool {
+        let command = self.config.agent.command.clone();
         let Some(wt) = self.selected_worktree() else {
             self.message = Some("no worktree selected".into());
             return false;
@@ -588,7 +627,7 @@ impl App {
             self.message = Some("could not resolve the current tmux session".into());
             return false;
         };
-        match tmux::new_window(&socket, &session, &name, &path, "claude") {
+        match tmux::new_window(&socket, &session, &name, &path, &command) {
             Ok(window_id) => {
                 // Switch to the new window so closing the popup lands the user on it.
                 let _ = tmux::select_window_id(&socket, &window_id);
@@ -749,13 +788,13 @@ impl App {
                 .iter()
                 .map(|row| match row {
                     Row::Header { label, count } => header_row(label, *count),
-                    Row::Agent(i) => agent_row(&self.view[*i], now),
+                    Row::Agent(i) => agent_row(&self.view[*i], now, &self.colors),
                     Row::Worktree(i) => worktree_row(&self.idle_view[*i]),
                 })
                 .collect();
             let list = List::new(items).block(block).highlight_style(
                 Style::default()
-                    .bg(Color::Rgb(50, 50, 60))
+                    .bg(self.colors.highlight_bg)
                     .add_modifier(Modifier::BOLD),
             );
             frame.render_stateful_widget(list, list_area, &mut self.list_state);
@@ -935,12 +974,12 @@ fn worktree_row(w: &IdleWorktree) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-fn agent_row(a: &Agent, now: u64) -> ListItem<'static> {
+fn agent_row(a: &Agent, now: u64, colors: &TuiColors) -> ListItem<'static> {
     let (color, glyph) = match a.effective_status {
-        Status::NeedsInput => (Color::Yellow, a.effective_status.glyph()),
-        Status::Working => (Color::Green, a.effective_status.glyph()),
-        Status::Idle => (Color::Gray, a.effective_status.glyph()),
-        Status::Unknown => (Color::DarkGray, a.effective_status.glyph()),
+        Status::NeedsInput => (colors.needs_input, a.effective_status.glyph()),
+        Status::Working => (colors.working, a.effective_status.glyph()),
+        Status::Idle => (colors.idle, a.effective_status.glyph()),
+        Status::Unknown => (colors.unknown, a.effective_status.glyph()),
     };
 
     let branch = a
@@ -979,18 +1018,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Directory new worktrees are created under. `$HYDRA_WORKTREE_ROOT` overrides the
-/// default of `~/work/tree`.
-fn worktree_root() -> std::path::PathBuf {
-    if let Ok(root) = std::env::var("HYDRA_WORKTREE_ROOT") {
-        if !root.is_empty() {
-            return std::path::PathBuf::from(root);
-        }
+/// Directory new worktrees are created under, from config (`[agent].worktree_root`;
+/// `HYDRA_WORKTREE_ROOT` is already folded in at load). A leading `~` is expanded.
+fn worktree_root(config: &crate::config::Config) -> std::path::PathBuf {
+    expand_tilde(&config.agent.worktree_root)
+}
+
+/// Expand a leading `~` / `~/` to the home directory. Other paths pass through.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_default();
     }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join("work")
-        .join("tree")
+    if let Some(rest) = path.strip_prefix("~/") {
+        return dirs::home_dir().unwrap_or_default().join(rest);
+    }
+    std::path::PathBuf::from(path)
 }
 
 /// Canonicalize a path for comparison (resolves `..`/symlinks); input on failure.
@@ -1022,5 +1064,17 @@ mod tests {
     fn sanitize_makes_a_safe_path_segment() {
         assert_eq!(sanitize("feat/pagination api"), "feat-pagination-api");
         assert_eq!(sanitize("simple"), "simple");
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home() {
+        use super::expand_tilde;
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/work/tree"), home.join("work/tree"));
+        assert_eq!(
+            expand_tilde("/abs/path"),
+            std::path::PathBuf::from("/abs/path")
+        );
     }
 }
