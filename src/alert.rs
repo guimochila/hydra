@@ -5,6 +5,7 @@
 //! Best-effort and fire-and-forget: we spawn the notifier detached and never wait, so
 //! the hook stays fast. Firing is gated by the caller via `[alerts].enabled` (or `HYDRA_ALERTS=0`).
 
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
 /// Announce that the agent in `cwd` is waiting for input. No-op if the platform notifier
