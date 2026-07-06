@@ -23,26 +23,27 @@ pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
     let mut needs = 0;
     let mut working = 0;
     let mut idle = 0;
+    let mut unknown = 0;
     for a in &agents {
         match a.effective_status {
             Status::NeedsInput => needs += 1,
             Status::Working => working += 1,
             Status::Idle => idle += 1,
-            Status::Unknown => {}
+            Status::Unknown => unknown += 1,
         }
     }
 
-    let indicator = format_indicator(needs, working, idle);
+    let indicator = format_indicator(needs, working, idle, unknown);
     if !indicator.is_empty() {
         print!("{indicator}");
     }
     Ok(())
 }
 
-/// Build the status string. NeedsInput first (most urgent), then working, then idle.
-/// Empty when all counts are zero.
-fn format_indicator(needs: usize, working: usize, idle: usize) -> String {
-    if needs + working + idle == 0 {
+/// Build the status string. NeedsInput first (most urgent), then working, idle, and
+/// stale/unknown (`?`). Empty when there are no agents at all.
+fn format_indicator(needs: usize, working: usize, idle: usize, unknown: usize) -> String {
+    if needs + working + idle + unknown == 0 {
         return String::new();
     }
     let mut parts = Vec::new();
@@ -54,6 +55,9 @@ fn format_indicator(needs: usize, working: usize, idle: usize) -> String {
     }
     if idle > 0 {
         parts.push(format!("#[fg=colour244]○{idle}"));
+    }
+    if unknown > 0 {
+        parts.push(format!("#[fg=colour244]?{unknown}"));
     }
     format!("#[fg=colour244]hydra {}#[fg=default]", parts.join(" "))
 }
@@ -71,28 +75,37 @@ mod tests {
 
     #[test]
     fn empty_when_no_agents() {
-        assert_eq!(format_indicator(0, 0, 0), "");
+        assert_eq!(format_indicator(0, 0, 0, 0), "");
     }
 
     #[test]
     fn shows_each_present_status_with_counts() {
-        let s = format_indicator(1, 2, 3);
+        let s = format_indicator(1, 2, 3, 4);
         assert!(s.contains("⚠1"));
         assert!(s.contains("●2"));
         assert!(s.contains("○3"));
+        assert!(s.contains("?4"));
     }
 
     #[test]
     fn omits_zero_categories() {
-        let s = format_indicator(0, 2, 0);
+        let s = format_indicator(0, 2, 0, 0);
         assert!(s.contains("●2"));
         assert!(!s.contains('⚠'));
         assert!(!s.contains('○'));
+        assert!(!s.contains('?'));
+    }
+
+    #[test]
+    fn stale_only_session_still_shows() {
+        // A session whose agents are all stale must not render blank.
+        let s = format_indicator(0, 0, 0, 2);
+        assert!(s.contains("?2"));
     }
 
     #[test]
     fn needs_input_comes_first() {
-        let s = format_indicator(1, 1, 1);
+        let s = format_indicator(1, 1, 1, 1);
         let warn = s.find('⚠').unwrap();
         let work = s.find('●').unwrap();
         assert!(warn < work, "needs-input should render before working");
