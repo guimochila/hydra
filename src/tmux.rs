@@ -129,7 +129,12 @@ pub fn send_text(socket: &str, pane_id: &str, text: &str) -> std::io::Result<()>
 /// Create a new window in `session` on `socket`, named `name`, started in `cwd` running
 /// `command` (e.g. `claude`). Created **detached** (`-d`) and its window id returned, so
 /// the caller can switch to it explicitly with `select_window_id` — more reliable from
-/// inside a popup than relying on new-window's implicit switch. Errors carry stderr.
+/// inside a popup than relying on new-window's implicit switch.
+///
+/// `-a -t "<session>:"` inserts *after* the session's active window. A bare
+/// `-t "<session>"` targets that active window's index and fails with "index N in use"
+/// under `base-index` when it's occupied; `-a` appends to the next free slot instead.
+/// Errors carry stderr.
 pub fn new_window(
     socket: &str,
     session: &str,
@@ -137,14 +142,16 @@ pub fn new_window(
     cwd: &str,
     command: &str,
 ) -> std::io::Result<String> {
+    let target = format!("{session}:");
     let out = Command::new("tmux")
         .arg("-S")
         .arg(socket)
         .args([
             "new-window",
             "-d",
+            "-a",
             "-t",
-            session,
+            target.as_str(),
             "-n",
             name,
             "-c",
