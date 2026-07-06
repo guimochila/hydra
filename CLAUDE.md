@@ -39,16 +39,18 @@ Module map (`src/`):
 - `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`). Also
   `DirtyCache` (throttled uncommitted-change counts), `WorktreeListCache` +
   `list_worktrees` (throttled `git worktree list` for idle-worktree discovery), the
-  `Caches` bundle, and `default_branch`/`create_worktree` for spawning. Repo identity
+  `Caches` bundle (with `invalidate()` to force a re-read after a mutation), and
+  `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove. Repo identity
   (`repo_key`) is the canonicalized common git dir (`abs_common_dir`) so main and
   linked worktrees share one key.
 - `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, filter to session,
   staleness, sort) and `collect` (adds worktree + dirty). Also `idle_from` (project
   worktrees − occupied), `matches_filter`/`worktree_matches_filter`, `format_age`.
-- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn), vim keys, a unified
-  repo-grouped list of both running agents (age/dirty) and idle worktrees (`Enter`
-  starts `claude`), a `capture-pane` preview, and a 250 ms refresh tick. Selection is
-  tracked by a stable key (agent pane id or worktree path).
+- `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
+  unified repo-grouped list of both running agents (age/dirty) and idle worktrees
+  (`Enter` starts `claude`), `x` to remove a worktree (confirm, kills agent window
+  first, forces on dirty, keeps branch), a `capture-pane` preview, and a 250 ms refresh
+  tick. Selection is tracked by a stable key (agent pane id or worktree path).
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
   indicator (tmux polls it from `status-right`).
 - `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT

@@ -141,6 +141,13 @@ pub fn new_window(
     )
 }
 
+/// Kill a window by session + index (used to stop an agent before removing its
+/// worktree, since the running process holds the directory).
+pub fn kill_window(socket: &str, session: &str, window_index: u32) -> std::io::Result<()> {
+    let target = format!("{session}:{window_index}");
+    run(socket, &["kill-window", "-t", &target])
+}
+
 /// Capture the visible contents of `pane_id` as plain text (no escape sequences),
 /// for the preview pane. Empty string if the pane can't be read.
 pub fn capture_pane(socket: &str, pane_id: &str) -> String {
