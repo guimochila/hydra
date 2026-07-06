@@ -73,6 +73,22 @@ enum Mode {
     Send,
     /// Editing the name/branch for a new agent to spawn.
     Spawn,
+    /// Awaiting y/N confirmation of a worktree removal.
+    Confirm,
+}
+
+/// A pending worktree removal, awaiting confirmation.
+struct RemoveTarget {
+    /// Worktree path to remove.
+    path: String,
+    /// Branch label, for the prompt.
+    branch: String,
+    /// A worktree of the same repo to run git from (never `path` itself).
+    base_cwd: String,
+    /// If this worktree has a running agent, its (socket, session, window) to kill first.
+    agent: Option<(String, String, u32)>,
+    /// Whether the worktree has uncommitted changes (removal needs `--force`).
+    dirty: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +117,8 @@ struct App {
     /// Stable key of the selection (agent pane id, or `wt:<path>`) so it survives
     /// reordering/rebuilds.
     selected_key: Option<String>,
+    /// A worktree removal awaiting y/N confirmation.
+    pending_remove: Option<RemoveTarget>,
     /// Transient status line (e.g. "✓ approved win 4"); cleared on the next keypress.
     message: Option<String>,
 }
@@ -277,6 +295,10 @@ impl App {
                 self.handle_spawn_key(code);
                 Action::None
             }
+            Mode::Confirm => {
+                self.handle_confirm_key(code);
+                Action::None
+            }
             Mode::Normal => self.handle_normal_key(code),
         }
     }
@@ -316,6 +338,7 @@ impl App {
                 self.mode = Mode::Spawn;
             }
             KeyCode::Tab => self.select_next_needs_input(),
+            KeyCode::Char('x') => self.begin_remove(),
             // Interaction (Phase 3): approve/deny a pending prompt, or compose a message.
             KeyCode::Char('a') => self.respond(Response::Approve),
             KeyCode::Char('d') => self.respond(Response::Deny),
@@ -551,6 +574,108 @@ impl App {
         tmux::new_window(&socket, &session, &name, &path, "claude")
     }
 
+    /// Begin removing the selected worktree: build the target and enter confirm mode,
+    /// or show why it can't be removed.
+    fn begin_remove(&mut self) {
+        match self.remove_target() {
+            Ok(target) => {
+                self.pending_remove = Some(target);
+                self.mode = Mode::Confirm;
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// Build a `RemoveTarget` from the current selection, or an error explaining why the
+    /// selection can't be removed (main worktree, Hydra's own cwd, or not a worktree).
+    fn remove_target(&self) -> Result<RemoveTarget, String> {
+        let (path, branch, repo_key, agent, dirty) = if let Some(a) = self.selected_agent() {
+            let wt = a
+                .worktree
+                .as_ref()
+                .ok_or_else(|| "agent isn't in a git worktree".to_string())?;
+            (
+                wt.root.clone(),
+                wt.branch
+                    .clone()
+                    .unwrap_or_else(|| a.pane.window_name.clone()),
+                wt.repo_key.clone(),
+                Some((
+                    a.state.socket.clone(),
+                    a.pane.session_name.clone(),
+                    a.pane.window_index,
+                )),
+                a.dirty > 0,
+            )
+        } else if let Some(w) = self.selected_worktree() {
+            (
+                w.path.clone(),
+                w.branch.clone().unwrap_or_else(|| "(detached)".into()),
+                w.repo_key.clone(),
+                None,
+                crate::worktree::is_dirty(&w.path),
+            )
+        } else {
+            return Err("nothing selected".into());
+        };
+
+        let base_cwd = repo_key
+            .strip_suffix("/.git")
+            .unwrap_or(&repo_key)
+            .to_string();
+        let canon_path = canon(&path);
+        if canon_path == canon(&base_cwd) {
+            return Err("can't remove the main worktree".into());
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if canon_path == canon(&cwd.to_string_lossy()) {
+                return Err("can't remove the worktree Hydra is running in".into());
+            }
+        }
+        Ok(RemoveTarget {
+            path,
+            branch,
+            base_cwd,
+            agent,
+            dirty,
+        })
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.do_remove(),
+            _ => {
+                self.pending_remove = None;
+                self.mode = Mode::Normal;
+            }
+        }
+    }
+
+    /// Perform the confirmed removal: kill the agent's window (if any), then
+    /// `git worktree remove` (forcing when dirty). Branch is kept.
+    fn do_remove(&mut self) {
+        self.mode = Mode::Normal;
+        let Some(target) = self.pending_remove.take() else {
+            return;
+        };
+        if let Some((socket, session, window)) = &target.agent {
+            if let Err(e) = crate::tmux::kill_window(socket, session, *window) {
+                self.message = Some(format!("kill window failed: {e}"));
+                return;
+            }
+        }
+        match crate::worktree::remove_worktree(&target.base_cwd, &target.path, target.dirty) {
+            Ok(()) => {
+                self.message = Some(format!("✓ removed {}", target.branch));
+                self.selected_key = None;
+                self.caches.invalidate();
+                self.fetch();
+                self.rebuild_rows();
+            }
+            Err(e) => self.message = Some(format!("remove failed: {e}")),
+        }
+    }
+
     fn jump(&mut self) -> std::io::Result<()> {
         if let Some(a) = self.selected_agent() {
             tmux::jump_to(
@@ -684,6 +809,32 @@ impl App {
                 Span::raw("  ").dim(),
                 Span::raw("⏎ create worktree+claude  Esc cancel").dim(),
             ]),
+            Mode::Confirm => {
+                let mut spans = vec![Span::styled(
+                    format!(
+                        " remove worktree {}?",
+                        self.pending_remove
+                            .as_ref()
+                            .map(|t| t.branch.as_str())
+                            .unwrap_or("")
+                    ),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )];
+                if let Some(t) = &self.pending_remove {
+                    if t.agent.is_some() {
+                        spans.push(Span::raw(" kills its agent").dim());
+                    }
+                    if t.dirty {
+                        spans.push(Span::styled(
+                            " ⚠ uncommitted changes (force)",
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                }
+                spans.push(Span::raw("   "));
+                spans.push(Span::raw("y confirm  n cancel").dim());
+                Line::from(spans)
+            }
             Mode::Normal => {
                 // A transient action result takes over the footer until the next key.
                 if let Some(msg) = &self.message {
@@ -705,6 +856,8 @@ impl App {
                     Span::raw("send  "),
                     Span::raw("n ").dim(),
                     Span::raw("new  "),
+                    Span::raw("x ").dim(),
+                    Span::raw("remove  "),
                     Span::raw("⇥ ").dim(),
                     Span::raw("next⚠  "),
                     Span::raw("/ ").dim(),
@@ -811,6 +964,13 @@ fn worktree_root() -> std::path::PathBuf {
         .unwrap_or_default()
         .join("work")
         .join("tree")
+}
+
+/// Canonicalize a path for comparison (resolves `..`/symlinks); input on failure.
+fn canon(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Make a name safe as a single path segment (slashes/whitespace → `-`). The branch

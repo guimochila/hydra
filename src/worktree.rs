@@ -91,6 +91,14 @@ pub struct Caches {
     pub wt_list: WorktreeListCache,
 }
 
+impl Caches {
+    /// Drop all cached data so the next fetch re-reads git/tmux from scratch. Called
+    /// after a mutation (spawn/remove) so the change shows immediately, not after a TTL.
+    pub fn invalidate(&mut self) {
+        *self = Caches::default();
+    }
+}
+
 /// The repo's default branch, resolved from `origin/HEAD`, falling back to a local
 /// `main`/`master`, then to `"main"`. Used as the base for spawned worktrees.
 pub fn default_branch(cwd: &str) -> String {
@@ -143,6 +151,34 @@ fn git_dirty_count(cwd: &str) -> usize {
     match git(cwd, &["status", "--porcelain"]) {
         Some(out) => out.lines().filter(|l| !l.is_empty()).count(),
         None => 0,
+    }
+}
+
+/// Whether the worktree at `cwd` has uncommitted changes.
+pub fn is_dirty(cwd: &str) -> bool {
+    git_dirty_count(cwd) > 0
+}
+
+/// Remove the worktree at `path`, run from `base_cwd` (another worktree of the repo —
+/// never the one being removed). `force` maps to `--force`, required for a worktree
+/// with uncommitted changes. Branch is left intact. Errors carry git's stderr.
+pub fn remove_worktree(base_cwd: &str, path: &str, force: bool) -> std::io::Result<()> {
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base_cwd)
+        .args(&args)
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
     }
 }
 

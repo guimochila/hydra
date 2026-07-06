@@ -70,6 +70,7 @@ Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
 | `d` | deny a pending prompt (Escape) |
 | `i` | send a message to the agent |
 | `n` | spawn a new agent: worktree + tmux window running `claude` |
+| `x` | remove the selected worktree (confirm with `y`) |
 | `p` | toggle the preview pane |
 | `/` | filter (branch / repo / summary / window) |
 | `r` | refresh |
@@ -90,6 +91,13 @@ is the source, so worktrees are found wherever they live.
 
 When an agent transitions into "needs input", Hydra fires a desktop notification
 (macOS) so you don't have to watch the popup. Set `HYDRA_ALERTS=0` to disable.
+
+### Removing worktrees
+
+`x` removes the selected worktree when the work is done, after a `y/N` confirm. If the
+worktree has a running agent, its tmux window is killed first. Uncommitted changes are
+surfaced in the prompt and require confirming a forced removal. The **branch is kept**
+(`git worktree remove` only) and the main/current worktree can't be removed.
 
 ### Spawning agents
 
