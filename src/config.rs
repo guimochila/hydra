@@ -89,6 +89,10 @@ pub struct ThemeTui {
     pub needs_input: String,
     pub idle: String,
     pub unknown: String,
+    /// Shortcut keys in the footer keybar (e.g. `j/k`, `⏎`, `a`).
+    pub footer_key: String,
+    /// The descriptions next to each footer key (e.g. `move`, `start/jump`).
+    pub footer_label: String,
 }
 
 impl Default for ThemeTui {
@@ -99,6 +103,8 @@ impl Default for ThemeTui {
             needs_input: "yellow".to_string(),
             idle: "gray".to_string(),
             unknown: "darkgray".to_string(),
+            footer_key: "green".to_string(),
+            footer_label: "gray".to_string(),
         }
     }
 }
@@ -302,6 +308,18 @@ mod tests {
         assert_eq!(cfg.theme.tui.working, "cyan");
         assert_eq!(cfg.theme.tui.idle, "gray"); // untouched default
         assert!(!cfg.alerts.enabled);
+    }
+
+    #[test]
+    fn footer_colors_default_and_can_be_overridden() {
+        // Defaults match the shortcut colors shown in the README screenshot.
+        let d = ThemeTui::default();
+        assert_eq!(d.footer_key, "green");
+        assert_eq!(d.footer_label, "gray");
+
+        let cfg = Config::parse("[theme.tui]\nfooter_key = \"#e6c384\"\n");
+        assert_eq!(cfg.theme.tui.footer_key, "#e6c384");
+        assert_eq!(cfg.theme.tui.footer_label, "gray"); // untouched default
     }
 
     #[test]

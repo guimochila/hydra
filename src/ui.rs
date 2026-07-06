@@ -107,6 +107,8 @@ struct TuiColors {
     needs_input: Color,
     idle: Color,
     unknown: Color,
+    footer_key: Color,
+    footer_label: Color,
 }
 
 impl Default for TuiColors {
@@ -117,6 +119,8 @@ impl Default for TuiColors {
             needs_input: Color::Yellow,
             idle: Color::Gray,
             unknown: Color::DarkGray,
+            footer_key: Color::Green,
+            footer_label: Color::Gray,
         }
     }
 }
@@ -131,6 +135,8 @@ impl TuiColors {
             needs_input: parse_color(&t.needs_input, d.needs_input),
             idle: parse_color(&t.idle, d.idle),
             unknown: parse_color(&t.unknown, d.unknown),
+            footer_key: parse_color(&t.footer_key, d.footer_key),
+            footer_label: parse_color(&t.footer_label, d.footer_label),
         }
     }
 }
@@ -910,30 +916,40 @@ impl App {
                         Style::default().fg(Color::Yellow),
                     ));
                 }
-                let mut spans = vec![
-                    Span::raw(" j/k ").dim(),
-                    Span::raw("move  "),
-                    Span::raw("⏎ ").dim(),
-                    Span::raw("start/jump  "),
-                    Span::raw("a ").dim(),
-                    Span::raw("✓  "),
-                    Span::raw("d ").dim(),
-                    Span::raw("✗  "),
-                    Span::raw("i ").dim(),
-                    Span::raw("send  "),
-                    Span::raw("n ").dim(),
-                    Span::raw("new  "),
-                    Span::raw("x ").dim(),
-                    Span::raw("remove  "),
-                    Span::raw("⇥ ").dim(),
-                    Span::raw("next⚠  "),
-                    Span::raw("/ ").dim(),
-                    Span::raw("filter  "),
-                    Span::raw("p ").dim(),
-                    Span::raw("preview  "),
-                    Span::raw("q ").dim(),
-                    Span::raw("quit"),
+                // key/label pairs, colored from the theme (footer_key / footer_label).
+                let key = |k: &str| {
+                    Span::styled(
+                        k.to_string(),
+                        Style::default()
+                            .fg(self.colors.footer_key)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                };
+                let label = |l: &str| {
+                    Span::styled(l.to_string(), Style::default().fg(self.colors.footer_label))
+                };
+                let pairs = [
+                    ("j/k", "move"),
+                    ("⏎", "start/jump"),
+                    ("a", "✓"),
+                    ("d", "✗"),
+                    ("i", "send"),
+                    ("n", "new"),
+                    ("x", "remove"),
+                    ("⇥", "next⚠"),
+                    ("/", "filter"),
+                    ("p", "preview"),
+                    ("q", "quit"),
                 ];
+                let mut spans = vec![Span::raw(" ")];
+                for (i, (k, l)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.push(key(k));
+                    spans.push(Span::raw(" "));
+                    spans.push(label(l));
+                }
                 if !self.filter.is_empty() {
                     spans.push(Span::raw("   "));
                     spans.push(Span::styled(
@@ -1065,6 +1081,35 @@ mod tests {
     fn sanitize_makes_a_safe_path_segment() {
         assert_eq!(sanitize("feat/pagination api"), "feat-pagination-api");
         assert_eq!(sanitize("simple"), "simple");
+    }
+
+    #[test]
+    fn footer_keybar_colors_keys_and_labels_from_theme() {
+        use super::*;
+        // A distinctive, non-default palette so we know the config drove the colors.
+        let app = App {
+            colors: TuiColors {
+                footer_key: Color::Rgb(1, 2, 3),
+                footer_label: Color::Rgb(4, 5, 6),
+                ..TuiColors::default()
+            },
+            ..App::default()
+        };
+        let spans = app.footer().spans;
+        // The `j/k` shortcut is the first key: themed color + bold.
+        let key = spans
+            .iter()
+            .find(|s| s.content == "j/k")
+            .expect("j/k key span present");
+        assert_eq!(key.style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert!(key.style.add_modifier.contains(Modifier::BOLD));
+        // Its `move` label uses the label color (not bold).
+        let label = spans
+            .iter()
+            .find(|s| s.content == "move")
+            .expect("move label span present");
+        assert_eq!(label.style.fg, Some(Color::Rgb(4, 5, 6)));
+        assert!(!label.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

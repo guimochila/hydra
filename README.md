@@ -14,17 +14,10 @@ See every agent you're running — who's *working*, who *needs input*, who's *do
 
 </div>
 
-```
-┌─ Hydra · cet-services · 4 agents · ⚠ 1 ──────────────┐
-│ ▸ cet-services (3)                                   │
-│   ⚠ win  4  feat/pagination-list-apis  fix cursor…   │
-│   ● win  2  feat/auth-tokens           add refresh…  │
-│   ○ win  5  chore/deps                                │
-│ ▸ no worktree (1)                                    │
-│   ○ win  6  scratch                                  │
-│ j/k move  ⏎ jump  a ✓  d ✗  i send  / filter  q quit │
-└──────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="assets/hydra-overview.png" width="900"
+       alt="The Hydra popup: a hydra tmux session with several Claude Code agents grouped by worktree — working, needs-input, and idle statuses, uncommitted-change counts, idle worktrees, and a live preview pane.">
+</p>
 
 Hydra is a single Rust binary — no daemon, no background service. It shows every Claude
 Code agent running in your current tmux session, across all windows, with a live status,
@@ -182,6 +175,8 @@ working      = "green"
 needs_input  = "yellow"
 idle         = "gray"
 unknown      = "darkgray"
+footer_key   = "green"         # shortcut keys in the footer keybar
+footer_label = "gray"          # the descriptions next to each footer key
 
 [theme.status]                 # status-bar palette
 label    = "#b35b79"
