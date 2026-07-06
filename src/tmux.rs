@@ -126,6 +126,27 @@ pub fn send_text(socket: &str, pane_id: &str, text: &str) -> std::io::Result<()>
     run(socket, &["send-keys", "-t", pane_id, "Enter"])
 }
 
+/// Create a new window in `session` on `socket`, named `name`, started in `cwd`
+/// running `command` (e.g. `claude`). The window is appended after existing ones.
+pub fn new_window(
+    socket: &str,
+    session: &str,
+    name: &str,
+    cwd: &str,
+    command: &str,
+) -> std::io::Result<()> {
+    run(
+        socket,
+        &["new-window", "-t", session, "-n", name, "-c", cwd, command],
+    )
+}
+
+/// Capture the visible contents of `pane_id` as plain text (no escape sequences),
+/// for the preview pane. Empty string if the pane can't be read.
+pub fn capture_pane(socket: &str, pane_id: &str) -> String {
+    tmux_output(socket, &["capture-pane", "-p", "-t", pane_id]).unwrap_or_default()
+}
+
 fn tmux_output(socket: &str, args: &[&str]) -> Option<String> {
     let out = Command::new("tmux")
         .arg("-S")

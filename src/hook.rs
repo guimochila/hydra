@@ -5,7 +5,7 @@
 //! `$TMUX_PANE` from the environment, map the event to a status, and atomically write
 //! (or remove) the pane's state file. No tmux or git subprocess calls happen here.
 
-use crate::state::{self, AgentState, EventOutcome};
+use crate::state::{self, AgentState, EventOutcome, Status};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,8 @@ pub fn run(event: &str) -> std::io::Result<()> {
         EventOutcome::Remove => state::remove_state(&env.socket, &env.pane_id),
         EventOutcome::Set(status) => {
             let prev = state::read_one(&env.socket, &env.pane_id);
+            // Alert only on the transition *into* NEEDS_INPUT, not on repeats.
+            let was_needs_input = prev.as_ref().map(|p| p.status) == Some(Status::NeedsInput);
 
             let cwd = payload
                 .get("cwd")
@@ -66,6 +68,10 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 .and_then(|v| v.as_str())
                 .map(|p| truncate(p.trim(), 60))
                 .or_else(|| prev.and_then(|p| p.task_summary));
+
+            if status == Status::NeedsInput && !was_needs_input {
+                crate::alert::needs_input(&cwd);
+            }
 
             let state = AgentState {
                 socket: env.socket,

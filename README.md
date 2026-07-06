@@ -64,15 +64,34 @@ Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
 |-----|--------|
 | `j` / `k`, arrows | move |
 | `gg` / `G` | first / last |
+| `Tab` | jump selection to the next agent needing input |
 | `Enter` | jump to the agent's window |
 | `a` | approve a pending prompt (accept the highlighted default) |
 | `d` | deny a pending prompt (Escape) |
 | `i` | send a message to the agent |
+| `n` | spawn a new agent: worktree + tmux window running `claude` |
+| `p` | toggle the preview pane |
 | `/` | filter (branch / repo / summary / window) |
 | `r` | refresh |
 | `q` / `Esc` | quit (Esc clears an active filter first) |
 
 `a`/`d` only act when the selected agent is actually waiting for input.
+
+Each row shows the agent's status glyph, how long it's been in that state (`4m`),
+its window number, branch, an uncommitted-change count (`Δ3`), and its last prompt.
+The preview pane (right) shows a live snapshot of the selected agent's screen.
+
+### Notifications
+
+When an agent transitions into "needs input", Hydra fires a desktop notification
+(macOS) so you don't have to watch the popup. Set `HYDRA_ALERTS=0` to disable.
+
+### Spawning agents
+
+`n` creates a git worktree on a new branch off the repo's default branch, then opens a
+tmux window running `claude` in it. Worktrees go under `~/work/tree/<name>` by default;
+override with `HYDRA_WORKTREE_ROOT`. Spawning uses an existing agent to locate the repo
+and session, so open at least one agent first.
 
 ## Commands
 
