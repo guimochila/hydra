@@ -3,16 +3,13 @@
 //!
 //! Fired from the hook (see `hook.rs`) only on the *transition* into NEEDS_INPUT.
 //! Best-effort and fire-and-forget: we spawn the notifier detached and never wait, so
-//! the hook stays fast. Set `HYDRA_ALERTS=0` to disable.
+//! the hook stays fast. Firing is gated by the caller via `[alerts].enabled` (or `HYDRA_ALERTS=0`).
 
 use std::process::{Command, Stdio};
 
-/// Announce that the agent in `cwd` is waiting for input. No-op if alerts are disabled
-/// or the platform notifier isn't available.
+/// Announce that the agent in `cwd` is waiting for input. No-op if the platform notifier
+/// isn't available. Whether alerts fire at all is decided by the caller (config-gated).
 pub fn needs_input(cwd: &str) {
-    if std::env::var("HYDRA_ALERTS").as_deref() == Ok("0") {
-        return;
-    }
     let label = dir_label(cwd);
     notify("🐍 Hydra", &format!("{label} needs your input"));
 }
