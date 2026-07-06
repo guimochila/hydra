@@ -58,7 +58,7 @@ jobs:
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" "$bin"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.package.outputs.archive }}
           generate_release_notes: true
