@@ -24,21 +24,85 @@ const HOOK_EVENTS: &[&str] = &[
 
 const TMUX_BEGIN: &str = "# >>> hydra >>>";
 const TMUX_END: &str = "# <<< hydra <<<";
-/// prefix + this key opens the popup. `a` = "agents"; unused in the user's config.
-const POPUP_KEY: &str = "a";
+
+/// A commented starter config written by `install` when none exists. Every value equals
+/// the built-in default, so writing it changes nothing until the user edits it.
+const STARTER_CONFIG: &str = r##"# Hydra configuration. All values below are the built-in defaults; edit and save,
+# then rebuild is NOT needed for most settings (they are read at runtime). Changing the
+# [popup] key/size requires re-running `hydra install` and `tmux source-file ~/.tmux.conf`.
+
+[timings]
+stale_after_secs       = 900   # a WORKING agent silent this long shows as UNKNOWN
+refresh_ms             = 250   # popup refresh tick
+dirty_ttl_secs         = 3     # throttle for `git status` dirty counts
+worktree_list_ttl_secs = 5     # throttle for `git worktree list`
+
+[agent]
+command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
+worktree_root = "~/work/tree"  # where spawned worktrees go (HYDRA_WORKTREE_ROOT wins)
+
+[popup]                        # tmux-side — re-run `hydra install` after changing
+key    = "a"                   # prefix + this key opens the popup
+width  = "70%"
+height = "60%"
+
+[theme.tui]                    # ratatui colors: a name ("green") or "#rrggbb"
+highlight_bg = "#32323c"
+working      = "green"
+needs_input  = "yellow"
+idle         = "gray"
+unknown      = "darkgray"
+
+[theme.status]                 # status-bar palette (tmux color names or "#rrggbb")
+label    = "#b35b79"
+working  = "#5e857a"
+idle     = "#d9a594"
+alert_fg = "#f2ecbc"
+alert_bg = "#d7474b"
+unknown  = "#b35b79"
+
+[alerts]
+enabled = true                 # macOS needs-input notifications (HYDRA_ALERTS=0 disables)
+"##;
+
+/// Write the starter config at `path` only if it does not already exist. Returns whether
+/// a file was written. Creates parent dirs as needed. Never overwrites a user's config.
+pub fn write_starter_config_at(path: &std::path::Path) -> io::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, STARTER_CONFIG)?;
+    Ok(true)
+}
 
 pub fn install() -> io::Result<()> {
     let exe = current_exe_string()?;
+    let config = crate::config::load();
     install_hooks(&exe)?;
-    install_tmux_binding(&exe)?;
+    install_tmux_binding(&exe, &config.popup)?;
+
+    let wrote_config = crate::config::default_config_path()
+        .map(|p| write_starter_config_at(&p))
+        .transpose()?
+        .unwrap_or(false);
+
     println!(
         "hydra: installed.\n  \
          • Claude Code hooks → {}\n  \
          • tmux binding: prefix + {} (popup)\n  \
-         • status-line indicator appended to status-right (non-destructive)\n\n\
+         • status-line indicator appended to status-right (non-destructive)\n  \
+         • config: {}\n\n\
          Reload tmux config with:  tmux source-file ~/.tmux.conf",
         settings_path()?.display(),
-        POPUP_KEY
+        config.popup.key,
+        if wrote_config {
+            "wrote starter ~/.config/hydra/config.toml"
+        } else {
+            "existing config left untouched"
+        },
     );
     Ok(())
 }
@@ -127,7 +191,7 @@ fn group_is_hydra(group: &Value) -> bool {
 
 // ---- tmux binding (~/.tmux.conf) ------------------------------------------------
 
-fn install_tmux_binding(exe: &str) -> io::Result<()> {
+fn install_tmux_binding(exe: &str, popup: &crate::config::Popup) -> io::Result<()> {
     let path = tmux_conf_path()?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     // `set -ga status-right` APPENDS to the right of the bar (non-destructive), landing
@@ -138,10 +202,13 @@ fn install_tmux_binding(exe: &str) -> io::Result<()> {
     // $TMUX).
     let block = format!(
         "{TMUX_BEGIN}\n\
-         bind-key {POPUP_KEY} display-popup -E -w 70% -h 60% \"{exe}\"\n\
+         bind-key {key} display-popup -E -w {width} -h {height} \"{exe}\"\n\
          set -g status-right-length 200\n\
          set -ga status-right \" #(\\\"{exe}\\\" status #{{socket_path}} #{{session_name}}) \"\n\
-         {TMUX_END}\n"
+         {TMUX_END}\n",
+        key = popup.key,
+        width = popup.width,
+        height = popup.height,
     );
     let updated = replace_marked_block(&existing, &block);
     std::fs::write(&path, updated)
@@ -264,5 +331,30 @@ mod tests {
             json!({ "hooks": [ { "type": "command", "command": "node gitnexus-hook.cjs" } ] });
         assert!(group_is_hydra(&ours));
         assert!(!group_is_hydra(&theirs));
+    }
+
+    #[test]
+    fn starter_config_writes_when_absent_and_not_when_present() {
+        // Use a unique temp path so parallel test runs don't collide.
+        let mut path = std::env::temp_dir();
+        path.push(format!("hydra-test-config-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Absent → writes, returns true, and the file parses back to defaults.
+        let wrote = write_starter_config_at(&path).unwrap();
+        assert!(wrote, "should write when absent");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            crate::config::Config::parse(&contents),
+            crate::config::Config::default()
+        );
+
+        // Present → does not overwrite, returns false.
+        std::fs::write(&path, "[agent]\ncommand = \"mine\"\n").unwrap();
+        let wrote_again = write_starter_config_at(&path).unwrap();
+        assert!(!wrote_again, "should not overwrite an existing config");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("mine"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
