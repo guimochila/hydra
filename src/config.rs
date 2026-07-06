@@ -8,6 +8,7 @@
 
 use ratatui::style::Color;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default)]
@@ -144,6 +145,25 @@ impl Config {
     pub fn parse(toml_str: &str) -> Config {
         toml::from_str(toml_str).unwrap_or_default()
     }
+
+    /// Fold env-var overrides into the config so use sites never re-check env.
+    /// `HYDRA_WORKTREE_ROOT` (non-empty) overrides the worktree root; `HYDRA_ALERTS=0`
+    /// disables alerts. Pure — the actual env reads happen in `load`.
+    pub fn with_env_overrides(
+        mut self,
+        worktree_root_env: Option<&str>,
+        alerts_env: Option<&str>,
+    ) -> Config {
+        if let Some(root) = worktree_root_env {
+            if !root.is_empty() {
+                self.agent.worktree_root = root.to_string();
+            }
+        }
+        if alerts_env == Some("0") {
+            self.alerts.enabled = false;
+        }
+        self
+    }
 }
 
 /// Parse a color string into a ratatui `Color`. Accepts named colors ("green",
@@ -174,7 +194,34 @@ pub fn parse_color(s: &str, fallback: Color) -> Color {
     }
 }
 
-// env overrides and load() are added in later tasks.
+/// Resolve the config file path: `$HYDRA_CONFIG`, else `$XDG_CONFIG_HOME/hydra/…`, else
+/// `~/.config/hydra/config.toml`. Deliberately NOT `dirs::config_dir()` (that maps to
+/// `~/Library/Application Support` on macOS; we want XDG-style `~/.config`).
+pub fn default_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HYDRA_CONFIG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x).join("hydra").join("config.toml"));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".config").join("hydra").join("config.toml"))
+}
+
+/// Load the effective config: read the file (defaults if missing/unreadable/unparseable),
+/// then fold in env overrides. Never fails.
+pub fn load() -> Config {
+    let cfg = default_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| Config::parse(&s))
+        .unwrap_or_default();
+    let root = std::env::var("HYDRA_WORKTREE_ROOT").ok();
+    let alerts = std::env::var("HYDRA_ALERTS").ok();
+    cfg.with_env_overrides(root.as_deref(), alerts.as_deref())
+}
 
 #[cfg(test)]
 mod tests {
@@ -235,5 +282,21 @@ mod tests {
         // Invalid hex length and unknown name fall back.
         assert_eq!(parse_color("#fff", Color::White), Color::White);
         assert_eq!(parse_color("chartreuse", Color::Black), Color::Black);
+    }
+
+    #[test]
+    fn env_overrides_win_over_file_values() {
+        let base = Config::parse("[agent]\nworktree_root = \"/from/file\"\n");
+        // HYDRA_WORKTREE_ROOT set and non-empty overrides; HYDRA_ALERTS=0 disables.
+        let merged = base
+            .clone()
+            .with_env_overrides(Some("/from/env"), Some("0"));
+        assert_eq!(merged.agent.worktree_root, "/from/env");
+        assert!(!merged.alerts.enabled);
+
+        // Empty env root is ignored; missing alerts env leaves default (enabled).
+        let unchanged = base.with_env_overrides(Some(""), None);
+        assert_eq!(unchanged.agent.worktree_root, "/from/file");
+        assert!(unchanged.alerts.enabled);
     }
 }
