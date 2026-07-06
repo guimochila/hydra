@@ -131,10 +131,10 @@ pub fn send_text(socket: &str, pane_id: &str, text: &str) -> std::io::Result<()>
 /// the caller can switch to it explicitly with `select_window_id` — more reliable from
 /// inside a popup than relying on new-window's implicit switch.
 ///
-/// `-a -t "<session>:"` inserts *after* the session's active window. A bare
-/// `-t "<session>"` targets that active window's index and fails with "index N in use"
-/// under `base-index` when it's occupied; `-a` appends to the next free slot instead.
-/// Errors carry stderr.
+/// `-a -t "<session>:{{end}}"` inserts *after the last* window, so it appends at the very
+/// end without renumbering existing windows. (A bare `-t "<session>"` targets the active
+/// window's index and fails with "index N in use" under `base-index`; `-a` after the
+/// active window would shift everything above it.) Errors carry stderr.
 pub fn new_window(
     socket: &str,
     session: &str,
@@ -142,7 +142,7 @@ pub fn new_window(
     cwd: &str,
     command: &str,
 ) -> std::io::Result<String> {
-    let target = format!("{session}:");
+    let target = format!("{session}:{{end}}");
     let out = Command::new("tmux")
         .arg("-S")
         .arg(socket)
