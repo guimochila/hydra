@@ -71,9 +71,10 @@ pub fn collect(
     states: Vec<AgentState>,
     now: u64,
     caches: &mut Caches,
+    stale_after: u64,
 ) -> Vec<Agent> {
     let panes = crate::tmux::list_panes(socket);
-    let mut agents = join_and_sort(states, &panes, session_name, now, STALE_AFTER_SECS);
+    let mut agents = join_and_sort(states, &panes, session_name, now, stale_after);
     for agent in &mut agents {
         agent.worktree = caches.worktree.resolve(&agent.pane.cwd);
         agent.dirty = caches.dirty.count(&agent.pane.cwd, now);
