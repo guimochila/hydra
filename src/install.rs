@@ -35,7 +35,7 @@ pub fn install() -> io::Result<()> {
         "hydra: installed.\n  \
          • Claude Code hooks → {}\n  \
          • tmux binding: prefix + {} (popup)\n  \
-         • status-line indicator appended to status-right (non-destructive)\n\n\
+         • status-line indicator appended to status-left (non-destructive)\n\n\
          Reload tmux config with:  tmux source-file ~/.tmux.conf",
         settings_path()?.display(),
         POPUP_KEY
@@ -130,13 +130,17 @@ fn group_is_hydra(group: &Value) -> bool {
 fn install_tmux_binding(exe: &str) -> io::Result<()> {
     let path = tmux_conf_path()?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // `set -ga status-right` APPENDS (non-destructive) so the user's existing, richly
-    // customized status line is preserved. The command's socket/session args come from
-    // tmux format expansion, since a status-line command has no $TMUX.
+    // `set -ga status-left` APPENDS to the front of the bar (non-destructive), so the
+    // indicator sits at the very start where it's most visible. This composes cleanly on
+    // each config reload because a custom bar re-sets status-left first, resetting the
+    // base before we re-append. status-left-length is raised so it isn't truncated. The
+    // command's socket/session args come from tmux format expansion (a status-line
+    // command has no $TMUX).
     let block = format!(
         "{TMUX_BEGIN}\n\
          bind-key {POPUP_KEY} display-popup -E -w 70% -h 60% \"{exe}\"\n\
-         set -ga status-right \" #(\\\"{exe}\\\" status #{{socket_path}} #{{session_name}})\"\n\
+         set -g status-left-length 100\n\
+         set -ga status-left \"#[default] #(\\\"{exe}\\\" status #{{socket_path}} #{{session_name}}) \"\n\
          {TMUX_END}\n"
     );
     let updated = replace_marked_block(&existing, &block);
