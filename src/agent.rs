@@ -23,7 +23,10 @@ pub struct Agent {
 
 /// A working agent whose `WORKING` status hasn't refreshed in this many seconds is
 /// shown as `UNKNOWN` (likely crashed). Idle/NeedsInput agents can legitimately sit
-/// for a long time, so staleness only applies to `WORKING`.
+/// for a long time, so staleness only applies to `WORKING`. This is also
+/// `Timings::stale_after_secs`'s default; callers now go through `config::load()`, so
+/// this constant is only reachable from tests (hence the `allow`).
+#[allow(dead_code)]
 pub const STALE_AFTER_SECS: u64 = 900;
 
 /// Pure core: join `states` (already for one socket) against live `panes`, keep only

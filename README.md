@@ -69,7 +69,8 @@ exception is `[popup]` (key/size), which is baked into `~/.tmux.conf` by `instal
 changing it, re-run `hydra install` and `tmux source-file ~/.tmux.conf`.
 
 Precedence: built-in defaults → config file → environment variables
-(`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) win on top.
+(`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) win on top. A leading `~` in `worktree_root`
+(including via `HYDRA_WORKTREE_ROOT`) is expanded to the home directory.
 
 ```toml
 [timings]
@@ -87,7 +88,8 @@ key    = "a"
 width  = "70%"
 height = "60%"
 
-[theme.tui]                    # a color name ("green") or "#rrggbb"
+[theme.tui]                    # a color name ("green") or "#rrggbb"; colors the agent
+                                # rows + selection highlight — idle-worktree rows use fixed colors
 highlight_bg = "#32323c"
 working      = "green"
 needs_input  = "yellow"
