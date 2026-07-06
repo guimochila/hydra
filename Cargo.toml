@@ -3,6 +3,11 @@ name = "hydra"
 version = "0.1.0"
 edition = "2021"
 description = "A tmux popup overseer for Claude Code agents"
+license = "MIT"
+repository = "https://github.com/guimochila/hydra"
+readme = "README.md"
+keywords = ["tmux", "claude", "tui", "agents", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "hydra"

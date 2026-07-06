@@ -1,12 +1,18 @@
+<div align="center">
+
 # Hydra
 
-A tmux popup overseer for [Claude Code](https://claude.com/claude-code) agents.
+**A tmux popup overseer for [Claude Code](https://claude.com/claude-code) agents.**
 
-Hydra shows every Claude Code agent running in your current tmux session — across all
-windows — with a live status (working / needs input / done), the window it's in, and
-its git worktree. Summon it from any window with a keybinding, navigate with vim keys,
-and press Enter to jump to an agent. You can also approve/deny a pending prompt or send
-a message to an agent without leaving the popup.
+See every agent you're running — who's *working*, who *needs input*, who's *done* — and jump to any of them without leaving your keyboard.
+
+[Install](#install) · [Quick start](#quick-start) · [Usage](#usage) · [Configuration](#configuration) · [How it works](#how-it-works) · [Contributing](#contributing)
+
+[![CI](https://github.com/guimochila/hydra/actions/workflows/ci.yml/badge.svg)](https://github.com/guimochila/hydra/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org)
+
+</div>
 
 ```
 ┌─ Hydra · cet-services · 4 agents · ⚠ 1 ──────────────┐
@@ -20,43 +26,124 @@ a message to an agent without leaving the popup.
 └──────────────────────────────────────────────────────┘
 ```
 
-## How it works
+Hydra is a single Rust binary — no daemon, no background service. It shows every Claude
+Code agent running in your current tmux session, across all windows, with a live status,
+the window it lives in, and its git worktree. Summon it from anywhere with a keybinding,
+navigate with vim keys, and press `Enter` to jump. You can approve or deny a pending
+prompt, send a message, and even spawn or tear down worktree-backed agents — all without
+leaving the popup.
 
-Hydra never scrapes terminal output. Instead:
+## Features
 
-1. **Claude Code hooks push state.** `hydra install` registers hooks that run
-   `hydra hook <event>` on each lifecycle event. Each agent self-reports its tmux
-   socket, pane, cwd, and status into a per-pane JSON file in a runtime dir — keyed by
-   `$TMUX_PANE`.
-2. **tmux says where things are.** The popup joins those state files against
-   `tmux list-panes` by pane id. A dead pane's leftover file matches nothing and
-   simply disappears — no ghosts.
-3. **Git says which worktree.** Each agent's cwd resolves to a branch/repo, and agents
-   are grouped under their repo.
-
-Status comes from the hook events: `UserPromptSubmit`/`PreToolUse` → working,
-`Notification` → needs input, `Stop` → idle, `SessionEnd` → gone.
+- 👁️ **One view of every agent** — all Claude Code sessions in your tmux session, grouped
+  by git repo, with a live *working / needs-input / idle* status.
+- ⌨️ **Vim-native navigation** — `j`/`k`, `gg`/`G`, `/` to filter, `Enter` to jump to an
+  agent's window.
+- ✅ **Act without switching** — approve (`a`) or deny (`d`) a pending prompt, or send a
+  message (`i`) to any agent from the popup.
+- 🌱 **Spawn & reap worktrees** — `n` creates a git worktree on a fresh branch and starts
+  an agent in it; `x` tears a worktree down when you're done.
+- 🔔 **Attention alerts** — a desktop notification the moment an agent needs your input,
+  so you don't have to babysit the popup.
+- 📊 **Status-line indicator** — a daemon-free `⚠ N NEEDS INPUT` badge in your tmux status
+  bar, updated by polling.
+- 🪶 **No scraping, no daemon** — state is pushed by Claude Code hooks and joined against
+  live tmux; a dead pane just disappears. Nesting works because every call is
+  socket-scoped.
 
 ## Install
 
-Requires Rust and tmux.
+> **Requirements:** [Rust](https://www.rust-lang.org/tools/install) (stable) and
+> [tmux](https://github.com/tmux/tmux).
+
+### From source
 
 ```sh
+git clone https://github.com/guimochila/hydra.git
+cd hydra
 cargo build --release
 ./target/release/hydra install      # adds Claude Code hooks + a tmux popup binding
 tmux source-file ~/.tmux.conf
 ```
 
-`install` is non-destructive and reversible:
+### Prebuilt binaries
 
-- It merges its hooks into `~/.claude/settings.json` alongside any you already have
+Grab a binary for your platform from the [latest release](https://github.com/guimochila/hydra/releases/latest)
+(Linux and macOS, x86_64 and aarch64), then run `hydra install` as above.
+
+### What `install` touches (non-destructive & reversible)
+
+- Merges its hooks into `~/.claude/settings.json` **alongside** any you already have
   (a backup is written first).
-- It appends a popup binding and a status-line indicator to `~/.tmux.conf` inside a
-  marked block, using `set -ga status-right` so your existing status line is preserved.
-  The indicator sits on the right of the bar; when an agent needs input it becomes a
-  `⚠ N NEEDS INPUT` block. Colours live in `src/status.rs` (matched to a theme palette).
+- Appends a popup binding and a status-line indicator to `~/.tmux.conf` inside a
+  marker-delimited block, using `set -ga status-right` so your existing status line is
+  preserved.
 
-Remove everything with `hydra uninstall`.
+Undo everything with `hydra uninstall`.
+
+## Quick start
+
+```sh
+# 1. Start (or attach to) a tmux session and run Claude Code in a window:
+tmux new -s work
+claude
+
+# 2. From any window in that session, open Hydra:
+#    press your tmux prefix, then `a`
+```
+
+You'll see every agent in the session. Move with `j`/`k`, press `Enter` to jump to one,
+press `n` to spawn a new worktree-backed agent, and `q` to dismiss the popup.
+
+## Usage
+
+Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
+
+| Key | Action |
+|-----|--------|
+| `j` / `k`, arrows | move |
+| `gg` / `G` | first / last |
+| `Tab` | jump selection to the next agent needing input |
+| `Enter` | jump to the agent's window — or, on an idle worktree, start `claude` there |
+| `a` | approve a pending prompt (accept the highlighted default) |
+| `d` | deny a pending prompt (Escape) |
+| `i` | send a message to the agent |
+| `n` | spawn a new agent: worktree + tmux window running `claude` |
+| `x` | remove the selected worktree (confirm with `y`) |
+| `p` | toggle the preview pane |
+| `/` | filter (branch / repo / summary / window) |
+| `r` | refresh |
+| `q` / `Esc` | quit (Esc clears an active filter first) |
+
+`a`/`d` only act when the selected agent is actually waiting for input.
+
+Each row shows the agent's status glyph, how long it's been in that state (`4m`), its
+window number, branch, an uncommitted-change count (`Δ3`), and its last prompt. The
+preview pane (right) shows a live snapshot of the selected agent's screen.
+
+The list also includes the project's **existing worktrees that have no agent yet**, shown
+dimmed under their repo. Press `Enter` on one to start `claude` in it — so you can pick up
+a worktree you created earlier without leaving Hydra. `git worktree list` is the source,
+so worktrees are found wherever they live.
+
+### Notifications
+
+When an agent transitions into "needs input", Hydra fires a desktop notification (macOS)
+so you don't have to watch the popup. Set `HYDRA_ALERTS=0` to disable.
+
+### Removing worktrees
+
+`x` removes the selected worktree when the work is done, after a `y/N` confirm. If the
+worktree has a running agent, its tmux window is killed first. Uncommitted changes are
+surfaced in the prompt and require confirming a forced removal. The **branch is kept**
+(`git worktree remove` only) and the main/current worktree can't be removed.
+
+### Spawning agents
+
+`n` creates a git worktree on a new branch off the repo's default branch, then opens a
+tmux window running `claude` in it. Worktrees go under `~/work/tree/<name>` by default;
+override with `HYDRA_WORKTREE_ROOT`. Spawning uses an existing agent to locate the repo
+and session, so open at least one agent first.
 
 ## Configuration
 
@@ -108,55 +195,22 @@ unknown  = "#b35b79"
 enabled = true                 # HYDRA_ALERTS=0 also disables
 ```
 
-## Usage
+## How it works
 
-Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
+Hydra never scrapes terminal output. Instead:
 
-| Key | Action |
-|-----|--------|
-| `j` / `k`, arrows | move |
-| `gg` / `G` | first / last |
-| `Tab` | jump selection to the next agent needing input |
-| `Enter` | jump to the agent's window — or, on an idle worktree, start `claude` there |
-| `a` | approve a pending prompt (accept the highlighted default) |
-| `d` | deny a pending prompt (Escape) |
-| `i` | send a message to the agent |
-| `n` | spawn a new agent: worktree + tmux window running `claude` |
-| `x` | remove the selected worktree (confirm with `y`) |
-| `p` | toggle the preview pane |
-| `/` | filter (branch / repo / summary / window) |
-| `r` | refresh |
-| `q` / `Esc` | quit (Esc clears an active filter first) |
+1. **Claude Code hooks push state.** `hydra install` registers hooks that run
+   `hydra hook <event>` on each lifecycle event. Each agent self-reports its tmux socket,
+   pane, cwd, and status into a per-pane JSON file in a runtime dir — keyed by
+   `$TMUX_PANE`.
+2. **tmux says where things are.** The popup joins those state files against
+   `tmux list-panes` by pane id. A dead pane's leftover file matches nothing and simply
+   disappears — no ghosts.
+3. **Git says which worktree.** Each agent's cwd resolves to a branch/repo, and agents are
+   grouped under their repo.
 
-`a`/`d` only act when the selected agent is actually waiting for input.
-
-Each row shows the agent's status glyph, how long it's been in that state (`4m`),
-its window number, branch, an uncommitted-change count (`Δ3`), and its last prompt.
-The preview pane (right) shows a live snapshot of the selected agent's screen.
-
-The list also includes the project's **existing worktrees that have no agent yet**,
-shown dimmed under their repo. Press `Enter` on one to start `claude` in it — so you
-can pick up a worktree you created earlier without leaving Hydra. `git worktree list`
-is the source, so worktrees are found wherever they live.
-
-### Notifications
-
-When an agent transitions into "needs input", Hydra fires a desktop notification
-(macOS) so you don't have to watch the popup. Set `HYDRA_ALERTS=0` to disable.
-
-### Removing worktrees
-
-`x` removes the selected worktree when the work is done, after a `y/N` confirm. If the
-worktree has a running agent, its tmux window is killed first. Uncommitted changes are
-surfaced in the prompt and require confirming a forced removal. The **branch is kept**
-(`git worktree remove` only) and the main/current worktree can't be removed.
-
-### Spawning agents
-
-`n` creates a git worktree on a new branch off the repo's default branch, then opens a
-tmux window running `claude` in it. Worktrees go under `~/work/tree/<name>` by default;
-override with `HYDRA_WORKTREE_ROOT`. Spawning uses an existing agent to locate the repo
-and session, so open at least one agent first.
+Status comes from the hook events: `UserPromptSubmit`/`PreToolUse` → working,
+`Notification` → needs input, `Stop` → idle, `SessionEnd` → gone.
 
 ## Commands
 
@@ -168,3 +222,41 @@ hydra hook <event>       Record a Claude Code lifecycle event (used by hooks)
 hydra install            Install hooks + tmux popup keybinding + status indicator
 hydra uninstall          Remove everything Hydra installed
 ```
+
+## Contributing
+
+Contributions are welcome. CI runs on every pull request and on pushes to `main`; before
+pushing, mirror what CI checks so you get a green build:
+
+```sh
+cargo fmt --all -- --check      # formatting (CI fails on diffs)
+cargo clippy --all-targets      # lints (CI treats warnings as errors)
+cargo test                      # the pure logic layers are unit-tested
+```
+
+Workflows live in `.github/workflows/`:
+
+- **`ci.yml`** — `fmt` + `clippy` on Ubuntu, then `build` + `test` on Ubuntu and macOS.
+- **`release.yml`** — on a `v*` tag, builds Linux and macOS binaries (x86_64 + aarch64)
+  and attaches them to a GitHub Release. Cut a release with `git tag v0.1.0 && git push --tags`.
+
+Dependencies (crates and Actions) are kept current by [Dependabot](.github/dependabot.yml).
+
+<details>
+<summary>Recommended branch protection</summary>
+
+To enforce green-before-merge, enable branch protection on `main`
+(Settings → Branches → Add rule) and mark these status checks as **required**:
+
+- `fmt + clippy`
+- `test (ubuntu-latest)`
+- `test (macos-latest)`
+
+Also enable *"Require branches to be up to date before merging"* and *"Require a pull
+request before merging"*.
+
+</details>
+
+## License
+
+Licensed under the [MIT License](LICENSE).
