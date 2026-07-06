@@ -170,7 +170,7 @@ struct App {
 }
 
 impl App {
-    fn run<B: ratatui::backend::Backend>(
+    fn run<B: ratatui::backend::Backend<Error = std::io::Error>>(
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> std::io::Result<()> {

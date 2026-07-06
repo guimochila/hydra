@@ -24,7 +24,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (stable + rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +44,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

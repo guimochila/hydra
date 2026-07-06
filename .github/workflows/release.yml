@@ -29,7 +29,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -58,7 +58,7 @@ jobs:
           tar -czf "$archive" -C "target/${{ matrix.target }}/release" "$bin"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.package.outputs.archive }}
           generate_release_notes: true
