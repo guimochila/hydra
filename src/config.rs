@@ -6,6 +6,7 @@
 //! (`ratatui::style::Color` and `std::path::PathBuf` are imported in the tasks that
 //! first use them — Task 2 and Task 3 respectively.)
 
+use ratatui::style::Color;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -145,7 +146,35 @@ impl Config {
     }
 }
 
-// parse_color, env overrides, and load() are added in later tasks.
+/// Parse a color string into a ratatui `Color`. Accepts named colors ("green",
+/// "darkgray", …) and `#rrggbb` hex. Anything unrecognized returns `fallback`, so a
+/// typo in the config degrades gracefully rather than crashing.
+pub fn parse_color(s: &str, fallback: Color) -> Color {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            if let Ok(n) = u32::from_str_radix(hex, 16) {
+                return Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8);
+            }
+        }
+        return fallback;
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "darkgrey" => Color::DarkGray,
+        "white" => Color::White,
+        _ => fallback,
+    }
+}
+
+// env overrides and load() are added in later tasks.
 
 #[cfg(test)]
 mod tests {
@@ -196,5 +225,15 @@ mod tests {
     #[test]
     fn syntax_error_falls_back_to_defaults() {
         assert_eq!(Config::parse("this is not = = toml"), Config::default());
+    }
+
+    #[test]
+    fn parse_color_handles_names_hex_and_invalid() {
+        assert_eq!(parse_color("green", Color::White), Color::Green);
+        assert_eq!(parse_color("DarkGray", Color::White), Color::DarkGray);
+        assert_eq!(parse_color("#32323c", Color::White), Color::Rgb(50, 50, 60));
+        // Invalid hex length and unknown name fall back.
+        assert_eq!(parse_color("#fff", Color::White), Color::White);
+        assert_eq!(parse_color("chartreuse", Color::Black), Color::Black);
     }
 }
