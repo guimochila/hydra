@@ -27,9 +27,15 @@ pub fn run() -> std::io::Result<()> {
         eprintln!("hydra: not running inside tmux — open me from a tmux popup");
         return Ok(());
     }
+    let config = crate::config::load();
     let mut terminal = ratatui::init();
     let mut app = App {
         show_preview: true,
+        caches: Caches::new(
+            config.timings.dirty_ttl_secs,
+            config.timings.worktree_list_ttl_secs,
+        ),
+        config,
         ..App::default()
     };
     let result = app.run(&mut terminal);
@@ -94,6 +100,7 @@ struct RemoveTarget {
 #[derive(Default)]
 struct App {
     caches: Caches,
+    config: crate::config::Config,
     /// Whether the preview pane is shown.
     show_preview: bool,
     /// All agents this tick (status-sorted), before filtering.
@@ -133,7 +140,7 @@ impl App {
             self.rebuild_rows();
             terminal.draw(|f| self.draw(f))?;
 
-            if event::poll(Duration::from_millis(250))? {
+            if event::poll(Duration::from_millis(self.config.timings.refresh_ms))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
@@ -160,7 +167,8 @@ impl App {
 
     /// Re-read agents + idle worktrees from disk/tmux/git (the expensive step).
     fn fetch(&mut self) {
-        let overview = crate::current_overview(&mut self.caches);
+        let overview =
+            crate::current_overview(&mut self.caches, self.config.timings.stale_after_secs);
         self.agents = overview.agents;
         self.idle = overview.idle;
     }

@@ -64,7 +64,7 @@ pub struct Overview {
 
 /// Resolve the current socket/session, collect agents, and list the project's idle
 /// worktrees. Shared by `ls` and the TUI.
-pub fn current_overview(caches: &mut worktree::Caches) -> Overview {
+pub fn current_overview(caches: &mut worktree::Caches, stale_after: u64) -> Overview {
     let socket = match tmux::current_socket() {
         Some(s) => s,
         None => return Overview::default(),
@@ -78,7 +78,7 @@ pub fn current_overview(caches: &mut worktree::Caches) -> Overview {
         .filter(|s| s.socket == socket)
         .collect();
     let now = now_secs();
-    let agents = agent::collect(&socket, &session, states, now, caches);
+    let agents = agent::collect(&socket, &session, states, now, caches, stale_after);
 
     // Anchor worktree listing at the popup's cwd, falling back to an agent's cwd.
     let anchor = std::env::current_dir()
@@ -95,8 +95,12 @@ pub fn current_overview(caches: &mut worktree::Caches) -> Overview {
 }
 
 fn list_command() -> std::io::Result<()> {
-    let mut caches = worktree::Caches::default();
-    let overview = current_overview(&mut caches);
+    let cfg = config::load();
+    let mut caches = worktree::Caches::new(
+        cfg.timings.dirty_ttl_secs,
+        cfg.timings.worktree_list_ttl_secs,
+    );
+    let overview = current_overview(&mut caches, cfg.timings.stale_after_secs);
     if overview.agents.is_empty() && overview.idle.is_empty() {
         println!("(no agents or worktrees in this session)");
         return Ok(());
