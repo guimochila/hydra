@@ -69,7 +69,10 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 .map(|p| truncate(p.trim(), 60))
                 .or_else(|| prev.and_then(|p| p.task_summary));
 
-            if status == Status::NeedsInput && !was_needs_input {
+            if status == Status::NeedsInput
+                && !was_needs_input
+                && crate::config::load().alerts.enabled
+            {
                 crate::alert::needs_input(&cwd);
             }
 
