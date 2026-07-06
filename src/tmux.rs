@@ -126,19 +126,47 @@ pub fn send_text(socket: &str, pane_id: &str, text: &str) -> std::io::Result<()>
     run(socket, &["send-keys", "-t", pane_id, "Enter"])
 }
 
-/// Create a new window in `session` on `socket`, named `name`, started in `cwd`
-/// running `command` (e.g. `claude`). The window is appended after existing ones.
+/// Create a new window in `session` on `socket`, named `name`, started in `cwd` running
+/// `command` (e.g. `claude`). Created **detached** (`-d`) and its window id returned, so
+/// the caller can switch to it explicitly with `select_window_id` — more reliable from
+/// inside a popup than relying on new-window's implicit switch. Errors carry stderr.
 pub fn new_window(
     socket: &str,
     session: &str,
     name: &str,
     cwd: &str,
     command: &str,
-) -> std::io::Result<()> {
-    run(
-        socket,
-        &["new-window", "-t", session, "-n", name, "-c", cwd, command],
-    )
+) -> std::io::Result<String> {
+    let out = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args([
+            "new-window",
+            "-d",
+            "-t",
+            session,
+            "-n",
+            name,
+            "-c",
+            cwd,
+            "-P",
+            "-F",
+            "#{window_id}",
+            command,
+        ])
+        .output()?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// Make `window_id` (e.g. `@7`) the current window on its session.
+pub fn select_window_id(socket: &str, window_id: &str) -> std::io::Result<()> {
+    run(socket, &["select-window", "-t", window_id])
 }
 
 /// Kill a window by session + index (used to stop an agent before removing its

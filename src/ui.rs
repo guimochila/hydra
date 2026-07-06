@@ -145,8 +145,10 @@ impl App {
                             break;
                         }
                         Action::Start => {
-                            self.start_selected_worktree()?;
-                            break;
+                            // Only exit on success; on failure stay open and show why.
+                            if self.start_selected_worktree() {
+                                break;
+                            }
                         }
                         Action::None => {}
                     }
@@ -444,7 +446,7 @@ impl App {
             &path_str,
             "claude",
         ) {
-            Ok(()) => Some(format!("✓ spawned {name}")),
+            Ok(_window_id) => Some(format!("✓ spawned {name}")),
             Err(e) => Some(format!("window failed: {e}")),
         };
     }
@@ -557,21 +559,38 @@ impl App {
 
     /// Start `claude` in the selected idle worktree: open a new window (named after the
     /// branch) in the current session, in the worktree's directory. The new agent then
-    /// appears via its own SessionStart hook. `new-window` switches to it, so exiting
-    /// the popup lands the user on the new agent.
-    fn start_selected_worktree(&mut self) -> std::io::Result<()> {
+    /// appears via its own SessionStart hook. `new-window` switches to it, so exiting the
+    /// popup lands the user on the new agent.
+    ///
+    /// Returns `true` on success (caller exits the popup). On any failure it records a
+    /// footer message and returns `false` so the popup stays open with the reason
+    /// visible, rather than closing silently.
+    fn start_selected_worktree(&mut self) -> bool {
         let Some(wt) = self.selected_worktree() else {
-            return Ok(());
+            self.message = Some("no worktree selected".into());
+            return false;
         };
         let name = sanitize(&wt.branch.clone().unwrap_or_else(|| wt.path.clone()));
         let path = wt.path.clone();
         let Some(socket) = tmux::current_socket() else {
-            return Ok(());
+            self.message = Some("not inside tmux".into());
+            return false;
         };
         let Some(session) = tmux::current_session(&socket) else {
-            return Ok(());
+            self.message = Some("could not resolve the current tmux session".into());
+            return false;
         };
-        tmux::new_window(&socket, &session, &name, &path, "claude")
+        match tmux::new_window(&socket, &session, &name, &path, "claude") {
+            Ok(window_id) => {
+                // Switch to the new window so closing the popup lands the user on it.
+                let _ = tmux::select_window_id(&socket, &window_id);
+                true
+            }
+            Err(e) => {
+                self.message = Some(format!("start failed: {e}"));
+                false
+            }
+        }
     }
 
     /// Begin removing the selected worktree: build the target and enter confirm mode,
