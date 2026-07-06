@@ -58,6 +58,54 @@ tmux source-file ~/.tmux.conf
 
 Remove everything with `hydra uninstall`.
 
+## Configuration
+
+Hydra reads an optional TOML config from `~/.config/hydra/config.toml` (override the path
+with `$HYDRA_CONFIG`). Without a config, Hydra uses its built-in defaults — nothing to set
+up. `hydra install` writes a commented starter file with every default if none exists.
+
+Most settings are read at runtime, so a rebuild isn't needed to pick them up. The one
+exception is `[popup]` (key/size), which is baked into `~/.tmux.conf` by `install` — after
+changing it, re-run `hydra install` and `tmux source-file ~/.tmux.conf`.
+
+Precedence: built-in defaults → config file → environment variables
+(`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) win on top.
+
+```toml
+[timings]
+stale_after_secs       = 900   # WORKING agent silent this long → UNKNOWN
+refresh_ms             = 250   # popup refresh tick
+dirty_ttl_secs         = 3     # throttle for git-status dirty counts
+worktree_list_ttl_secs = 5     # throttle for git worktree list
+
+[agent]
+command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
+worktree_root = "~/work/tree"  # where spawned worktrees go
+
+[popup]                        # re-run `hydra install` after changing
+key    = "a"
+width  = "70%"
+height = "60%"
+
+[theme.tui]                    # a color name ("green") or "#rrggbb"
+highlight_bg = "#32323c"
+working      = "green"
+needs_input  = "yellow"
+idle         = "gray"
+unknown      = "darkgray"
+
+[theme.status]                 # status-bar palette
+label    = "#b35b79"
+working  = "#5e857a"
+idle     = "#d9a594"
+alert_fg = "#f2ecbc"
+alert_bg = "#d7474b"
+unknown  = "#b35b79"
+
+[alerts]
+enabled = true                 # HYDRA_ALERTS=0 also disables
+```
+
 ## Usage
 
 Open the popup with **`prefix` + `a`** (tmux prefix, then `a`).
