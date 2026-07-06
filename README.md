@@ -52,7 +52,9 @@ tmux source-file ~/.tmux.conf
 - It merges its hooks into `~/.claude/settings.json` alongside any you already have
   (a backup is written first).
 - It appends a popup binding and a status-line indicator to `~/.tmux.conf` inside a
-  marked block, using `set -ga status-right` so your existing status line is preserved.
+  marked block, using `set -ga status-left` so your existing status line is preserved.
+  The indicator sits at the front of the bar; when an agent needs input it becomes a
+  bold `⚠ N NEEDS INPUT` block.
 
 Remove everything with `hydra uninstall`.
 
