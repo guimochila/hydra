@@ -145,8 +145,10 @@ mod tests {
 
     #[test]
     fn honors_a_custom_palette() {
-        let mut theme = ThemeStatus::default();
-        theme.working = "cyan".to_string();
+        let theme = ThemeStatus {
+            working: "cyan".to_string(),
+            ..ThemeStatus::default()
+        };
         let s = format_indicator(0, 1, 0, 0, &theme);
         assert!(s.contains("fg=cyan"));
     }
