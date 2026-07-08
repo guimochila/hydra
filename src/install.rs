@@ -55,6 +55,10 @@ idle         = "gray"
 unknown      = "darkgray"
 footer_key   = "green"         # shortcut keys in the footer keybar
 footer_label = "gray"          # the descriptions next to each footer key
+header       = "blue"          # repo group headers
+branch       = "cyan"          # branch names in agent rows
+dirty        = "magenta"       # the uncommitted-change count (Δ3)
+worktree_row = "darkgray"      # idle-worktree rows (glyph + "start ⏎")
 
 [theme.status]                 # status-bar palette (tmux color names or "#rrggbb")
 label    = "#b35b79"

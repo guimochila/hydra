@@ -93,6 +93,14 @@ pub struct ThemeTui {
     pub footer_key: String,
     /// The descriptions next to each footer key (e.g. `move`, `start/jump`).
     pub footer_label: String,
+    /// Repo group headers (`▸ name`).
+    pub header: String,
+    /// Branch names in agent rows.
+    pub branch: String,
+    /// The uncommitted-change count (`Δ3`).
+    pub dirty: String,
+    /// Idle-worktree rows (glyph and `start ⏎` affordance).
+    pub worktree_row: String,
 }
 
 impl Default for ThemeTui {
@@ -105,6 +113,10 @@ impl Default for ThemeTui {
             unknown: "darkgray".to_string(),
             footer_key: "green".to_string(),
             footer_label: "gray".to_string(),
+            header: "blue".to_string(),
+            branch: "cyan".to_string(),
+            dirty: "magenta".to_string(),
+            worktree_row: "darkgray".to_string(),
         }
     }
 }
@@ -320,6 +332,19 @@ mod tests {
         let cfg = Config::parse("[theme.tui]\nfooter_key = \"#e6c384\"\n");
         assert_eq!(cfg.theme.tui.footer_key, "#e6c384");
         assert_eq!(cfg.theme.tui.footer_label, "gray"); // untouched default
+    }
+
+    #[test]
+    fn row_theme_keys_default_to_the_old_hardcoded_colors() {
+        let d = ThemeTui::default();
+        assert_eq!(d.header, "blue");
+        assert_eq!(d.branch, "cyan");
+        assert_eq!(d.dirty, "magenta");
+        assert_eq!(d.worktree_row, "darkgray");
+
+        let cfg = Config::parse("[theme.tui]\nheader = \"#e6c384\"\n");
+        assert_eq!(cfg.theme.tui.header, "#e6c384");
+        assert_eq!(cfg.theme.tui.branch, "cyan"); // untouched default
     }
 
     #[test]

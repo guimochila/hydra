@@ -13,6 +13,7 @@ use crate::tmux;
 use crate::worktree::{Caches, IdleWorktree};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ansi_to_tui::IntoText;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -113,6 +114,10 @@ struct TuiColors {
     unknown: Color,
     footer_key: Color,
     footer_label: Color,
+    header: Color,
+    branch: Color,
+    dirty: Color,
+    worktree_row: Color,
 }
 
 impl Default for TuiColors {
@@ -125,6 +130,10 @@ impl Default for TuiColors {
             unknown: Color::DarkGray,
             footer_key: Color::Green,
             footer_label: Color::Gray,
+            header: Color::Blue,
+            branch: Color::Cyan,
+            dirty: Color::Magenta,
+            worktree_row: Color::DarkGray,
         }
     }
 }
@@ -141,6 +150,10 @@ impl TuiColors {
             unknown: parse_color(&t.unknown, d.unknown),
             footer_key: parse_color(&t.footer_key, d.footer_key),
             footer_label: parse_color(&t.footer_label, d.footer_label),
+            header: parse_color(&t.header, d.header),
+            branch: parse_color(&t.branch, d.branch),
+            dirty: parse_color(&t.dirty, d.dirty),
+            worktree_row: parse_color(&t.worktree_row, d.worktree_row),
         }
     }
 }
@@ -845,15 +858,16 @@ impl App {
             frame.render_widget(empty, list_area);
         } else {
             let now = now_secs();
+            let width = list_area.width;
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
                 .map(|row| match row {
-                    Row::Header { label, count } => header_row(label, *count),
+                    Row::Header { label, count } => header_row(label, *count, &self.colors),
                     Row::Agent(i) => {
-                        agent_row(&self.view[*i], now, &self.colors, self.all_sessions)
+                        agent_row(&self.view[*i], now, &self.colors, self.all_sessions, width)
                     }
-                    Row::Worktree(i) => worktree_row(&self.idle_view[*i]),
+                    Row::Worktree(i) => worktree_row(&self.idle_view[*i], &self.colors),
                 })
                 .collect();
             let list = List::new(items).block(block).highlight_style(
@@ -880,18 +894,17 @@ impl App {
             .borders(Borders::ALL)
             .title(title)
             .title_style(Style::default().add_modifier(Modifier::DIM));
-        // Show the tail of the agent's visible screen (the most recent output/prompt).
+        // Show the tail of the agent's visible screen (the most recent output/prompt),
+        // with its real colors: capture-pane -e keeps the SGR sequences and
+        // ansi-to-tui turns them into styled ratatui lines. Unparseable output falls
+        // back to plain text rather than an empty preview.
         let content = tmux::capture_pane(&a.state.socket, &a.pane.pane_id);
+        let text = content
+            .into_text()
+            .unwrap_or_else(|_| ratatui::text::Text::raw(content));
         let rows = area.height.saturating_sub(2) as usize;
-        let tail: Vec<Line> = content
-            .lines()
-            .rev()
-            .take(rows)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|l| Line::from(Span::raw(l.to_string())))
-            .collect();
+        let skip = text.lines.len().saturating_sub(rows);
+        let tail: Vec<Line> = text.lines.into_iter().skip(skip).collect();
         let para = ratatui::widgets::Paragraph::new(tail).block(block);
         frame.render_widget(para, area);
     }
@@ -1025,12 +1038,12 @@ impl App {
     }
 }
 
-fn header_row(label: &str, count: usize) -> ListItem<'static> {
+fn header_row(label: &str, count: usize, colors: &TuiColors) -> ListItem<'static> {
     let line = Line::from(vec![
         Span::styled(
             format!("▸ {label}"),
             Style::default()
-                .fg(Color::Blue)
+                .fg(colors.header)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" ({count})")).dim(),
@@ -1039,21 +1052,27 @@ fn header_row(label: &str, count: usize) -> ListItem<'static> {
 }
 
 /// An idle worktree with no agent: dimmed, with a "start ⏎" affordance.
-fn worktree_row(w: &IdleWorktree) -> ListItem<'static> {
+fn worktree_row(w: &IdleWorktree, colors: &TuiColors) -> ListItem<'static> {
     let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
     let line = Line::from(vec![
-        Span::styled("  ○", Style::default().fg(Color::DarkGray)),
+        Span::styled("  ○", Style::default().fg(colors.worktree_row)),
         Span::raw("  —   —      "),
         Span::styled(
-            format!("{branch:<24}"),
-            Style::default().fg(Color::Cyan).dim(),
+            format!("{:<24}", agent::truncate(&branch, 23)),
+            Style::default().fg(colors.branch).dim(),
         ),
-        Span::styled("start ⏎", Style::default().fg(Color::DarkGray)),
+        Span::styled("start ⏎", Style::default().fg(colors.worktree_row)),
     ]);
     ListItem::new(line)
 }
 
-fn agent_row(a: &Agent, now: u64, colors: &TuiColors, show_session: bool) -> ListItem<'static> {
+fn agent_row(
+    a: &Agent,
+    now: u64,
+    colors: &TuiColors,
+    show_session: bool,
+    width: u16,
+) -> ListItem<'static> {
     let (color, glyph) = match a.effective_status {
         Status::NeedsInput => (colors.needs_input, a.effective_status.glyph()),
         Status::Working => (colors.working, a.effective_status.glyph()),
@@ -1068,7 +1087,25 @@ fn agent_row(a: &Agent, now: u64, colors: &TuiColors, show_session: bool) -> Lis
         .unwrap_or_else(|| a.pane.window_name.clone());
 
     let age = agent::format_age(now.saturating_sub(a.state.updated_at));
-    let detail = agent::detail_text(a).unwrap_or_default();
+    // In all-sessions view each row says which session it lives in.
+    let place = if show_session {
+        format!("{}:{}  ", a.pane.session_name, a.pane.window_index)
+    } else {
+        format!("win {:>2}  ", a.pane.window_index)
+    };
+    let dirty = (a.dirty > 0).then(|| format!("Δ{} ", a.dirty));
+
+    // Truncate the variable cells to the row's actual width: the branch to its
+    // 24-char cell, the detail to whatever is left (long text otherwise overflows
+    // off-screen instead of wrapping — List items are single lines).
+    let branch_cell = format!("{:<24}", agent::truncate(&branch, 23));
+    let fixed = 2 + 1 + 5 // indent + glyph + " age "
+        + place.chars().count()
+        + branch_cell.chars().count()
+        + dirty.as_deref().map_or(0, |d| d.chars().count())
+        + 2; // block borders
+    let budget = (width as usize).saturating_sub(fixed);
+    let detail = agent::truncate(&agent::detail_text(a).unwrap_or_default(), budget);
     // The attention message ("needs permission to run Bash") is the row's most
     // actionable text — color it like the status instead of dimming it away.
     let detail_span = if a.effective_status == Status::NeedsInput && a.state.attention.is_some() {
@@ -1084,19 +1121,11 @@ fn agent_row(a: &Agent, now: u64, colors: &TuiColors, show_session: bool) -> Lis
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" {age:>3} "), Style::default().fg(color)),
-        // In all-sessions view each row says which session it lives in.
-        Span::raw(if show_session {
-            format!("{}:{}  ", a.pane.session_name, a.pane.window_index)
-        } else {
-            format!("win {:>2}  ", a.pane.window_index)
-        }),
-        Span::styled(format!("{branch:<24}"), Style::default().fg(Color::Cyan)),
+        Span::raw(place),
+        Span::styled(branch_cell, Style::default().fg(colors.branch)),
     ];
-    if a.dirty > 0 {
-        spans.push(Span::styled(
-            format!("Δ{} ", a.dirty),
-            Style::default().fg(Color::Magenta),
-        ));
+    if let Some(d) = dirty {
+        spans.push(Span::styled(d, Style::default().fg(colors.dirty)));
     }
     spans.push(detail_span);
     ListItem::new(Line::from(spans))

@@ -5,6 +5,7 @@
 //! `$TMUX_PANE` from the environment, map the event to a status, and atomically write
 //! (or remove) the pane's state file. No tmux or git subprocess calls happen here.
 
+use crate::agent::truncate;
 use crate::state::{self, AgentState, EventOutcome, Status};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -121,40 +122,9 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Truncate to at most `max` chars (char-boundary safe), adding an ellipsis.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_leaves_short_strings_alone() {
-        assert_eq!(truncate("hi", 60), "hi");
-    }
-
-    #[test]
-    fn truncate_shortens_long_strings_with_ellipsis() {
-        let long = "a".repeat(100);
-        let t = truncate(&long, 10);
-        assert_eq!(t.chars().count(), 10);
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn truncate_respects_multibyte_boundaries() {
-        let s = "héllo wörld ☃ agent task summary that is quite long indeed";
-        let t = truncate(s, 5);
-        // Must not panic and must be 5 chars incl. ellipsis.
-        assert_eq!(t.chars().count(), 5);
-    }
 
     #[test]
     fn attention_set_on_needs_input_and_cleared_on_other_statuses() {

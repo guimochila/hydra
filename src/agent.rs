@@ -135,6 +135,17 @@ pub fn detail_text(a: &Agent) -> Option<String> {
     a.state.task_summary.clone()
 }
 
+/// Truncate to at most `max` chars (char-boundary safe), adding an ellipsis. Shared
+/// by the hook (task summaries / attention) and the row renderer (width fitting).
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Format an age in seconds compactly: `12s`, `4m`, `2h`, `3d`.
 pub fn format_age(secs: u64) -> String {
     if secs < 60 {
@@ -332,6 +343,17 @@ mod tests {
         // Back to working: the attention reason no longer applies.
         a.effective_status = Status::Working;
         assert_eq!(detail_text(&a), Some("build the api".to_string()));
+    }
+
+    #[test]
+    fn truncate_is_char_safe_and_adds_an_ellipsis() {
+        assert_eq!(truncate("hi", 60), "hi");
+        let t = truncate(&"a".repeat(100), 10);
+        assert_eq!(t.chars().count(), 10);
+        assert!(t.ends_with('…'));
+        // Multibyte input must not panic and must land on a char boundary.
+        let t = truncate("héllo wörld ☃ quite long indeed", 5);
+        assert_eq!(t.chars().count(), 5);
     }
 
     #[test]

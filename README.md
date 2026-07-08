@@ -173,8 +173,7 @@ key    = "a"
 width  = "70%"
 height = "60%"
 
-[theme.tui]                    # a color name ("green") or "#rrggbb"; colors the agent
-                                # rows + selection highlight — idle-worktree rows use fixed colors
+[theme.tui]                    # a color name ("green") or "#rrggbb"
 highlight_bg = "#32323c"
 working      = "green"
 needs_input  = "yellow"
@@ -182,6 +181,10 @@ idle         = "gray"
 unknown      = "darkgray"
 footer_key   = "green"         # shortcut keys in the footer keybar
 footer_label = "gray"          # the descriptions next to each footer key
+header       = "blue"          # repo group headers
+branch       = "cyan"          # branch names in agent rows
+dirty        = "magenta"       # the uncommitted-change count (Δ3)
+worktree_row = "darkgray"      # idle-worktree rows (glyph + "start ⏎")
 
 [theme.status]                 # status-bar palette
 label    = "#b35b79"
