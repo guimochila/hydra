@@ -177,6 +177,55 @@ impl TuiColors {
 /// ratatui's buffer diffing.
 const INPUT_POLL_MS: u64 = 50;
 
+/// The normal-mode footer keybar: (key, label) pairs, in display order.
+const KEYBAR: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("⏎", "start/jump"),
+    ("a", "✓"),
+    ("d", "✗"),
+    ("1-3", "pick"),
+    ("i", "send"),
+    ("n", "new"),
+    ("x", "remove"),
+    ("⇥", "next⚠"),
+    ("/", "filter"),
+    ("p", "preview"),
+    ("s", "sess"),
+    ("q", "quit"),
+];
+
+/// Rendered width of one `key label` pair.
+fn keybar_pair_width(&(k, l): &(&str, &str)) -> usize {
+    k.chars().count() + 1 + l.chars().count()
+}
+
+/// Rendered width of a keybar row: 1-column indent + pairs + 2-space separators.
+fn keybar_row_width(row: &[(&str, &str)]) -> usize {
+    1 + row.iter().map(keybar_pair_width).sum::<usize>() + 2 * row.len().saturating_sub(1)
+}
+
+/// Greedily pack the keybar pairs into rows of at most `width` columns, so a narrow
+/// popup wraps whole `key label` entries onto extra footer lines instead of clipping
+/// them off the right edge. Every row keeps at least one pair (pathological widths
+/// still terminate), and order is preserved.
+fn pack_keybar<'a>(pairs: &'a [(&'a str, &'a str)], width: usize) -> Vec<&'a [(&'a str, &'a str)]> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut used = 1; // leading indent
+    for (i, pair) in pairs.iter().enumerate() {
+        let w = keybar_pair_width(pair);
+        if i > start && used + 2 + w > width {
+            rows.push(&pairs[start..i]);
+            start = i;
+            used = 1 + w;
+        } else {
+            used += if i == start { w } else { 2 + w };
+        }
+    }
+    rows.push(&pairs[start..]);
+    rows
+}
+
 #[derive(Default)]
 struct App {
     config: crate::config::Config,
@@ -880,8 +929,11 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        // The footer grows to as many lines as the width requires (keybar wrapping).
+        let footer = self.footer(frame.area().width);
         let chunks =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+            Layout::vertical([Constraint::Min(1), Constraint::Length(footer.len() as u16)])
+                .split(frame.area());
 
         // Split the body into list + preview when the preview is on and there's room.
         let preview_on = self.show_preview && self.selected_agent().is_some();
@@ -934,7 +986,7 @@ impl App {
             self.draw_preview(frame, area);
         }
 
-        frame.render_widget(self.footer(), chunks[1]);
+        frame.render_widget(ratatui::widgets::Paragraph::new(footer), chunks[1]);
     }
 
     fn draw_preview(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -985,8 +1037,11 @@ impl App {
         }
     }
 
-    fn footer(&self) -> Line<'static> {
-        match self.mode {
+    /// Footer lines for the given terminal width. Input/confirm modes and transient
+    /// messages are a single line; the normal-mode keybar wraps onto extra lines
+    /// when the popup is too narrow to fit every shortcut (nothing is clipped).
+    fn footer(&self, width: u16) -> Vec<Line<'static>> {
+        let line = match self.mode {
             Mode::Filter => Line::from(vec![
                 Span::styled("/", Style::default().fg(Color::Yellow)),
                 Span::raw(self.filter.clone()),
@@ -1037,40 +1092,37 @@ impl App {
             Mode::Normal => {
                 // A transient action result takes over the footer until the next key.
                 if let Some(msg) = &self.message {
-                    return Line::from(Span::styled(
+                    return vec![Line::from(Span::styled(
                         format!(" {msg}"),
                         Style::default().fg(Color::Yellow),
-                    ));
+                    ))];
                 }
-                // key/label pairs, colored from the theme (footer_key / footer_label).
-                let key = |k: &str| {
-                    Span::styled(
-                        k.to_string(),
-                        Style::default()
-                            .fg(self.colors.footer_key)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                };
-                let label = |l: &str| {
-                    Span::styled(l.to_string(), Style::default().fg(self.colors.footer_label))
-                };
-                let pairs = [
-                    ("j/k", "move"),
-                    ("⏎", "start/jump"),
-                    ("a", "✓"),
-                    ("d", "✗"),
-                    ("1-3", "pick"),
-                    ("i", "send"),
-                    ("n", "new"),
-                    ("x", "remove"),
-                    ("⇥", "next⚠"),
-                    ("/", "filter"),
-                    ("p", "preview"),
-                    ("s", "sess"),
-                    ("q", "quit"),
-                ];
+                return self.keybar_lines(width);
+            }
+        };
+        vec![line]
+    }
+
+    /// The keybar packed into rows that fit `width`, colored from the theme
+    /// (footer_key / footer_label), with the active-filter indicator appended.
+    fn keybar_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let key = |k: &str| {
+            Span::styled(
+                k.to_string(),
+                Style::default()
+                    .fg(self.colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let label =
+            |l: &str| Span::styled(l.to_string(), Style::default().fg(self.colors.footer_label));
+
+        let rows = pack_keybar(KEYBAR, width as usize);
+        let mut lines: Vec<Line> = rows
+            .iter()
+            .map(|row| {
                 let mut spans = vec![Span::raw(" ")];
-                for (i, (k, l)) in pairs.iter().enumerate() {
+                for (i, (k, l)) in row.iter().enumerate() {
                     if i > 0 {
                         spans.push(Span::raw("  "));
                     }
@@ -1078,16 +1130,25 @@ impl App {
                     spans.push(Span::raw(" "));
                     spans.push(label(l));
                 }
-                if !self.filter.is_empty() {
-                    spans.push(Span::raw("   "));
-                    spans.push(Span::styled(
-                        format!("filter: {}", self.filter),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
                 Line::from(spans)
+            })
+            .collect();
+
+        if !self.filter.is_empty() {
+            let text = format!("filter: {}", self.filter);
+            let span = Span::styled(text.clone(), Style::default().fg(Color::Yellow));
+            // Append to the last row when it fits, else give it its own line.
+            let last_used = rows.last().map(|r| keybar_row_width(r)).unwrap_or(0);
+            if last_used + 3 + text.chars().count() <= width as usize {
+                if let Some(last) = lines.last_mut() {
+                    last.push_span(Span::raw("   "));
+                    last.push_span(span);
+                }
+            } else {
+                lines.push(Line::from(vec![Span::raw(" "), span]));
             }
         }
+        lines
     }
 }
 
@@ -1755,7 +1816,9 @@ mod tests {
             },
             ..App::default()
         };
-        let spans = app.footer().spans;
+        let lines = app.footer(200);
+        assert_eq!(lines.len(), 1, "wide footer fits on one line");
+        let spans = &lines[0].spans;
         // The `j/k` shortcut is the first key: themed color + bold.
         let key = spans
             .iter()
@@ -1770,6 +1833,52 @@ mod tests {
             .expect("move label span present");
         assert_eq!(label.style.fg, Some(Color::Rgb(4, 5, 6)));
         assert!(!label.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn keybar_wraps_on_narrow_widths_without_dropping_keys() {
+        let app = App::default();
+        let narrow = app.footer(40);
+        assert!(narrow.len() > 1, "40 cols can't fit the whole keybar");
+        // Every key and label still appears somewhere.
+        let text: String = narrow
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.clone())
+            .collect();
+        for (k, l) in KEYBAR {
+            assert!(text.contains(k), "key {k} present");
+            assert!(text.contains(l), "label {l} present");
+        }
+        // No rendered row exceeds the width it was packed for.
+        for line in &narrow {
+            assert!(line.width() <= 40, "row '{line}' fits in 40 cols");
+        }
+    }
+
+    #[test]
+    fn pack_keybar_terminates_and_preserves_order_at_pathological_widths() {
+        let rows = pack_keybar(KEYBAR, 1); // narrower than any single pair
+        assert_eq!(rows.len(), KEYBAR.len(), "one pair per row");
+        let flat: Vec<_> = rows.iter().flat_map(|r| r.iter()).collect();
+        assert_eq!(flat.len(), KEYBAR.len());
+        assert_eq!(*flat[0], KEYBAR[0]);
+        assert_eq!(*flat[flat.len() - 1], KEYBAR[KEYBAR.len() - 1]);
+    }
+
+    #[test]
+    fn active_filter_indicator_survives_wrapping() {
+        let app = App {
+            filter: "alpha".into(),
+            ..App::default()
+        };
+        let lines = app.footer(40);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(text.contains("filter: alpha"));
     }
 
     #[test]
