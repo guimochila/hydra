@@ -1,8 +1,10 @@
 //! The popup TUI: a live, vim-navigated, repo-grouped list of the session's agents.
 //!
-//! Refreshes on a 250 ms tick (re-reads state files + `tmux list-panes`), which is
-//! real-time enough for a popup and avoids a filesystem-watch dependency. Enter jumps
-//! to the selected agent's window and exits so the `-E` popup closes on the agent.
+//! Data comes from the background fetch worker (`fetcher.rs`), which re-reads state
+//! files + `tmux list-panes` + throttled git on its own tick — the UI thread only
+//! drains snapshots, handles keys (polled at `INPUT_POLL_MS`) and draws, so input
+//! never blocks on a slow `git status`. Enter jumps to the selected agent's window
+//! and exits so the `-E` popup closes on the agent.
 //!
 //! Rows are either a repo header or an agent; navigation skips headers, and selection
 //! is tracked by pane id so it sticks to the same agent as the list reorders.
@@ -30,23 +32,30 @@ pub fn run() -> std::io::Result<()> {
     }
     let (config, config_notice) = crate::config::load_reporting();
     let colors = TuiColors::from_config(&config.theme.tui);
+    // The caches move into the background worker; the UI only receives snapshots.
+    let caches = Caches::new(
+        config.timings.dirty_ttl_secs,
+        config.timings.worktree_list_ttl_secs,
+    );
+    let fetcher = crate::fetcher::spawn(
+        caches,
+        config.timings.refresh_ms,
+        config.timings.stale_after_secs,
+    );
     let mut terminal = ratatui::init();
     let mut app = App {
         show_preview: true,
-        caches: Caches::new(
-            config.timings.dirty_ttl_secs,
-            config.timings.worktree_list_ttl_secs,
-        ),
         colors,
         config,
         message: config_notice,
         ..App::default()
     };
-    let result = app.run(&mut terminal);
+    let result = app.run(&mut terminal, &fetcher);
     ratatui::restore();
     result
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Quit,
@@ -54,6 +63,11 @@ enum Action {
     Jump,
     /// Start `claude` in the selected idle worktree, then exit.
     Start,
+    /// Ask the fetch worker for an immediate refetch; `invalidate` drops its caches
+    /// first (after a mutation, so the change shows on the next snapshot).
+    Refresh {
+        invalidate: bool,
+    },
 }
 
 /// A quick reply to a pending prompt.
@@ -158,9 +172,13 @@ impl TuiColors {
     }
 }
 
+/// How long `event::poll` waits for a key each pass. Bounds input latency and how
+/// quickly a worker snapshot is picked up; redrawing at ≤20 Hz is cheap under
+/// ratatui's buffer diffing.
+const INPUT_POLL_MS: u64 = 50;
+
 #[derive(Default)]
 struct App {
-    caches: Caches,
     config: crate::config::Config,
     colors: TuiColors,
     /// Whether the preview pane is shown.
@@ -192,19 +210,41 @@ struct App {
     pending_remove: Option<RemoveTarget>,
     /// Transient status line (e.g. "✓ approved win 4"); cleared on the next keypress.
     message: Option<String>,
+    /// Whether the first snapshot has arrived (before that, show "loading…").
+    loaded: bool,
+    /// Bumped per received snapshot; part of the preview memo key.
+    data_seq: u64,
+    /// (pane id, data_seq) the current `preview_text` was captured for.
+    preview_cache: Option<(String, u64)>,
+    /// Captured screen content of the selected agent (with SGR sequences).
+    preview_text: String,
 }
 
 impl App {
     fn run<B: ratatui::backend::Backend<Error = std::io::Error>>(
         &mut self,
         terminal: &mut Terminal<B>,
+        fetcher: &crate::fetcher::Fetcher,
     ) -> std::io::Result<()> {
         loop {
-            self.fetch();
-            self.rebuild_rows();
+            // Drain worker snapshots, keeping only the newest.
+            let mut fresh = false;
+            while let Ok(overview) = fetcher.snap_rx.try_recv() {
+                self.agents = overview.agents;
+                self.idle = overview.idle;
+                fresh = true;
+            }
+            if fresh {
+                self.loaded = true;
+                self.data_seq += 1;
+                self.rebuild_rows();
+            }
+            self.refresh_preview();
             terminal.draw(|f| self.draw(f))?;
 
-            if event::poll(Duration::from_millis(self.config.timings.refresh_ms))? {
+            // Short poll so keys AND snapshots are both picked up promptly (the
+            // worker paces the actual refetch cadence, not this loop).
+            if event::poll(Duration::from_millis(INPUT_POLL_MS))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
@@ -221,6 +261,9 @@ impl App {
                                 break;
                             }
                         }
+                        Action::Refresh { invalidate } => {
+                            fetcher.request_refresh(invalidate, self.all_sessions);
+                        }
                         Action::None => {}
                     }
                 }
@@ -229,15 +272,23 @@ impl App {
         Ok(())
     }
 
-    /// Re-read agents + idle worktrees from disk/tmux/git (the expensive step).
-    fn fetch(&mut self) {
-        let overview = crate::current_overview(
-            &mut self.caches,
-            self.config.timings.stale_after_secs,
-            self.all_sessions,
-        );
-        self.agents = overview.agents;
-        self.idle = overview.idle;
+    /// Memoized capture of the selected agent's screen: one tmux call per selection
+    /// change or data snapshot, none on pure-keystroke redraws.
+    fn refresh_preview(&mut self) {
+        if !self.show_preview {
+            return;
+        }
+        let Some(a) = self.selected_agent() else {
+            self.preview_cache = None;
+            self.preview_text.clear();
+            return;
+        };
+        let key = (a.pane.pane_id.clone(), self.data_seq);
+        if self.preview_cache.as_ref() == Some(&key) {
+            return;
+        }
+        self.preview_text = tmux::capture_pane(&a.state.socket, &a.pane.pane_id);
+        self.preview_cache = Some(key);
     }
 
     /// Rebuild the filtered views and the header/agent/worktree rows, grouped by repo
@@ -372,10 +423,7 @@ impl App {
                 self.handle_spawn_key(key);
                 Action::None
             }
-            Mode::Confirm => {
-                self.handle_confirm_key(key.code);
-                Action::None
-            }
+            Mode::Confirm => self.handle_confirm_key(key.code),
             Mode::Normal => self.handle_normal_key(key.code),
         }
     }
@@ -419,15 +467,13 @@ impl App {
                     self.pending_g = true;
                 }
             }
-            KeyCode::Char('r') => {
-                self.fetch();
-                self.rebuild_rows();
-            }
+            KeyCode::Char('r') => return Action::Refresh { invalidate: false },
             KeyCode::Char('p') => self.show_preview = !self.show_preview,
             KeyCode::Char('s') => {
+                // The stale scope stays visible until the worker's next snapshot
+                // (near-immediate: the refresh request wakes it).
                 self.all_sessions = !self.all_sessions;
-                self.fetch();
-                self.rebuild_rows();
+                return Action::Refresh { invalidate: false };
             }
             KeyCode::Char('n') => {
                 self.spawn_input.clear();
@@ -782,38 +828,42 @@ impl App {
         })
     }
 
-    fn handle_confirm_key(&mut self, code: KeyCode) {
+    fn handle_confirm_key(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => self.do_remove(),
             _ => {
                 self.pending_remove = None;
                 self.mode = Mode::Normal;
+                Action::None
             }
         }
     }
 
     /// Perform the confirmed removal: kill the agent's window (if any), then
-    /// `git worktree remove` (forcing when dirty). Branch is kept.
-    fn do_remove(&mut self) {
+    /// `git worktree remove` (forcing when dirty). Branch is kept. On success the
+    /// returned Refresh invalidates the worker's caches so the row disappears on
+    /// the next snapshot (the UI stays responsive while git re-scans).
+    fn do_remove(&mut self) -> Action {
         self.mode = Mode::Normal;
         let Some(target) = self.pending_remove.take() else {
-            return;
+            return Action::None;
         };
         if let Some((socket, session, window)) = &target.agent {
             if let Err(e) = crate::tmux::kill_window(socket, session, *window) {
                 self.message = Some(format!("kill window failed: {e}"));
-                return;
+                return Action::None;
             }
         }
         match crate::worktree::remove_worktree(&target.base_cwd, &target.path, target.dirty) {
             Ok(()) => {
                 self.message = Some(format!("✓ removed {}", target.branch));
                 self.selected_key = None;
-                self.caches.invalidate();
-                self.fetch();
-                self.rebuild_rows();
+                Action::Refresh { invalidate: true }
             }
-            Err(e) => self.message = Some(format!("remove failed: {e}")),
+            Err(e) => {
+                self.message = Some(format!("remove failed: {e}"));
+                Action::None
+            }
         }
     }
 
@@ -849,7 +899,9 @@ impl App {
             .title_style(Style::default().add_modifier(Modifier::BOLD));
 
         if self.rows.is_empty() {
-            let msg = if self.filter.is_empty() {
+            let msg = if !self.loaded {
+                "  loading…" // the popup opens before the worker's first snapshot
+            } else if self.filter.is_empty() {
                 "  no Claude Code agents in this session"
             } else {
                 "  no agents match filter"
@@ -897,11 +949,12 @@ impl App {
         // Show the tail of the agent's visible screen (the most recent output/prompt),
         // with its real colors: capture-pane -e keeps the SGR sequences and
         // ansi-to-tui turns them into styled ratatui lines. Unparseable output falls
-        // back to plain text rather than an empty preview.
-        let content = tmux::capture_pane(&a.state.socket, &a.pane.pane_id);
-        let text = content
+        // back to plain text rather than an empty preview. The capture itself is
+        // memoized in `refresh_preview`.
+        let text = self
+            .preview_text
             .into_text()
-            .unwrap_or_else(|_| ratatui::text::Text::raw(content));
+            .unwrap_or_else(|_| ratatui::text::Text::raw(self.preview_text.clone()));
         let rows = area.height.saturating_sub(2) as usize;
         let skip = text.lines.len().saturating_sub(rows);
         let tail: Vec<Line> = text.lines.into_iter().skip(skip).collect();
@@ -1658,6 +1711,30 @@ mod tests {
         let mut s = String::new();
         delete_last_word(&mut s); // must not panic on empty
         assert_eq!(s, "");
+    }
+
+    #[test]
+    fn refresh_keys_return_refresh_actions_for_the_worker() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('r')),
+            Action::Refresh { invalidate: false }
+        );
+        // `s` flips the scope and asks the worker to refetch with it.
+        assert!(!app.all_sessions);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('s')),
+            Action::Refresh { invalidate: false }
+        );
+        assert!(app.all_sessions);
     }
 
     #[test]

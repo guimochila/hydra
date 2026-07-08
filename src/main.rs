@@ -10,6 +10,7 @@
 mod agent;
 mod alert;
 mod config;
+mod fetcher;
 mod hook;
 mod install;
 mod state;
