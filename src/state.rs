@@ -134,8 +134,18 @@ pub fn state_file_name(socket: &str, pane_id: &str) -> String {
 
 /// Create the runtime dir if needed, owner-only (0700). The `/tmp/hydra-<user>`
 /// fallback would otherwise be world-readable, and state files carry prompt text.
+/// A pre-existing dir (e.g. created by an older hydra with default perms) is
+/// tightened too — checked first so the common path costs one stat, no chmod.
 fn create_runtime_dir(dir: &std::path::Path) -> std::io::Result<()> {
     if dir.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         return Ok(());
     }
     let mut builder = std::fs::DirBuilder::new();
