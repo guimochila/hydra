@@ -12,10 +12,12 @@ cargo clippy --all-targets
 cargo fmt                # run before committing; CI-clean = fmt --check passes
 ```
 
-There is no test harness for the interactive TUI (ratatui needs a real terminal). The
-data/logic layers are pure and unit-tested; the UI is thin rendering over them. To
-verify behavior end-to-end, use `hydra ls` and `hydra status` (headless), or drive the
-popup by hand in tmux.
+The data/logic layers are pure and unit-tested; the UI is thin rendering over them.
+The TUI itself is tested with `ratatui::backend::TestBackend` (see `ui.rs` tests):
+build an `App` from synthetic agents/worktrees, drive `handle_key`, render into an
+in-memory buffer and assert on its content — new UI behavior should come with such a
+test. For real end-to-end checks, use `hydra ls` and `hydra status` (headless), or
+drive the popup by hand in tmux.
 
 ## Architecture
 

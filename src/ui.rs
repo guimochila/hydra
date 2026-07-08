@@ -87,6 +87,7 @@ enum Mode {
 }
 
 /// A pending worktree removal, awaiting confirmation.
+#[derive(Debug)]
 struct RemoveTarget {
     /// Worktree path to remove.
     path: String,
@@ -1076,6 +1077,398 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::sanitize;
+    use super::*;
+    use crate::state::AgentState;
+    use crate::tmux::Pane;
+    use crate::worktree::WorktreeInfo;
+    use ratatui::backend::TestBackend;
+
+    /// A displayable agent with a synthetic pane/state, optionally in a repo.
+    /// `repo` = (repo_key, repo_name, branch, worktree_root).
+    fn agent(
+        pane_id: &str,
+        status: Status,
+        window: u32,
+        repo: Option<(&str, &str, &str, &str)>,
+    ) -> Agent {
+        Agent {
+            state: AgentState {
+                socket: "/sock".into(),
+                session_id: "1".into(),
+                pane_id: pane_id.into(),
+                cwd: "/repo".into(),
+                status,
+                event: "x".into(),
+                task_summary: None,
+                updated_at: 100,
+            },
+            pane: Pane {
+                pane_id: pane_id.into(),
+                session_name: "proj".into(),
+                window_index: window,
+                window_name: "claude".into(),
+                cwd: "/repo".into(),
+                window_active: false,
+                pane_tty: "/dev/ttys000".into(),
+            },
+            effective_status: status,
+            worktree: repo.map(|(key, name, branch, root)| WorktreeInfo {
+                root: root.into(),
+                repo_key: key.into(),
+                repo_name: name.into(),
+                branch: Some(branch.into()),
+            }),
+            dirty: 0,
+        }
+    }
+
+    fn idle_wt(path: &str, branch: &str, repo_key: &str, repo_name: &str) -> IdleWorktree {
+        IdleWorktree {
+            path: path.into(),
+            branch: Some(branch.into()),
+            repo_key: repo_key.into(),
+            repo_name: repo_name.into(),
+        }
+    }
+
+    /// An App with the given data, rows built and selection restored — the state the
+    /// TUI is in right after a fetch tick.
+    fn app_with(agents: Vec<Agent>, idle: Vec<IdleWorktree>) -> App {
+        let mut app = App {
+            agents,
+            idle,
+            ..App::default()
+        };
+        app.rebuild_rows();
+        app
+    }
+
+    /// Pane id (or `wt:` path) of the currently selected row, for assertions.
+    fn selected_key_of(app: &App) -> Option<String> {
+        app.list_state
+            .selected()
+            .and_then(|r| app.rows.get(r))
+            .and_then(|row| app.row_key(row))
+            .cloned()
+    }
+
+    #[test]
+    fn groups_agents_under_repo_headers_with_idle_worktrees_after() {
+        let app = app_with(
+            vec![
+                agent(
+                    "%1",
+                    Status::Working,
+                    1,
+                    Some(("/a/.git", "alpha", "f1", "/a")),
+                ),
+                agent(
+                    "%2",
+                    Status::Idle,
+                    2,
+                    Some(("/a/.git", "alpha", "f2", "/a2")),
+                ),
+                agent("%3", Status::Idle, 3, None), // no worktree
+            ],
+            vec![
+                idle_wt("/b/wt", "feat-x", "/b/.git", "beta"), // idle-only repo
+                idle_wt("/a/wt", "feat-y", "/a/.git", "alpha"),
+            ],
+        );
+        let labels: Vec<(String, usize)> = app
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Header { label, count } => Some((label.clone(), *count)),
+                _ => None,
+            })
+            .collect();
+        // Agent repos first (in agent order), idle-only repos after.
+        assert_eq!(
+            labels,
+            vec![
+                ("alpha".to_string(), 3), // 2 agents + 1 idle worktree
+                ("no worktree".to_string(), 1),
+                ("beta".to_string(), 1),
+            ]
+        );
+        // Within a group: agent rows come before worktree rows.
+        let alpha_rows: Vec<&Row> = app.rows[1..4].iter().collect();
+        assert!(matches!(alpha_rows[0], Row::Agent(_)));
+        assert!(matches!(alpha_rows[1], Row::Agent(_)));
+        assert!(matches!(alpha_rows[2], Row::Worktree(_)));
+    }
+
+    #[test]
+    fn selection_sticks_to_pane_id_across_reorder() {
+        let mut app = app_with(
+            vec![
+                agent(
+                    "%1",
+                    Status::Idle,
+                    1,
+                    Some(("/a/.git", "alpha", "f1", "/a1")),
+                ),
+                agent(
+                    "%2",
+                    Status::Idle,
+                    2,
+                    Some(("/a/.git", "alpha", "f2", "/a2")),
+                ),
+            ],
+            vec![],
+        );
+        app.selected_key = Some("%2".into());
+        app.rebuild_rows();
+        assert_eq!(selected_key_of(&app), Some("%2".to_string()));
+
+        // The list reorders (e.g. %2's status now sorts it first): selection follows.
+        app.agents.swap(0, 1);
+        app.rebuild_rows();
+        assert_eq!(selected_key_of(&app), Some("%2".to_string()));
+    }
+
+    #[test]
+    fn selection_falls_back_to_first_selectable_when_key_vanishes() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        app.selected_key = Some("%gone".into());
+        app.rebuild_rows();
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+    }
+
+    #[test]
+    fn movement_skips_headers_and_clamps() {
+        let mut app = app_with(
+            vec![
+                agent(
+                    "%1",
+                    Status::Idle,
+                    1,
+                    Some(("/a/.git", "alpha", "f1", "/a1")),
+                ),
+                agent(
+                    "%2",
+                    Status::Idle,
+                    2,
+                    Some(("/b/.git", "beta", "f2", "/b1")),
+                ),
+            ],
+            vec![],
+        );
+        // Layout: header(alpha), %1, header(beta), %2.
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+        app.move_by(1); // must skip the beta header
+        assert_eq!(selected_key_of(&app), Some("%2".to_string()));
+        app.move_by(1); // clamped at the end
+        assert_eq!(selected_key_of(&app), Some("%2".to_string()));
+        app.move_by(-5); // clamped at the start
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+    }
+
+    #[test]
+    fn gg_and_shift_g_jump_to_first_and_last() {
+        let mut app = app_with(
+            vec![
+                agent(
+                    "%1",
+                    Status::Idle,
+                    1,
+                    Some(("/a/.git", "alpha", "f1", "/a1")),
+                ),
+                agent(
+                    "%2",
+                    Status::Idle,
+                    2,
+                    Some(("/a/.git", "alpha", "f2", "/a2")),
+                ),
+                agent(
+                    "%3",
+                    Status::Idle,
+                    3,
+                    Some(("/a/.git", "alpha", "f3", "/a3")),
+                ),
+            ],
+            vec![],
+        );
+        app.handle_key(KeyCode::Char('G'));
+        assert_eq!(selected_key_of(&app), Some("%3".to_string()));
+        app.handle_key(KeyCode::Char('g'));
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+    }
+
+    #[test]
+    fn tab_cycles_needs_input_and_wraps() {
+        let mut app = app_with(
+            vec![
+                agent(
+                    "%1",
+                    Status::NeedsInput,
+                    1,
+                    Some(("/a/.git", "alpha", "f1", "/a1")),
+                ),
+                agent(
+                    "%2",
+                    Status::Idle,
+                    2,
+                    Some(("/a/.git", "alpha", "f2", "/a2")),
+                ),
+                agent(
+                    "%3",
+                    Status::NeedsInput,
+                    3,
+                    Some(("/a/.git", "alpha", "f3", "/a3")),
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(selected_key_of(&app), Some("%3".to_string()));
+        app.handle_key(KeyCode::Tab); // wraps past %3 back to %1
+        assert_eq!(selected_key_of(&app), Some("%1".to_string()));
+    }
+
+    #[test]
+    fn tab_with_no_waiting_agents_shows_a_hint() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.message.as_deref(), Some("no agents need input"));
+    }
+
+    #[test]
+    fn remove_target_rejects_the_main_worktree() {
+        // Worktree root == the repo's main dir (repo_key minus /.git).
+        let app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/repo/main/.git", "main-repo", "main", "/repo/main")),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            app.remove_target().unwrap_err(),
+            "can't remove the main worktree"
+        );
+    }
+
+    #[test]
+    fn remove_target_rejects_hydras_own_cwd() {
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/elsewhere/.git", "other", "b", cwd.as_str())),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            app.remove_target().unwrap_err(),
+            "can't remove the worktree Hydra is running in"
+        );
+    }
+
+    #[test]
+    fn remove_target_accepts_a_linked_worktree_and_enters_confirm() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/repo/main/.git", "main-repo", "feat", "/wt/feat")),
+            )],
+            vec![],
+        );
+        let target = app.remove_target().expect("linked worktree is removable");
+        assert_eq!(target.path, "/wt/feat");
+        assert_eq!(target.base_cwd, "/repo/main");
+        assert!(target.agent.is_some(), "running agent must be killed first");
+
+        app.handle_key(KeyCode::Char('x'));
+        assert!(app.mode == Mode::Confirm && app.pending_remove.is_some());
+        // Anything but y/Y cancels.
+        app.handle_key(KeyCode::Char('n'));
+        assert!(app.mode == Mode::Normal && app.pending_remove.is_none());
+    }
+
+    #[test]
+    fn keys_enter_and_leave_the_input_modes() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        app.handle_key(KeyCode::Char('/'));
+        assert!(app.mode == Mode::Filter);
+        app.handle_key(KeyCode::Char('x'));
+        assert_eq!(app.filter, "x"); // typed into the filter, not treated as remove
+        app.handle_key(KeyCode::Esc);
+        assert!(app.mode == Mode::Normal && app.filter.is_empty());
+
+        app.handle_key(KeyCode::Char('i'));
+        assert!(app.mode == Mode::Send);
+        app.handle_key(KeyCode::Esc);
+        assert!(app.mode == Mode::Normal);
+
+        app.handle_key(KeyCode::Char('n'));
+        assert!(app.mode == Mode::Spawn);
+        app.handle_key(KeyCode::Esc);
+        assert!(app.mode == Mode::Normal);
+    }
+
+    #[test]
+    fn render_smoke_test_shows_headers_agents_and_worktrees() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::NeedsInput,
+                4,
+                Some(("/a/.git", "alpha", "feat/pagination", "/a1")),
+            )],
+            vec![idle_wt("/a/wt", "feat-idle", "/a/.git", "alpha")],
+        );
+        app.show_preview = false; // keep the test hermetic (no tmux capture)
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("▸ alpha"), "repo header rendered");
+        assert!(text.contains("⚠"), "needs-input glyph rendered");
+        assert!(text.contains("feat/pagination"), "branch rendered");
+        assert!(text.contains("feat-idle"), "idle worktree rendered");
+        assert!(text.contains("start ⏎"), "start affordance rendered");
+        assert!(text.contains("⚠ 1"), "title shows the needs-input count");
+    }
 
     #[test]
     fn sanitize_makes_a_safe_path_segment() {
