@@ -13,7 +13,7 @@ use crate::tmux;
 use crate::worktree::{Caches, IdleWorktree};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -61,6 +61,9 @@ enum Response {
     Approve,
     /// Reject / cancel the prompt (send Escape).
     Deny,
+    /// Select option N of a multi-option dialog (send the digit itself) — less
+    /// fragile than Enter/Escape when the default isn't the answer you want.
+    Pick(char),
 }
 
 /// A rendered line: a repo header, a running agent (`view` index), or an idle
@@ -193,7 +196,7 @@ impl App {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    match self.handle_key(key.code) {
+                    match self.handle_key(key) {
                         Action::Quit => break,
                         Action::Jump => {
                             self.jump()?;
@@ -342,26 +345,40 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> Action {
+    fn handle_key(&mut self, key: KeyEvent) -> Action {
         match self.mode {
             Mode::Filter => {
-                self.handle_filter_key(code);
+                self.handle_filter_key(key);
                 Action::None
             }
             Mode::Send => {
-                self.handle_send_key(code);
+                self.handle_send_key(key);
                 Action::None
             }
             Mode::Spawn => {
-                self.handle_spawn_key(code);
+                self.handle_spawn_key(key);
                 Action::None
             }
             Mode::Confirm => {
-                self.handle_confirm_key(code);
+                self.handle_confirm_key(key.code);
                 Action::None
             }
-            Mode::Normal => self.handle_normal_key(code),
+            Mode::Normal => self.handle_normal_key(key.code),
         }
+    }
+
+    /// Readline-style editing shared by the three text-input modes. Returns whether
+    /// the key was a handled (or swallowed) Ctrl chord.
+    fn handle_edit_chord(key: KeyEvent, buf: &mut String) -> bool {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('u') => buf.clear(),
+            KeyCode::Char('w') => delete_last_word(buf),
+            _ => {} // swallow other Ctrl chords rather than typing them literally
+        }
+        true
     }
 
     fn handle_normal_key(&mut self, code: KeyCode) -> Action {
@@ -408,6 +425,7 @@ impl App {
             // Interaction (Phase 3): approve/deny a pending prompt, or compose a message.
             KeyCode::Char('a') => self.respond(Response::Approve),
             KeyCode::Char('d') => self.respond(Response::Deny),
+            KeyCode::Char(c @ '1'..='3') => self.respond(Response::Pick(c)),
             KeyCode::Char('i') => {
                 if self.selected_agent().is_some() {
                     self.send_input.clear();
@@ -421,8 +439,12 @@ impl App {
         Action::None
     }
 
-    fn handle_filter_key(&mut self, code: KeyCode) {
-        match code {
+    fn handle_filter_key(&mut self, key: KeyEvent) {
+        if Self::handle_edit_chord(key, &mut self.filter) {
+            self.rebuild_rows();
+            return;
+        }
+        match key.code {
             // Esc abandons the filter; Enter commits it and returns to normal mode.
             KeyCode::Esc => {
                 self.filter.clear();
@@ -444,8 +466,11 @@ impl App {
         }
     }
 
-    fn handle_send_key(&mut self, code: KeyCode) {
-        match code {
+    fn handle_send_key(&mut self, key: KeyEvent) {
+        if Self::handle_edit_chord(key, &mut self.send_input) {
+            return;
+        }
+        match key.code {
             KeyCode::Esc => {
                 self.send_input.clear();
                 self.mode = Mode::Normal;
@@ -465,8 +490,11 @@ impl App {
         }
     }
 
-    fn handle_spawn_key(&mut self, code: KeyCode) {
-        match code {
+    fn handle_spawn_key(&mut self, key: KeyEvent) {
+        if Self::handle_edit_chord(key, &mut self.spawn_input) {
+            return;
+        }
+        match key.code {
             KeyCode::Esc => {
                 self.spawn_input.clear();
                 self.mode = Mode::Normal;
@@ -533,9 +561,9 @@ impl App {
         Some((socket, session, cwd))
     }
 
-    /// Approve (accept the highlighted default) or deny (Escape) a pending prompt on the
-    /// selected agent. Only acts when that agent is actually waiting for input, so a
-    /// stray keypress can't submit an Enter to a busy or idle agent.
+    /// Approve (Enter), deny (Escape) or pick option N (digit) on the selected
+    /// agent's pending prompt. Only acts when that agent is actually waiting for
+    /// input, so a stray keypress can't submit an Enter to a busy or idle agent.
     fn respond(&mut self, response: Response) {
         let Some((socket, pane, window, status)) = self.selected_target() else {
             return;
@@ -544,11 +572,19 @@ impl App {
             self.message = Some(format!("win {window} isn't waiting for input"));
             return;
         }
+        // The in-memory status can be a refresh-tick stale; re-read the state file at
+        // the last moment so the keystroke can't hit an agent that already moved on.
+        let fresh = crate::state::read_one(&socket, &pane).map(|s| s.status);
+        if fresh != Some(Status::NeedsInput) {
+            self.message = Some(format!("win {window} is no longer waiting for input"));
+            return;
+        }
         let (key, verb) = match response {
-            Response::Approve => ("Enter", "approved"),
-            Response::Deny => ("Escape", "denied"),
+            Response::Approve => ("Enter".to_string(), "approved".to_string()),
+            Response::Deny => ("Escape".to_string(), "denied".to_string()),
+            Response::Pick(c) => (c.to_string(), format!("picked {c} in")),
         };
-        self.message = Some(match tmux::send_key(&socket, &pane, key) {
+        self.message = Some(match tmux::send_key(&socket, &pane, &key) {
             Ok(()) => format!("✓ {verb} win {window}"),
             Err(e) => format!("{verb} failed: {e}"),
         });
@@ -957,6 +993,7 @@ impl App {
                     ("⏎", "start/jump"),
                     ("a", "✓"),
                     ("d", "✗"),
+                    ("1-3", "pick"),
                     ("i", "send"),
                     ("n", "new"),
                     ("x", "remove"),
@@ -1096,6 +1133,16 @@ fn canon(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
+/// Delete the trailing word plus any whitespace after it (readline Ctrl-W).
+fn delete_last_word(s: &mut String) {
+    while s.chars().last().is_some_and(char::is_whitespace) {
+        s.pop();
+    }
+    while s.chars().last().is_some_and(|c| !c.is_whitespace()) {
+        s.pop();
+    }
+}
+
 /// Make a name safe as a single path segment (slashes/whitespace → `-`). The branch
 /// keeps the original name; only the worktree directory leaf is sanitized.
 fn sanitize(name: &str) -> String {
@@ -1178,6 +1225,11 @@ mod tests {
         };
         app.rebuild_rows();
         app
+    }
+
+    /// Press a plain (unmodified) key, as the run loop would deliver it.
+    fn press(app: &mut App, code: KeyCode) -> Action {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     /// Pane id (or `wt:` path) of the currently selected row, for assertions.
@@ -1335,10 +1387,10 @@ mod tests {
             ],
             vec![],
         );
-        app.handle_key(KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('G'));
         assert_eq!(selected_key_of(&app), Some("%3".to_string()));
-        app.handle_key(KeyCode::Char('g'));
-        app.handle_key(KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
         assert_eq!(selected_key_of(&app), Some("%1".to_string()));
     }
 
@@ -1368,9 +1420,9 @@ mod tests {
             vec![],
         );
         assert_eq!(selected_key_of(&app), Some("%1".to_string()));
-        app.handle_key(KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(selected_key_of(&app), Some("%3".to_string()));
-        app.handle_key(KeyCode::Tab); // wraps past %3 back to %1
+        press(&mut app, KeyCode::Tab); // wraps past %3 back to %1
         assert_eq!(selected_key_of(&app), Some("%1".to_string()));
     }
 
@@ -1385,7 +1437,7 @@ mod tests {
             )],
             vec![],
         );
-        app.handle_key(KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.message.as_deref(), Some("no agents need input"));
     }
 
@@ -1441,10 +1493,10 @@ mod tests {
         assert_eq!(target.base_cwd, "/repo/main");
         assert!(target.agent.is_some(), "running agent must be killed first");
 
-        app.handle_key(KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('x'));
         assert!(app.mode == Mode::Confirm && app.pending_remove.is_some());
         // Anything but y/Y cancels.
-        app.handle_key(KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('n'));
         assert!(app.mode == Mode::Normal && app.pending_remove.is_none());
     }
 
@@ -1459,21 +1511,21 @@ mod tests {
             )],
             vec![],
         );
-        app.handle_key(KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('/'));
         assert!(app.mode == Mode::Filter);
-        app.handle_key(KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.filter, "x"); // typed into the filter, not treated as remove
-        app.handle_key(KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
         assert!(app.mode == Mode::Normal && app.filter.is_empty());
 
-        app.handle_key(KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('i'));
         assert!(app.mode == Mode::Send);
-        app.handle_key(KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
         assert!(app.mode == Mode::Normal);
 
-        app.handle_key(KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('n'));
         assert!(app.mode == Mode::Spawn);
-        app.handle_key(KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
         assert!(app.mode == Mode::Normal);
     }
 
@@ -1505,6 +1557,78 @@ mod tests {
         assert!(text.contains("feat-idle"), "idle worktree rendered");
         assert!(text.contains("start ⏎"), "start affordance rendered");
         assert!(text.contains("⚠ 1"), "title shows the needs-input count");
+    }
+
+    #[test]
+    fn respond_requires_a_fresh_needs_input_state_file() {
+        // The in-memory agent says NeedsInput, but no state file backs it up (the
+        // agent moved on / the file is gone) — respond must refuse to send keys.
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::NeedsInput,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("win 4 is no longer waiting for input")
+        );
+    }
+
+    #[test]
+    fn number_keys_are_gated_like_approve() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Working,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("win 4 isn't waiting for input")
+        );
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_edit_the_send_buffer() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('i'));
+        for c in "fix the api tests".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.send_input, "fix the api ");
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.send_input, "");
+    }
+
+    #[test]
+    fn delete_last_word_handles_spaces_and_unicode() {
+        let mut s = "fix the tests  ".to_string();
+        delete_last_word(&mut s);
+        assert_eq!(s, "fix the ");
+        let mut s = "héllo wörld".to_string();
+        delete_last_word(&mut s);
+        assert_eq!(s, "héllo ");
+        let mut s = String::new();
+        delete_last_word(&mut s); // must not panic on empty
+        assert_eq!(s, "");
     }
 
     #[test]
