@@ -115,4 +115,5 @@ preview pane) are done. `git status` for dirty counts is throttled via `DirtyCac
 (`DIRTY_TTL_SECS`) so it doesn't run on every fetch tick — keep it that way. Not yet
 verified: the cross-socket jump against a real nested tmux (matching logic unit-tested
 via `match_pane_by_tty`). The command *forms* for send-keys, spawn (worktree +
-new-window) and status are verified against live tmux.
+new-window), status, and the cross-session jump (`switch-client`, incl. from inside a
+popup) are verified against live tmux.

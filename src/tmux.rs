@@ -57,11 +57,17 @@ pub fn list_panes(socket: &str) -> Vec<Pane> {
 
 /// Bring the view to an agent. `agent_socket` is the server the agent runs on.
 ///
-/// Same-server case (the norm): just select the agent's window/pane. Nested case
-/// (agent on a different tmux server than Hydra's popup): also focus the outer pane
-/// that hosts the inner tmux client, so the user actually sees the inner view. The
-/// host pane is found by matching the inner client's tty to an outer pane's tty; if
-/// that can't be resolved we still selected the inner window (best effort).
+/// `select-window`/`select-pane` only change what's current *inside* the agent's
+/// session; if the agent lives in a different session than the one being viewed
+/// (all-sessions mode), the attached client must also be moved there with
+/// `switch-client`. Run from inside the popup, tmux resolves the popup's owning
+/// client; a same-session switch is a no-op.
+///
+/// Nested case (agent on a different tmux server than Hydra's popup): switch the
+/// *inner* client to the agent's session, then focus the outer pane that hosts it,
+/// so the user actually sees the inner view. The host pane is found by matching the
+/// inner client's tty to an outer pane's tty; if that can't be resolved we still
+/// selected the inner window (best effort).
 pub fn jump_to(
     agent_socket: &str,
     session: &str,
@@ -72,20 +78,25 @@ pub fn jump_to(
     run(agent_socket, &["select-window", "-t", &target_window])?;
     run(agent_socket, &["select-pane", "-t", pane_id])?;
 
-    if let Some(host_socket) = current_socket() {
-        if host_socket != agent_socket {
-            focus_host_pane(&host_socket, agent_socket);
+    match current_socket() {
+        Some(host_socket) if host_socket != agent_socket => {
+            focus_host_pane(&host_socket, agent_socket, session);
+        }
+        _ => {
+            run(agent_socket, &["switch-client", "-t", session])?;
         }
     }
     Ok(())
 }
 
-/// On `host_socket`, select the pane that hosts a client of `inner_socket`. Best effort:
-/// silently returns if no client/tty/pane can be matched.
-fn focus_host_pane(host_socket: &str, inner_socket: &str) {
+/// On `host_socket`, select the pane that hosts a client of `inner_socket`, first
+/// switching that inner client to `session` (the agent's). Best effort: silently
+/// returns if no client/tty/pane can be matched.
+fn focus_host_pane(host_socket: &str, inner_socket: &str, session: &str) {
     for tty in client_ttys(inner_socket) {
         let panes = list_panes(host_socket);
         if let Some(host) = match_pane_by_tty(&panes, &tty) {
+            let _ = run(inner_socket, &["switch-client", "-c", &tty, "-t", session]);
             let target = format!("{}:{}", host.session_name, host.window_index);
             let _ = run(host_socket, &["select-window", "-t", &target]);
             let _ = run(host_socket, &["select-pane", "-t", &host.pane_id]);
