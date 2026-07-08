@@ -39,6 +39,10 @@ fn main() -> ExitCode {
             print_help();
             Ok(())
         }
+        Some("version") | Some("-V") | Some("--version") => {
+            println!("hydra {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some(other) => {
             eprintln!("hydra: unknown command '{other}'\n");
             print_help();
@@ -78,7 +82,15 @@ pub fn current_overview(caches: &mut worktree::Caches, stale_after: u64) -> Over
         .filter(|s| s.socket == socket)
         .collect();
     let now = now_secs();
-    let agents = agent::collect(&socket, &session, states, now, caches, stale_after);
+    let panes = tmux::list_panes(&socket);
+
+    // GC: a state file whose pane is long gone (crashed agent, no SessionEnd) is
+    // invisible in the join but would otherwise sit on disk forever. Best-effort.
+    for (sock, pane_id) in agent::dead_states(&states, &panes, now, agent::GC_GRACE_SECS) {
+        let _ = state::remove_state(&sock, &pane_id);
+    }
+
+    let agents = agent::collect(&session, states, &panes, now, caches, stale_after);
 
     // Anchor worktree listing at the popup's cwd, falling back to an agent's cwd.
     let anchor = std::env::current_dir()
@@ -143,7 +155,8 @@ fn print_help() {
          \x20 hydra ls                 Print the agent list (headless)\n\
          \x20 hydra status <sock> <s>  Print the status-line indicator for a session\n\
          \x20 hydra hook <event>       Record a Claude Code lifecycle event\n\
-         \x20 hydra install          Install hooks + tmux popup keybinding\n\
-         \x20 hydra uninstall        Remove hooks + keybinding"
+         \x20 hydra install            Install hooks + tmux popup keybinding\n\
+         \x20 hydra uninstall          Remove hooks + keybinding\n\
+         \x20 hydra version            Print the hydra version"
     );
 }

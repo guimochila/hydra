@@ -50,11 +50,13 @@ pub enum EventOutcome {
 /// Map a Claude Code hook event name to the effect it has on agent state.
 pub fn outcome_for_event(event: &str) -> EventOutcome {
     match event {
-        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => {
+        // SubagentStop means a *subagent* finished — the parent agent is still
+        // processing its result, so it stays WORKING (Idle here would flicker).
+        "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStop" => {
             EventOutcome::Set(Status::Working)
         }
         "Notification" => EventOutcome::Set(Status::NeedsInput),
-        "Stop" | "SubagentStop" => EventOutcome::Set(Status::Idle),
+        "Stop" => EventOutcome::Set(Status::Idle),
         "SessionEnd" => EventOutcome::Remove,
         _ => EventOutcome::Ignore,
     }
@@ -125,11 +127,27 @@ pub fn state_file_name(socket: &str, pane_id: &str) -> String {
     format!("pane-{socket_hash:x}-{pane}.json")
 }
 
+/// Create the runtime dir if needed, owner-only (0700). The `/tmp/hydra-<user>`
+/// fallback would otherwise be world-readable, and state files carry prompt text.
+fn create_runtime_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// Write a state record atomically (temp file + rename) so the reader never sees a
 /// half-written file. Creates the runtime dir on demand.
 pub fn write_state(state: &AgentState) -> std::io::Result<()> {
     let dir = runtime_dir();
-    std::fs::create_dir_all(&dir)?;
+    create_runtime_dir(&dir)?;
     let final_path = dir.join(state_file_name(&state.socket, &state.pane_id));
     let tmp_path = dir.join(format!(
         ".{}.tmp",
@@ -199,10 +217,19 @@ mod tests {
             EventOutcome::Set(Status::Working)
         );
         assert_eq!(
+            outcome_for_event("PostToolUse"),
+            EventOutcome::Set(Status::Working)
+        );
+        assert_eq!(
             outcome_for_event("Notification"),
             EventOutcome::Set(Status::NeedsInput)
         );
         assert_eq!(outcome_for_event("Stop"), EventOutcome::Set(Status::Idle));
+        // A subagent stopping must NOT idle the parent agent — it's still working.
+        assert_eq!(
+            outcome_for_event("SubagentStop"),
+            EventOutcome::Set(Status::Working)
+        );
         assert_eq!(outcome_for_event("SessionEnd"), EventOutcome::Remove);
         assert_eq!(outcome_for_event("SomethingElse"), EventOutcome::Ignore);
     }

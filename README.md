@@ -55,9 +55,14 @@ leaving the popup.
 git clone https://github.com/guimochila/hydra.git
 cd hydra
 cargo build --release
-./target/release/hydra install      # adds Claude Code hooks + a tmux popup binding
+cp target/release/hydra ~/.local/bin/   # or anywhere stable on your PATH
+~/.local/bin/hydra install              # adds Claude Code hooks + a tmux popup binding
 tmux source-file ~/.tmux.conf
 ```
+
+> `install` bakes the binary's **absolute path** into the hooks and tmux binding, so
+> run it from a stable location (not a `target/` build dir that moves on rebuild).
+> If you move the binary later, just re-run `hydra install` from the new path.
 
 ### Prebuilt binaries
 
@@ -204,8 +209,8 @@ Hydra never scrapes terminal output. Instead:
 3. **Git says which worktree.** Each agent's cwd resolves to a branch/repo, and agents are
    grouped under their repo.
 
-Status comes from the hook events: `UserPromptSubmit`/`PreToolUse` → working,
-`Notification` → needs input, `Stop` → idle, `SessionEnd` → gone.
+Status comes from the hook events: `UserPromptSubmit`/`PreToolUse`/`PostToolUse` →
+working, `Notification` → needs input, `Stop` → idle, `SessionEnd` → gone.
 
 ## Commands
 

@@ -88,9 +88,13 @@ Module map (`src/`):
 
 ## Status state machine
 
-`UserPromptSubmit`/`PreToolUse`/`SessionStart` → `WORKING`; `Notification` →
-`NEEDS_INPUT`; `Stop` → `IDLE`; `SessionEnd` → removed. Staleness downgrades only
-`WORKING` (not idle/needs-input, which can legitimately sit) to `UNKNOWN`.
+`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`SessionStart` → `WORKING`;
+`Notification` → `NEEDS_INPUT`; `Stop` → `IDLE`; `SessionEnd` → removed.
+`SubagentStop` also maps to `WORKING` (the *parent* agent is still processing — never
+`IDLE`, which would flicker). Staleness downgrades only `WORKING` (not
+idle/needs-input, which can legitimately sit) to `UNKNOWN`. Leftover files from
+crashed agents (no `SessionEnd`) are GC'd by `current_overview` via
+`agent::dead_states`: pane gone from `list_panes` AND older than `GC_GRACE_SECS`.
 
 ## Roadmap notes
 

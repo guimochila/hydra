@@ -66,23 +66,45 @@ pub fn join_and_sort(
     agents
 }
 
-/// Full pipeline: read live panes on `socket`, join with `states`, and resolve each
-/// surviving agent's worktree and (throttled) uncommitted-change count.
+/// Full pipeline: join `states` with the given live `panes`, and resolve each
+/// surviving agent's worktree and (throttled) uncommitted-change count. The caller
+/// provides `panes` (one `list_panes` call serves both this join and the GC).
 pub fn collect(
-    socket: &str,
     session_name: &str,
     states: Vec<AgentState>,
+    panes: &[Pane],
     now: u64,
     caches: &mut Caches,
     stale_after: u64,
 ) -> Vec<Agent> {
-    let panes = crate::tmux::list_panes(socket);
-    let mut agents = join_and_sort(states, &panes, session_name, now, stale_after);
+    let mut agents = join_and_sort(states, panes, session_name, now, stale_after);
     for agent in &mut agents {
         agent.worktree = caches.worktree.resolve(&agent.pane.cwd);
         agent.dirty = caches.dirty.count(&agent.pane.cwd, now);
     }
     agents
+}
+
+/// Grace period before a dead agent's leftover state file is deleted. Generous on
+/// purpose: leftovers are invisible anyway (the join hides them), so GC is pure disk
+/// hygiene and must never race a pane that is briefly absent.
+pub const GC_GRACE_SECS: u64 = 3600;
+
+/// State files whose pane no longer exists on this socket AND whose last update is
+/// older than `grace_secs` — safe to delete. Returns their (socket, pane_id) keys.
+/// `states` must already be filtered to the socket `panes` was listed from.
+pub fn dead_states(
+    states: &[AgentState],
+    panes: &[Pane],
+    now: u64,
+    grace_secs: u64,
+) -> Vec<(String, String)> {
+    states
+        .iter()
+        .filter(|s| !panes.iter().any(|p| p.pane_id == s.pane_id))
+        .filter(|s| now.saturating_sub(s.updated_at) > grace_secs)
+        .map(|s| (s.socket.clone(), s.pane_id.clone()))
+        .collect()
 }
 
 /// Format an age in seconds compactly: `12s`, `4m`, `2h`, `3d`.
@@ -243,6 +265,19 @@ mod tests {
         let idle = idle_from(&[occupied_agent], &project);
         let paths: Vec<&str> = idle.iter().map(|w| w.path.as_str()).collect();
         assert_eq!(paths, vec!["/repo/main", "/wt/b"]);
+    }
+
+    #[test]
+    fn dead_states_only_flags_long_gone_panes() {
+        let now = 10_000;
+        let states = vec![
+            state("%1", Status::Idle, 0),           // pane alive → kept
+            state("%2", Status::Working, 9_990),    // pane gone but recent → kept
+            state("%3", Status::NeedsInput, 1_000), // pane gone + old → dead
+        ];
+        let panes = vec![pane("%1", "proj", 1)];
+        let dead = dead_states(&states, &panes, now, GC_GRACE_SECS);
+        assert_eq!(dead, vec![("/sock".to_string(), "%3".to_string())]);
     }
 
     #[test]
