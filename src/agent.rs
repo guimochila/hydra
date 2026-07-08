@@ -30,12 +30,13 @@ pub struct Agent {
 pub const STALE_AFTER_SECS: u64 = 900;
 
 /// Pure core: join `states` (already for one socket) against live `panes`, keep only
-/// those in `session_name`, apply staleness, and sort (NeedsInput first, then by
-/// window index). Worktree is left unresolved here so this stays IO-free and testable.
+/// those in `session_name` (`None` = every session on the socket), apply staleness,
+/// and sort (NeedsInput first, then by window index). Worktree is left unresolved
+/// here so this stays IO-free and testable.
 pub fn join_and_sort(
     states: Vec<AgentState>,
     panes: &[Pane],
-    session_name: &str,
+    session_name: Option<&str>,
     now: u64,
     stale_after: u64,
 ) -> Vec<Agent> {
@@ -43,7 +44,7 @@ pub fn join_and_sort(
         .into_iter()
         .filter_map(|state| {
             let pane = panes.iter().find(|p| p.pane_id == state.pane_id)?.clone();
-            if pane.session_name != session_name {
+            if session_name.is_some_and(|name| pane.session_name != name) {
                 return None;
             }
             let effective_status =
@@ -70,7 +71,7 @@ pub fn join_and_sort(
 /// surviving agent's worktree and (throttled) uncommitted-change count. The caller
 /// provides `panes` (one `list_panes` call serves both this join and the GC).
 pub fn collect(
-    session_name: &str,
+    session_name: Option<&str>,
     states: Vec<AgentState>,
     panes: &[Pane],
     now: u64,
@@ -105,6 +106,21 @@ pub fn dead_states(
         .filter(|s| now.saturating_sub(s.updated_at) > grace_secs)
         .map(|s| (s.socket.clone(), s.pane_id.clone()))
         .collect()
+}
+
+/// Candidate anchor directories for idle-worktree discovery: each agent's worktree
+/// root in display order, then the popup's own cwd. Order matters — the caller
+/// dedupes by repo identity taking the first anchor, so idle-only repos (reachable
+/// just via the popup cwd) group after the repos that hold agents.
+pub fn idle_anchors(agents: &[Agent], popup_cwd: Option<&str>) -> Vec<String> {
+    let mut anchors: Vec<String> = agents
+        .iter()
+        .filter_map(|a| a.worktree.as_ref().map(|w| w.root.clone()))
+        .collect();
+    if let Some(cwd) = popup_cwd {
+        anchors.push(cwd.to_string());
+    }
+    anchors
 }
 
 /// The per-row detail text: while the agent needs input, the live attention message
@@ -294,6 +310,17 @@ mod tests {
     }
 
     #[test]
+    fn idle_anchors_lists_agent_roots_first_then_popup_cwd() {
+        let a1 = agent_with("%1", Status::Working, 1, Some(("/a/.git", "alpha", None)));
+        let a2 = agent_with("%2", Status::Idle, 2, None); // no worktree → no anchor
+        assert_eq!(
+            idle_anchors(&[a1, a2], Some("/popup/repo")),
+            vec!["/r".to_string(), "/popup/repo".to_string()]
+        );
+        assert!(idle_anchors(&[], None).is_empty());
+    }
+
+    #[test]
     fn detail_text_prefers_attention_only_while_needing_input() {
         let mut a = agent_with("%1", Status::NeedsInput, 1, None);
         a.state.task_summary = Some("build the api".into());
@@ -338,7 +365,7 @@ mod tests {
             state("%2", Status::Working, 100), // no matching live pane
         ];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].state.pane_id, "%1");
     }
@@ -350,9 +377,20 @@ mod tests {
             state("%2", Status::Idle, 100),
         ];
         let panes = vec![pane("%1", "proj", 1), pane("%2", "other", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].pane.session_name, "proj");
+    }
+
+    #[test]
+    fn no_session_filter_keeps_every_session() {
+        let states = vec![
+            state("%1", Status::Idle, 100),
+            state("%2", Status::Idle, 100),
+        ];
+        let panes = vec![pane("%1", "proj", 1), pane("%2", "other", 1)];
+        let agents = join_and_sort(states, &panes, None, 100, STALE_AFTER_SECS);
+        assert_eq!(agents.len(), 2);
     }
 
     #[test]
@@ -369,7 +407,7 @@ mod tests {
             pane("%3", "proj", 3),
             pane("%4", "proj", 1),
         ];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         let order: Vec<&str> = agents.iter().map(|a| a.state.pane_id.as_str()).collect();
         // NeedsInput(%2), then Working by window index (%4 win1, %3 win3), then Idle(%1).
         assert_eq!(order, vec!["%2", "%4", "%3", "%1"]);
@@ -379,7 +417,7 @@ mod tests {
     fn stale_working_agent_becomes_unknown() {
         let states = vec![state("%1", Status::Working, 0)];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 10_000, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 10_000, STALE_AFTER_SECS);
         assert_eq!(agents[0].effective_status, Status::Unknown);
     }
 
@@ -388,7 +426,7 @@ mod tests {
         // Idle agents can sit indefinitely; staleness must not touch them.
         let states = vec![state("%1", Status::Idle, 0)];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 10_000, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 10_000, STALE_AFTER_SECS);
         assert_eq!(agents[0].effective_status, Status::Idle);
     }
 }

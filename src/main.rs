@@ -66,9 +66,14 @@ pub struct Overview {
     pub idle: Vec<worktree::IdleWorktree>,
 }
 
-/// Resolve the current socket/session, collect agents, and list the project's idle
-/// worktrees. Shared by `ls` and the TUI.
-pub fn current_overview(caches: &mut worktree::Caches, stale_after: u64) -> Overview {
+/// Resolve the current socket/session, collect agents (session-scoped, or every
+/// session on the socket when `all_sessions`), and list idle worktrees across all
+/// repos in view. Shared by `ls` and the TUI.
+pub fn current_overview(
+    caches: &mut worktree::Caches,
+    stale_after: u64,
+    all_sessions: bool,
+) -> Overview {
     let socket = match tmux::current_socket() {
         Some(s) => s,
         None => return Overview::default(),
@@ -90,18 +95,26 @@ pub fn current_overview(caches: &mut worktree::Caches, stale_after: u64) -> Over
         let _ = state::remove_state(&sock, &pane_id);
     }
 
-    let agents = agent::collect(&session, states, &panes, now, caches, stale_after);
+    let session_filter = (!all_sessions).then_some(session.as_str());
+    let agents = agent::collect(session_filter, states, &panes, now, caches, stale_after);
 
-    // Anchor worktree listing at the popup's cwd, falling back to an agent's cwd.
-    let anchor = std::env::current_dir()
+    // Idle worktrees for every repo in view: each agent's repo plus the popup's own
+    // cwd (when it's in a repo) — deduped by repo identity, first anchor wins.
+    let popup_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string())
-        .filter(|p| caches.worktree.resolve(p).is_some())
-        .or_else(|| agents.first().map(|a| a.pane.cwd.clone()));
-    let idle = anchor
-        .and_then(|cwd| caches.wt_list.get(&cwd, now))
-        .map(|project| agent::idle_from(&agents, &project))
-        .unwrap_or_default();
+        .filter(|p| caches.worktree.resolve(p).is_some());
+    let mut idle = Vec::new();
+    let mut seen_repos = std::collections::HashSet::new();
+    for anchor in agent::idle_anchors(&agents, popup_cwd.as_deref()) {
+        let Some(project) = caches.wt_list.get(&anchor, now) else {
+            continue;
+        };
+        if !seen_repos.insert(project.repo_key.clone()) {
+            continue;
+        }
+        idle.extend(agent::idle_from(&agents, &project));
+    }
 
     Overview { agents, idle }
 }
@@ -112,7 +125,7 @@ fn list_command() -> std::io::Result<()> {
         cfg.timings.dirty_ttl_secs,
         cfg.timings.worktree_list_ttl_secs,
     );
-    let overview = current_overview(&mut caches, cfg.timings.stale_after_secs);
+    let overview = current_overview(&mut caches, cfg.timings.stale_after_secs, false);
     if overview.agents.is_empty() && overview.idle.is_empty() {
         println!("(no agents or worktrees in this session)");
         return Ok(());

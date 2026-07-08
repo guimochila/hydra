@@ -149,6 +149,8 @@ struct App {
     colors: TuiColors,
     /// Whether the preview pane is shown.
     show_preview: bool,
+    /// Show agents from every session on the socket, not just the current one.
+    all_sessions: bool,
     /// All agents this tick (status-sorted), before filtering.
     agents: Vec<Agent>,
     /// All idle worktrees this tick, before filtering.
@@ -213,8 +215,11 @@ impl App {
 
     /// Re-read agents + idle worktrees from disk/tmux/git (the expensive step).
     fn fetch(&mut self) {
-        let overview =
-            crate::current_overview(&mut self.caches, self.config.timings.stale_after_secs);
+        let overview = crate::current_overview(
+            &mut self.caches,
+            self.config.timings.stale_after_secs,
+            self.all_sessions,
+        );
         self.agents = overview.agents;
         self.idle = overview.idle;
     }
@@ -389,6 +394,11 @@ impl App {
                 self.rebuild_rows();
             }
             KeyCode::Char('p') => self.show_preview = !self.show_preview,
+            KeyCode::Char('s') => {
+                self.all_sessions = !self.all_sessions;
+                self.fetch();
+                self.rebuild_rows();
+            }
             KeyCode::Char('n') => {
                 self.spawn_input.clear();
                 self.mode = Mode::Spawn;
@@ -478,11 +488,12 @@ impl App {
     }
 
     /// Create a worktree + tmux window running `claude` for a new agent. Uses an
-    /// existing agent (selected, else first) to infer the repo, socket and session —
-    /// so spawning needs at least one agent already present to anchor the project.
+    /// existing agent (selected, else first) to infer the repo, socket and session,
+    /// falling back to the popup's own cwd when no agent exists yet — so the first
+    /// agent of a session can be spawned from Hydra too.
     fn spawn_agent(&mut self, name: &str) {
         let Some((socket, session, cwd)) = self.spawn_context() else {
-            self.message = Some("spawn needs an existing agent to anchor the repo".into());
+            self.message = Some("spawn needs an agent, or open the popup from a git repo".into());
             return;
         };
         let path = worktree_root(&self.config).join(sanitize(name));
@@ -505,14 +516,21 @@ impl App {
         };
     }
 
-    /// Socket/session/cwd of the agent used to anchor a spawn (selected, else first).
+    /// Socket/session/cwd anchoring a spawn: the selected agent, else the first
+    /// agent, else the popup's own cwd when it lives inside a git repo.
     fn spawn_context(&self) -> Option<(String, String, String)> {
-        let a = self.selected_agent().or_else(|| self.view.first())?;
-        Some((
-            a.state.socket.clone(),
-            a.pane.session_name.clone(),
-            a.pane.cwd.clone(),
-        ))
+        if let Some(a) = self.selected_agent().or_else(|| self.view.first()) {
+            return Some((
+                a.state.socket.clone(),
+                a.pane.session_name.clone(),
+                a.pane.cwd.clone(),
+            ));
+        }
+        let cwd = std::env::current_dir().ok()?.display().to_string();
+        crate::worktree::resolve(&cwd)?; // one-shot action; uncached is fine
+        let socket = tmux::current_socket()?;
+        let session = tmux::current_session(&socket)?;
+        Some((socket, session, cwd))
     }
 
     /// Approve (accept the highlighted default) or deny (Escape) a pending prompt on the
@@ -796,7 +814,9 @@ impl App {
                 .iter()
                 .map(|row| match row {
                     Row::Header { label, count } => header_row(label, *count),
-                    Row::Agent(i) => agent_row(&self.view[*i], now, &self.colors),
+                    Row::Agent(i) => {
+                        agent_row(&self.view[*i], now, &self.colors, self.all_sessions)
+                    }
                     Row::Worktree(i) => worktree_row(&self.idle_view[*i]),
                 })
                 .collect();
@@ -841,12 +861,15 @@ impl App {
     }
 
     fn title(&self) -> String {
-        let session = self
-            .agents
-            .first()
-            .map(|a| a.pane.session_name.clone())
-            .or_else(|| tmux::current_socket().and_then(|s| tmux::current_session(&s)))
-            .unwrap_or_else(|| "?".into());
+        let session = if self.all_sessions {
+            "all sessions".to_string()
+        } else {
+            self.agents
+                .first()
+                .map(|a| a.pane.session_name.clone())
+                .or_else(|| tmux::current_socket().and_then(|s| tmux::current_session(&s)))
+                .unwrap_or_else(|| "?".into())
+        };
         let needs = self
             .agents
             .iter()
@@ -940,6 +963,7 @@ impl App {
                     ("⇥", "next⚠"),
                     ("/", "filter"),
                     ("p", "preview"),
+                    ("s", "sess"),
                     ("q", "quit"),
                 ];
                 let mut spans = vec![Span::raw(" ")];
@@ -992,7 +1016,7 @@ fn worktree_row(w: &IdleWorktree) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-fn agent_row(a: &Agent, now: u64, colors: &TuiColors) -> ListItem<'static> {
+fn agent_row(a: &Agent, now: u64, colors: &TuiColors, show_session: bool) -> ListItem<'static> {
     let (color, glyph) = match a.effective_status {
         Status::NeedsInput => (colors.needs_input, a.effective_status.glyph()),
         Status::Working => (colors.working, a.effective_status.glyph()),
@@ -1023,7 +1047,12 @@ fn agent_row(a: &Agent, now: u64, colors: &TuiColors) -> ListItem<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" {age:>3} "), Style::default().fg(color)),
-        Span::raw(format!("win {:>2}  ", a.pane.window_index)),
+        // In all-sessions view each row says which session it lives in.
+        Span::raw(if show_session {
+            format!("{}:{}  ", a.pane.session_name, a.pane.window_index)
+        } else {
+            format!("win {:>2}  ", a.pane.window_index)
+        }),
         Span::styled(format!("{branch:<24}"), Style::default().fg(Color::Cyan)),
     ];
     if a.dirty > 0 {
