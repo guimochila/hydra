@@ -123,7 +123,7 @@ fn list_command() -> std::io::Result<()> {
             .as_ref()
             .and_then(|w| w.branch.clone())
             .unwrap_or_else(|| "-".into());
-        let summary = a.state.task_summary.clone().unwrap_or_default();
+        let summary = agent::detail_text(a).unwrap_or_default();
         println!(
             "{} win {:>2}  {:<20} {:<28} {}",
             a.effective_status.glyph(),

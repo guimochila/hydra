@@ -107,6 +107,18 @@ pub fn dead_states(
         .collect()
 }
 
+/// The per-row detail text: while the agent needs input, the live attention message
+/// (why it's blocked — more actionable than the prompt that got it there); otherwise
+/// the last task summary.
+pub fn detail_text(a: &Agent) -> Option<String> {
+    if a.effective_status == Status::NeedsInput {
+        if let Some(attention) = &a.state.attention {
+            return Some(attention.clone());
+        }
+    }
+    a.state.task_summary.clone()
+}
+
 /// Format an age in seconds compactly: `12s`, `4m`, `2h`, `3d`.
 pub fn format_age(secs: u64) -> String {
     if secs < 60 {
@@ -212,6 +224,7 @@ mod tests {
             status,
             event: "x".into(),
             task_summary: None,
+            attention: None,
             updated_at,
         }
     }
@@ -278,6 +291,20 @@ mod tests {
         let panes = vec![pane("%1", "proj", 1)];
         let dead = dead_states(&states, &panes, now, GC_GRACE_SECS);
         assert_eq!(dead, vec![("/sock".to_string(), "%3".to_string())]);
+    }
+
+    #[test]
+    fn detail_text_prefers_attention_only_while_needing_input() {
+        let mut a = agent_with("%1", Status::NeedsInput, 1, None);
+        a.state.task_summary = Some("build the api".into());
+        a.state.attention = Some("needs permission to run Bash".into());
+        assert_eq!(
+            detail_text(&a),
+            Some("needs permission to run Bash".to_string())
+        );
+        // Back to working: the attention reason no longer applies.
+        a.effective_status = Status::Working;
+        assert_eq!(detail_text(&a), Some("build the api".to_string()));
     }
 
     #[test]

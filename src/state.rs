@@ -101,6 +101,11 @@ pub struct AgentState {
     pub event: String,
     #[serde(default)]
     pub task_summary: Option<String>,
+    /// Why the agent needs input (the Notification's message), set only while
+    /// NEEDS_INPUT; cleared on any Working/Idle transition. `default` keeps state
+    /// files written by older hydra versions parseable.
+    #[serde(default)]
+    pub attention: Option<String>,
     /// Unix seconds of the last update.
     pub updated_at: u64,
 }
@@ -283,6 +288,7 @@ mod tests {
             status: Status::NeedsInput,
             event: "Notification".into(),
             task_summary: Some("refactor api".into()),
+            attention: Some("permission to run Bash".into()),
             updated_at: 42,
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -290,5 +296,15 @@ mod tests {
         assert_eq!(s, back);
         // Status serializes as a screaming-snake string.
         assert!(json.contains("\"NEEDS_INPUT\""));
+    }
+
+    #[test]
+    fn state_files_without_attention_still_parse() {
+        // A file written by an older hydra (no `attention` key) must deserialize.
+        let old = r#"{"socket":"/sock","session_id":"2","pane_id":"%7","cwd":"/repo",
+                      "status":"IDLE","event":"Stop","updated_at":42}"#;
+        let s: AgentState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.attention, None);
+        assert_eq!(s.task_summary, None);
     }
 }

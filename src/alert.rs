@@ -8,11 +8,16 @@
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
-/// Announce that the agent in `cwd` is waiting for input. No-op if the platform notifier
-/// isn't available. Whether alerts fire at all is decided by the caller (config-gated).
-pub fn needs_input(cwd: &str) {
+/// Announce that the agent in `cwd` is waiting for input, with the notification's
+/// reason when available. No-op if the platform notifier isn't available. Whether
+/// alerts fire at all is decided by the caller (config-gated).
+pub fn needs_input(cwd: &str, message: Option<&str>) {
     let label = dir_label(cwd);
-    notify("🐍 Hydra", &format!("{label} needs your input"));
+    let body = match message {
+        Some(m) if !m.is_empty() => format!("{label}: {m}"),
+        _ => format!("{label} needs your input"),
+    };
+    notify("🐍 Hydra", &body);
 }
 
 /// Basename of the worktree dir, as a short human label.

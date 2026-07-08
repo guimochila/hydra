@@ -1007,7 +1007,14 @@ fn agent_row(a: &Agent, now: u64, colors: &TuiColors) -> ListItem<'static> {
         .unwrap_or_else(|| a.pane.window_name.clone());
 
     let age = agent::format_age(now.saturating_sub(a.state.updated_at));
-    let summary = a.state.task_summary.clone().unwrap_or_default();
+    let detail = agent::detail_text(a).unwrap_or_default();
+    // The attention message ("needs permission to run Bash") is the row's most
+    // actionable text — color it like the status instead of dimming it away.
+    let detail_span = if a.effective_status == Status::NeedsInput && a.state.attention.is_some() {
+        Span::styled(detail, Style::default().fg(colors.needs_input)).dim()
+    } else {
+        Span::raw(detail).dim()
+    };
 
     let mut spans = vec![
         Span::raw("  "),
@@ -1025,7 +1032,7 @@ fn agent_row(a: &Agent, now: u64, colors: &TuiColors) -> ListItem<'static> {
             Style::default().fg(Color::Magenta),
         ));
     }
-    spans.push(Span::raw(summary).dim());
+    spans.push(detail_span);
     ListItem::new(Line::from(spans))
 }
 
@@ -1100,6 +1107,7 @@ mod tests {
                 status,
                 event: "x".into(),
                 task_summary: None,
+                attention: None,
                 updated_at: 100,
             },
             pane: Pane {

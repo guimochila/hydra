@@ -61,6 +61,14 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 .map(String::from)
                 .unwrap_or_else(|| env.session_id.clone());
 
+            // Why the agent is blocked (the Notification's message); cleared the
+            // moment it goes back to Working/Idle.
+            let attention = attention_for(
+                status,
+                payload.get("message").and_then(|v| v.as_str()),
+                prev.as_ref().and_then(|p| p.attention.clone()),
+            );
+
             // Prefer a fresh prompt as the task summary; otherwise keep the last one
             // so the row stays labelled through Stop/Notification events.
             let task_summary = payload
@@ -73,7 +81,7 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 && !was_needs_input
                 && crate::config::load().alerts.enabled
             {
-                crate::alert::needs_input(&cwd);
+                crate::alert::needs_input(&cwd, attention.as_deref());
             }
 
             let state = AgentState {
@@ -84,10 +92,25 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 status,
                 event,
                 task_summary,
+                attention,
                 updated_at: now_secs(),
             };
             state::write_state(&state)
         }
+    }
+}
+
+/// The attention text to persist: while NEEDS_INPUT, the (truncated) notification
+/// message — kept from the previous state when a repeat Notification carries none.
+/// Any other status clears it; a stale "needs permission" line must never outlive
+/// the prompt it described.
+fn attention_for(status: Status, message: Option<&str>, prev: Option<String>) -> Option<String> {
+    match status {
+        Status::NeedsInput => message
+            .map(|m| truncate(m.trim(), 80))
+            .filter(|m| !m.is_empty())
+            .or(prev),
+        _ => None,
     }
 }
 
@@ -131,5 +154,28 @@ mod tests {
         let t = truncate(s, 5);
         // Must not panic and must be 5 chars incl. ellipsis.
         assert_eq!(t.chars().count(), 5);
+    }
+
+    #[test]
+    fn attention_set_on_needs_input_and_cleared_on_other_statuses() {
+        assert_eq!(
+            attention_for(
+                Status::NeedsInput,
+                Some("needs permission to run Bash"),
+                None
+            ),
+            Some("needs permission to run Bash".to_string())
+        );
+        // A repeat Notification without a message keeps the previous reason.
+        assert_eq!(
+            attention_for(Status::NeedsInput, None, Some("old reason".into())),
+            Some("old reason".to_string())
+        );
+        // Working/Idle always clear it — a stale reason must not linger.
+        assert_eq!(
+            attention_for(Status::Working, Some("ignored"), Some("old".into())),
+            None
+        );
+        assert_eq!(attention_for(Status::Idle, None, Some("old".into())), None);
     }
 }
