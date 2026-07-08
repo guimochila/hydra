@@ -210,6 +210,13 @@ pub fn remove_worktree(base_cwd: &str, path: &str, force: bool) -> std::io::Resu
     }
 }
 
+/// One-shot, uncached cwd → worktree resolution, for user-initiated actions that
+/// happen outside the cached fetch pipeline (e.g. anchoring a spawn on the popup's
+/// own cwd). Prefer `WorktreeCache::resolve` on any recurring path.
+pub fn resolve(cwd: &str) -> Option<WorktreeInfo> {
+    resolve_uncached(cwd)
+}
+
 fn resolve_uncached(cwd: &str) -> Option<WorktreeInfo> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"])?;
     let common_dir = abs_common_dir(cwd)?;

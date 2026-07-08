@@ -12,10 +12,12 @@ cargo clippy --all-targets
 cargo fmt                # run before committing; CI-clean = fmt --check passes
 ```
 
-There is no test harness for the interactive TUI (ratatui needs a real terminal). The
-data/logic layers are pure and unit-tested; the UI is thin rendering over them. To
-verify behavior end-to-end, use `hydra ls` and `hydra status` (headless), or drive the
-popup by hand in tmux.
+The data/logic layers are pure and unit-tested; the UI is thin rendering over them.
+The TUI itself is tested with `ratatui::backend::TestBackend` (see `ui.rs` tests):
+build an `App` from synthetic agents/worktrees, drive `handle_key`, render into an
+in-memory buffer and assert on its content — new UI behavior should come with such a
+test. For real end-to-end checks, use `hydra ls` and `hydra status` (headless), or
+drive the popup by hand in tmux.
 
 ## Architecture
 
@@ -24,9 +26,10 @@ joins against live tmux. See `README.md` "How it works" for the high-level pictu
 
 Module map (`src/`):
 
-- `main.rs` — CLI dispatch (`hydra`, `ls`, `status`, `hook`, `install`, `uninstall`)
-  and `current_overview()`, the shared "resolve socket+session → agents + idle
-  worktrees" helper.
+- `main.rs` — CLI dispatch (`hydra`, `ls`, `status`, `hook`, `install`, `uninstall`,
+  `version`) and `current_overview()`, the shared "resolve socket+session → agents +
+  idle worktrees" helper (session-scoped or `all_sessions`; idle worktrees for every
+  repo in view; GC's dead state files as a side effect).
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
   (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files.
   **The only shared contract between the hook writer and the TUI reader.**
@@ -37,8 +40,13 @@ Module map (`src/`):
   pure core — no globals. Env vars (`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) are folded into
   `Config` at load, so use sites never re-check env.
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
-  reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file. No
-  tmux or git calls here.
+  reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
+  (including `attention`, the Notification's "why input is needed" message). No tmux
+  or git calls here.
+- `fetcher.rs` — the background fetch worker. Owns the `Caches`, re-runs
+  `current_overview` on its own `refresh_ms` tick, streams `Overview` snapshots to
+  the TUI over mpsc. Requests coalesce (`wait_for_request`): at most one fetch is
+  ever in flight, so a slow `git status` can't queue work or block input.
 - `tmux.rs` — all `tmux` CLI wrappers, **parameterized by socket path** so nested
   servers work. `list_panes`, `current_socket/session`, `jump_to`, `send_key`,
   `send_text`. Shells out (no libtmux).
@@ -53,10 +61,14 @@ Module map (`src/`):
   staleness, sort) and `collect` (adds worktree + dirty). Also `idle_from` (project
   worktrees − occupied), `matches_filter`/`worktree_matches_filter`, `format_age`.
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
-  unified repo-grouped list of both running agents (age/dirty) and idle worktrees
-  (`Enter` starts `claude`), `x` to remove a worktree (confirm, kills agent window
-  first, forces on dirty, keeps branch), a `capture-pane` preview, and a 250 ms refresh
-  tick. Selection is tracked by a stable key (agent pane id or worktree path).
+  unified repo-grouped list of both running agents (age/dirty/attention) and idle
+  worktrees (`Enter` starts `claude`), `a`/`d`/`1`-`3` prompt replies (NEEDS_INPUT
+  gated + state-file re-checked at send time), `x` to remove a worktree (confirm,
+  kills agent window first, forces on dirty, keeps branch), `s` all-sessions toggle,
+  and a colored `capture-pane -e` preview (memoized per selection+snapshot). Data
+  arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms and
+  never does git/tmux fetch work itself. Selection is tracked by a stable key (agent
+  pane id or worktree path). UI behavior is tested via `TestBackend`.
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
   indicator (tmux polls it from `status-right`).
 - `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT
@@ -88,15 +100,19 @@ Module map (`src/`):
 
 ## Status state machine
 
-`UserPromptSubmit`/`PreToolUse`/`SessionStart` → `WORKING`; `Notification` →
-`NEEDS_INPUT`; `Stop` → `IDLE`; `SessionEnd` → removed. Staleness downgrades only
-`WORKING` (not idle/needs-input, which can legitimately sit) to `UNKNOWN`.
+`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`SessionStart` → `WORKING`;
+`Notification` → `NEEDS_INPUT`; `Stop` → `IDLE`; `SessionEnd` → removed.
+`SubagentStop` also maps to `WORKING` (the *parent* agent is still processing — never
+`IDLE`, which would flicker). Staleness downgrades only `WORKING` (not
+idle/needs-input, which can legitimately sit) to `UNKNOWN`. Leftover files from
+crashed agents (no `SessionEnd`) are GC'd by `current_overview` via
+`agent::dead_states`: pane gone from `list_panes` AND older than `GC_GRACE_SECS`.
 
 ## Roadmap notes
 
 Phases 1–4 plus the extra features (attention alerts, spawn `n`, triage age/`Δ`/`Tab`,
 preview pane) are done. `git status` for dirty counts is throttled via `DirtyCache`
-(`DIRTY_TTL_SECS`) so it doesn't run on every 250 ms tick — keep it that way. Not yet
+(`DIRTY_TTL_SECS`) so it doesn't run on every fetch tick — keep it that way. Not yet
 verified: the cross-socket jump against a real nested tmux (matching logic unit-tested
 via `match_pane_by_tty`). The command *forms* for send-keys, spawn (worktree +
 new-window) and status are verified against live tmux.

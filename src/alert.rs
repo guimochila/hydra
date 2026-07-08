@@ -5,14 +5,19 @@
 //! Best-effort and fire-and-forget: we spawn the notifier detached and never wait, so
 //! the hook stays fast. Firing is gated by the caller via `[alerts].enabled` (or `HYDRA_ALERTS=0`).
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-/// Announce that the agent in `cwd` is waiting for input. No-op if the platform notifier
-/// isn't available. Whether alerts fire at all is decided by the caller (config-gated).
-pub fn needs_input(cwd: &str) {
+/// Announce that the agent in `cwd` is waiting for input, with the notification's
+/// reason when available. No-op if the platform notifier isn't available. Whether
+/// alerts fire at all is decided by the caller (config-gated).
+pub fn needs_input(cwd: &str, message: Option<&str>) {
     let label = dir_label(cwd);
-    notify("🐍 Hydra", &format!("{label} needs your input"));
+    let body = match message {
+        Some(m) if !m.is_empty() => format!("{label}: {m}"),
+        _ => format!("{label} needs your input"),
+    };
+    notify("🐍 Hydra", &body);
 }
 
 /// Basename of the worktree dir, as a short human label.
@@ -43,9 +48,23 @@ fn notify(title: &str, body: &str) {
         .spawn();
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn notify(title: &str, body: &str) {
+    // notify-send is the de-facto freedesktop notifier; args are passed positionally
+    // (no shell), so no escaping needed. Silently a no-op when it isn't installed.
+    let _ = Command::new("notify-send")
+        .arg("--app-name=hydra")
+        .arg(title)
+        .arg(body)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn notify(_title: &str, _body: &str) {
-    // No notifier wired for non-macOS yet; the status-line indicator still surfaces it.
+    // No notifier wired for this platform; the status-line indicator still surfaces it.
 }
 
 #[cfg(test)]

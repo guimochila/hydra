@@ -22,7 +22,7 @@ pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
     let agents = agent::join_and_sort(
         states,
         &panes,
-        session,
+        Some(session),
         now_secs(),
         cfg.timings.stale_after_secs,
     );

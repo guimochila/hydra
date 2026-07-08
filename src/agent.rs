@@ -30,12 +30,13 @@ pub struct Agent {
 pub const STALE_AFTER_SECS: u64 = 900;
 
 /// Pure core: join `states` (already for one socket) against live `panes`, keep only
-/// those in `session_name`, apply staleness, and sort (NeedsInput first, then by
-/// window index). Worktree is left unresolved here so this stays IO-free and testable.
+/// those in `session_name` (`None` = every session on the socket), apply staleness,
+/// and sort (NeedsInput first, then by window index). Worktree is left unresolved
+/// here so this stays IO-free and testable.
 pub fn join_and_sort(
     states: Vec<AgentState>,
     panes: &[Pane],
-    session_name: &str,
+    session_name: Option<&str>,
     now: u64,
     stale_after: u64,
 ) -> Vec<Agent> {
@@ -43,7 +44,7 @@ pub fn join_and_sort(
         .into_iter()
         .filter_map(|state| {
             let pane = panes.iter().find(|p| p.pane_id == state.pane_id)?.clone();
-            if pane.session_name != session_name {
+            if session_name.is_some_and(|name| pane.session_name != name) {
                 return None;
             }
             let effective_status =
@@ -66,23 +67,83 @@ pub fn join_and_sort(
     agents
 }
 
-/// Full pipeline: read live panes on `socket`, join with `states`, and resolve each
-/// surviving agent's worktree and (throttled) uncommitted-change count.
+/// Full pipeline: join `states` with the given live `panes`, and resolve each
+/// surviving agent's worktree and (throttled) uncommitted-change count. The caller
+/// provides `panes` (one `list_panes` call serves both this join and the GC).
 pub fn collect(
-    socket: &str,
-    session_name: &str,
+    session_name: Option<&str>,
     states: Vec<AgentState>,
+    panes: &[Pane],
     now: u64,
     caches: &mut Caches,
     stale_after: u64,
 ) -> Vec<Agent> {
-    let panes = crate::tmux::list_panes(socket);
-    let mut agents = join_and_sort(states, &panes, session_name, now, stale_after);
+    let mut agents = join_and_sort(states, panes, session_name, now, stale_after);
     for agent in &mut agents {
         agent.worktree = caches.worktree.resolve(&agent.pane.cwd);
         agent.dirty = caches.dirty.count(&agent.pane.cwd, now);
     }
     agents
+}
+
+/// Grace period before a dead agent's leftover state file is deleted. Generous on
+/// purpose: leftovers are invisible anyway (the join hides them), so GC is pure disk
+/// hygiene and must never race a pane that is briefly absent.
+pub const GC_GRACE_SECS: u64 = 3600;
+
+/// State files whose pane no longer exists on this socket AND whose last update is
+/// older than `grace_secs` — safe to delete. Returns their (socket, pane_id) keys.
+/// `states` must already be filtered to the socket `panes` was listed from.
+pub fn dead_states(
+    states: &[AgentState],
+    panes: &[Pane],
+    now: u64,
+    grace_secs: u64,
+) -> Vec<(String, String)> {
+    states
+        .iter()
+        .filter(|s| !panes.iter().any(|p| p.pane_id == s.pane_id))
+        .filter(|s| now.saturating_sub(s.updated_at) > grace_secs)
+        .map(|s| (s.socket.clone(), s.pane_id.clone()))
+        .collect()
+}
+
+/// Candidate anchor directories for idle-worktree discovery: each agent's worktree
+/// root in display order, then the popup's own cwd. Order matters — the caller
+/// dedupes by repo identity taking the first anchor, so idle-only repos (reachable
+/// just via the popup cwd) group after the repos that hold agents.
+pub fn idle_anchors(agents: &[Agent], popup_cwd: Option<&str>) -> Vec<String> {
+    let mut anchors: Vec<String> = agents
+        .iter()
+        .filter_map(|a| a.worktree.as_ref().map(|w| w.root.clone()))
+        .collect();
+    if let Some(cwd) = popup_cwd {
+        anchors.push(cwd.to_string());
+    }
+    anchors
+}
+
+/// The per-row detail text: while the agent needs input, the live attention message
+/// (why it's blocked — more actionable than the prompt that got it there); otherwise
+/// the last task summary.
+pub fn detail_text(a: &Agent) -> Option<String> {
+    if a.effective_status == Status::NeedsInput {
+        if let Some(attention) = &a.state.attention {
+            return Some(attention.clone());
+        }
+    }
+    a.state.task_summary.clone()
+}
+
+/// Truncate to at most `max` chars (char-boundary safe), adding an ellipsis. Shared
+/// by the hook (task summaries / attention) and the row renderer (width fitting).
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// Format an age in seconds compactly: `12s`, `4m`, `2h`, `3d`.
@@ -190,6 +251,7 @@ mod tests {
             status,
             event: "x".into(),
             task_summary: None,
+            attention: None,
             updated_at,
         }
     }
@@ -246,6 +308,55 @@ mod tests {
     }
 
     #[test]
+    fn dead_states_only_flags_long_gone_panes() {
+        let now = 10_000;
+        let states = vec![
+            state("%1", Status::Idle, 0),           // pane alive → kept
+            state("%2", Status::Working, 9_990),    // pane gone but recent → kept
+            state("%3", Status::NeedsInput, 1_000), // pane gone + old → dead
+        ];
+        let panes = vec![pane("%1", "proj", 1)];
+        let dead = dead_states(&states, &panes, now, GC_GRACE_SECS);
+        assert_eq!(dead, vec![("/sock".to_string(), "%3".to_string())]);
+    }
+
+    #[test]
+    fn idle_anchors_lists_agent_roots_first_then_popup_cwd() {
+        let a1 = agent_with("%1", Status::Working, 1, Some(("/a/.git", "alpha", None)));
+        let a2 = agent_with("%2", Status::Idle, 2, None); // no worktree → no anchor
+        assert_eq!(
+            idle_anchors(&[a1, a2], Some("/popup/repo")),
+            vec!["/r".to_string(), "/popup/repo".to_string()]
+        );
+        assert!(idle_anchors(&[], None).is_empty());
+    }
+
+    #[test]
+    fn detail_text_prefers_attention_only_while_needing_input() {
+        let mut a = agent_with("%1", Status::NeedsInput, 1, None);
+        a.state.task_summary = Some("build the api".into());
+        a.state.attention = Some("needs permission to run Bash".into());
+        assert_eq!(
+            detail_text(&a),
+            Some("needs permission to run Bash".to_string())
+        );
+        // Back to working: the attention reason no longer applies.
+        a.effective_status = Status::Working;
+        assert_eq!(detail_text(&a), Some("build the api".to_string()));
+    }
+
+    #[test]
+    fn truncate_is_char_safe_and_adds_an_ellipsis() {
+        assert_eq!(truncate("hi", 60), "hi");
+        let t = truncate(&"a".repeat(100), 10);
+        assert_eq!(t.chars().count(), 10);
+        assert!(t.ends_with('…'));
+        // Multibyte input must not panic and must land on a char boundary.
+        let t = truncate("héllo wörld ☃ quite long indeed", 5);
+        assert_eq!(t.chars().count(), 5);
+    }
+
+    #[test]
     fn format_age_uses_compact_units() {
         assert_eq!(format_age(5), "5s");
         assert_eq!(format_age(90), "1m");
@@ -276,7 +387,7 @@ mod tests {
             state("%2", Status::Working, 100), // no matching live pane
         ];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].state.pane_id, "%1");
     }
@@ -288,9 +399,20 @@ mod tests {
             state("%2", Status::Idle, 100),
         ];
         let panes = vec![pane("%1", "proj", 1), pane("%2", "other", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].pane.session_name, "proj");
+    }
+
+    #[test]
+    fn no_session_filter_keeps_every_session() {
+        let states = vec![
+            state("%1", Status::Idle, 100),
+            state("%2", Status::Idle, 100),
+        ];
+        let panes = vec![pane("%1", "proj", 1), pane("%2", "other", 1)];
+        let agents = join_and_sort(states, &panes, None, 100, STALE_AFTER_SECS);
+        assert_eq!(agents.len(), 2);
     }
 
     #[test]
@@ -307,7 +429,7 @@ mod tests {
             pane("%3", "proj", 3),
             pane("%4", "proj", 1),
         ];
-        let agents = join_and_sort(states, &panes, "proj", 100, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 100, STALE_AFTER_SECS);
         let order: Vec<&str> = agents.iter().map(|a| a.state.pane_id.as_str()).collect();
         // NeedsInput(%2), then Working by window index (%4 win1, %3 win3), then Idle(%1).
         assert_eq!(order, vec!["%2", "%4", "%3", "%1"]);
@@ -317,7 +439,7 @@ mod tests {
     fn stale_working_agent_becomes_unknown() {
         let states = vec![state("%1", Status::Working, 0)];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 10_000, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 10_000, STALE_AFTER_SECS);
         assert_eq!(agents[0].effective_status, Status::Unknown);
     }
 
@@ -326,7 +448,7 @@ mod tests {
         // Idle agents can sit indefinitely; staleness must not touch them.
         let states = vec![state("%1", Status::Idle, 0)];
         let panes = vec![pane("%1", "proj", 1)];
-        let agents = join_and_sort(states, &panes, "proj", 10_000, STALE_AFTER_SECS);
+        let agents = join_and_sort(states, &panes, Some("proj"), 10_000, STALE_AFTER_SECS);
         assert_eq!(agents[0].effective_status, Status::Idle);
     }
 }

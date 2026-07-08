@@ -183,10 +183,11 @@ pub fn kill_window(socket: &str, session: &str, window_index: u32) -> std::io::R
     run(socket, &["kill-window", "-t", &target])
 }
 
-/// Capture the visible contents of `pane_id` as plain text (no escape sequences),
-/// for the preview pane. Empty string if the pane can't be read.
+/// Capture the visible contents of `pane_id` including SGR escape sequences (`-e`),
+/// so the preview pane can render the agent's real colors. Empty string if the pane
+/// can't be read.
 pub fn capture_pane(socket: &str, pane_id: &str) -> String {
-    tmux_output(socket, &["capture-pane", "-p", "-t", pane_id]).unwrap_or_default()
+    tmux_output(socket, &["capture-pane", "-p", "-e", "-t", pane_id]).unwrap_or_default()
 }
 
 fn tmux_output(socket: &str, args: &[&str]) -> Option<String> {

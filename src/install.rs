@@ -17,6 +17,7 @@ const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
+    "PostToolUse",
     "Notification",
     "Stop",
     "SessionEnd",
@@ -54,6 +55,10 @@ idle         = "gray"
 unknown      = "darkgray"
 footer_key   = "green"         # shortcut keys in the footer keybar
 footer_label = "gray"          # the descriptions next to each footer key
+header       = "blue"          # repo group headers
+branch       = "cyan"          # branch names in agent rows
+dirty        = "magenta"       # the uncommitted-change count (Δ3)
+worktree_row = "darkgray"      # idle-worktree rows (glyph + "start ⏎")
 
 [theme.status]                 # status-bar palette (tmux color names or "#rrggbb")
 label    = "#b35b79"
@@ -94,11 +99,13 @@ pub fn install() -> io::Result<()> {
     println!(
         "hydra: installed.\n  \
          • Claude Code hooks → {}\n  \
+         • hooks/binding invoke this binary: {}\n  \
          • tmux binding: prefix + {} (popup)\n  \
          • status-line indicator appended to status-right (non-destructive)\n  \
          • config: {}\n\n\
          Reload tmux config with:  tmux source-file ~/.tmux.conf",
         settings_path()?.display(),
+        exe,
         config.popup.key,
         if wrote_config {
             "wrote starter ~/.config/hydra/config.toml"
@@ -106,6 +113,15 @@ pub fn install() -> io::Result<()> {
             "existing config left untouched"
         },
     );
+    // The absolute path above is baked into settings.json and .tmux.conf; a binary
+    // living in a build dir moves on the next `cargo clean`/rebuild elsewhere.
+    if exe.contains("/target/") {
+        println!(
+            "\nnote: this binary lives in a cargo target dir. If it moves, hooks break \
+             silently — consider copying it to a stable location (e.g. ~/.local/bin) \
+             and re-running `hydra install` from there."
+        );
+    }
     Ok(())
 }
 

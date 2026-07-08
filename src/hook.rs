@@ -5,6 +5,7 @@
 //! `$TMUX_PANE` from the environment, map the event to a status, and atomically write
 //! (or remove) the pane's state file. No tmux or git subprocess calls happen here.
 
+use crate::agent::truncate;
 use crate::state::{self, AgentState, EventOutcome, Status};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +62,14 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 .map(String::from)
                 .unwrap_or_else(|| env.session_id.clone());
 
+            // Why the agent is blocked (the Notification's message); cleared the
+            // moment it goes back to Working/Idle.
+            let attention = attention_for(
+                status,
+                payload.get("message").and_then(|v| v.as_str()),
+                prev.as_ref().and_then(|p| p.attention.clone()),
+            );
+
             // Prefer a fresh prompt as the task summary; otherwise keep the last one
             // so the row stays labelled through Stop/Notification events.
             let task_summary = payload
@@ -73,7 +82,7 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 && !was_needs_input
                 && crate::config::load().alerts.enabled
             {
-                crate::alert::needs_input(&cwd);
+                crate::alert::needs_input(&cwd, attention.as_deref());
             }
 
             let state = AgentState {
@@ -84,10 +93,25 @@ pub fn run(event: &str) -> std::io::Result<()> {
                 status,
                 event,
                 task_summary,
+                attention,
                 updated_at: now_secs(),
             };
             state::write_state(&state)
         }
+    }
+}
+
+/// The attention text to persist: while NEEDS_INPUT, the (truncated) notification
+/// message — kept from the previous state when a repeat Notification carries none.
+/// Any other status clears it; a stale "needs permission" line must never outlive
+/// the prompt it described.
+fn attention_for(status: Status, message: Option<&str>, prev: Option<String>) -> Option<String> {
+    match status {
+        Status::NeedsInput => message
+            .map(|m| truncate(m.trim(), 80))
+            .filter(|m| !m.is_empty())
+            .or(prev),
+        _ => None,
     }
 }
 
@@ -98,38 +122,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Truncate to at most `max` chars (char-boundary safe), adding an ellipsis.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn truncate_leaves_short_strings_alone() {
-        assert_eq!(truncate("hi", 60), "hi");
-    }
-
-    #[test]
-    fn truncate_shortens_long_strings_with_ellipsis() {
-        let long = "a".repeat(100);
-        let t = truncate(&long, 10);
-        assert_eq!(t.chars().count(), 10);
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn truncate_respects_multibyte_boundaries() {
-        let s = "héllo wörld ☃ agent task summary that is quite long indeed";
-        let t = truncate(s, 5);
-        // Must not panic and must be 5 chars incl. ellipsis.
-        assert_eq!(t.chars().count(), 5);
+    fn attention_set_on_needs_input_and_cleared_on_other_statuses() {
+        assert_eq!(
+            attention_for(
+                Status::NeedsInput,
+                Some("needs permission to run Bash"),
+                None
+            ),
+            Some("needs permission to run Bash".to_string())
+        );
+        // A repeat Notification without a message keeps the previous reason.
+        assert_eq!(
+            attention_for(Status::NeedsInput, None, Some("old reason".into())),
+            Some("old reason".to_string())
+        );
+        // Working/Idle always clear it — a stale reason must not linger.
+        assert_eq!(
+            attention_for(Status::Working, Some("ignored"), Some("old".into())),
+            None
+        );
+        assert_eq!(attention_for(Status::Idle, None, Some("old".into())), None);
     }
 }
