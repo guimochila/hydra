@@ -961,10 +961,16 @@ impl App {
         let Some(target) = self.pending_remove.take() else {
             return Action::None;
         };
-        if let Some((socket, session, window)) = &target.agent {
-            if let Err(e) = crate::tmux::kill_window(socket, session, *window) {
-                self.message = Some(format!("kill window failed: {e}"));
-                return Action::None;
+        // Kill every window rooted in the worktree, not just the agent's own window.
+        // Session mode: shell + agent windows -> tmux destroys the now-empty session.
+        // Window mode: only the agent window is rooted here, so this matches today.
+        if let Some((socket, _session, _window)) = &target.agent {
+            let panes = crate::tmux::list_panes(socket);
+            for (session, window) in crate::agent::windows_under_path(&panes, &target.path) {
+                if let Err(e) = crate::tmux::kill_window(socket, &session, window) {
+                    self.message = Some(format!("kill window failed: {e}"));
+                    return Action::None;
+                }
             }
         }
         match crate::worktree::remove_worktree(&target.base_cwd, &target.path, target.dirty) {
