@@ -1300,6 +1300,27 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
+/// A tmux-safe session name for a worktree: the branch if present, else the path's final
+/// segment. `/`, whitespace, `.` and `:` all become `-` — tmux treats `.`/`:` as target
+/// separators (`session:window.pane`), so they must not appear in a name we later target.
+fn session_name(branch: Option<&str>, path: &str) -> String {
+    let raw = branch.map(str::to_string).unwrap_or_else(|| {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    });
+    raw.chars()
+        .map(|c| {
+            if c == '/' || c == '.' || c == ':' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize;
@@ -1802,6 +1823,19 @@ mod tests {
     fn sanitize_makes_a_safe_path_segment() {
         assert_eq!(sanitize("feat/pagination api"), "feat-pagination-api");
         assert_eq!(sanitize("simple"), "simple");
+    }
+
+    #[test]
+    fn session_name_uses_branch_then_basename_and_is_tmux_safe() {
+        // Branch preferred; `/`, `.`, `:`, whitespace all become `-`.
+        assert_eq!(
+            session_name(Some("feature/foo.bar"), "/x/wt"),
+            "feature-foo-bar"
+        );
+        assert_eq!(session_name(Some("a b:c"), "/x"), "a-b-c");
+        // No branch -> final path segment.
+        assert_eq!(session_name(None, "/root/wt-a"), "wt-a");
+        assert_eq!(session_name(None, "/root/wt-a/"), "wt-a");
     }
 
     #[test]
