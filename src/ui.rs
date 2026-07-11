@@ -665,7 +665,14 @@ impl App {
                         &sanitize(name),
                         &self.config.agent.command,
                     ) {
-                        Ok(_agent_win) => Some(format!("✓ spawned {name} in session {sess}")),
+                        Ok(agent_win) => {
+                            // Make the Claude window (window 2) the session's current
+                            // window, so a later Enter that reuses this session (via
+                            // switch_client) lands on Claude, not the shell window that
+                            // new_session leaves current.
+                            let _ = crate::tmux::select_window_id(&socket, &agent_win);
+                            Some(format!("✓ spawned {name} in session {sess}"))
+                        }
                         Err(e) => Some(format!("session failed: {e}")),
                     }
                 }
