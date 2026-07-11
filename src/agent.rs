@@ -238,6 +238,26 @@ fn status_rank(s: Status) -> u8 {
     }
 }
 
+/// Every `(session, window_index)` whose pane cwd is rooted in `path` — equal to `path`
+/// or under it on a path boundary, so `/r/wt-a` never matches `/r/wt-ab`. Deduplicated,
+/// so a window with several panes is returned once. Used by worktree removal to tear
+/// down all windows a worktree occupies: in session spawn mode that is the shell + agent
+/// windows (killing them empties and destroys the dedicated session); in window mode it
+/// is just the single agent window.
+pub fn windows_under_path(panes: &[Pane], path: &str) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let prefix = format!("{path}/");
+    for p in panes {
+        if p.cwd == path || p.cwd.starts_with(&prefix) {
+            let key = (p.session_name.clone(), p.window_index);
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +470,33 @@ mod tests {
         let panes = vec![pane("%1", "proj", 1)];
         let agents = join_and_sort(states, &panes, Some("proj"), 10_000, STALE_AFTER_SECS);
         assert_eq!(agents[0].effective_status, Status::Idle);
+    }
+
+    #[test]
+    fn windows_under_path_matches_rooted_windows_dedups_and_respects_boundary() {
+        let mk = |id: &str, session: &str, win: u32, cwd: &str| Pane {
+            pane_id: id.into(),
+            session_name: session.into(),
+            window_index: win,
+            window_name: "w".into(),
+            cwd: cwd.into(),
+            window_active: false,
+            pane_tty: "/dev/ttys000".into(),
+        };
+        let panes = vec![
+            mk("%1", "wt-a", 1, "/root/wt-a"),     // shell window (exact match)
+            mk("%2", "wt-a", 2, "/root/wt-a"),     // agent window
+            mk("%3", "wt-a", 2, "/root/wt-a/src"), // 2nd pane, same window -> dedup
+            mk("%4", "other", 5, "/root/wt-ab"),   // boundary: must NOT match
+            mk("%5", "other", 6, "/elsewhere"),    // unrelated
+        ];
+        let got = windows_under_path(&panes, "/root/wt-a");
+        assert_eq!(got, vec![("wt-a".to_string(), 1), ("wt-a".to_string(), 2)]);
+    }
+
+    #[test]
+    fn windows_under_path_empty_when_nothing_matches() {
+        let panes: Vec<Pane> = Vec::new();
+        assert!(windows_under_path(&panes, "/root/wt-a").is_empty());
     }
 }

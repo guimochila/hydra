@@ -32,6 +32,7 @@ pub fn run() -> std::io::Result<()> {
     }
     let (config, config_notice) = crate::config::load_reporting();
     let colors = TuiColors::from_config(&config.theme.tui);
+    let all_sessions = starts_all_sessions(&config);
     // The caches move into the background worker; the UI only receives snapshots.
     let caches = Caches::new(
         config.timings.dirty_ttl_secs,
@@ -41,13 +42,15 @@ pub fn run() -> std::io::Result<()> {
         caches,
         config.timings.refresh_ms,
         config.timings.stale_after_secs,
+        all_sessions,
     );
     let mut terminal = ratatui::init();
     let mut app = App {
         show_preview: true,
         colors,
-        config,
+        all_sessions,
         message: config_notice,
+        config,
         ..App::default()
     };
     let result = app.run(&mut terminal, &fetcher);
@@ -640,15 +643,43 @@ impl App {
             self.message = Some(format!("worktree failed: {e}"));
             return;
         }
-        self.message = match crate::tmux::new_window(
-            &socket,
-            &session,
-            &sanitize(name),
-            &path_str,
-            &self.config.agent.command,
-        ) {
-            Ok(_window_id) => Some(format!("✓ spawned {name}")),
-            Err(e) => Some(format!("window failed: {e}")),
+        self.message = match self.config.spawn_mode() {
+            crate::config::SpawnMode::Window => match crate::tmux::new_window(
+                &socket,
+                &session,
+                &sanitize(name),
+                &path_str,
+                &self.config.agent.command,
+            ) {
+                Ok(_window_id) => Some(format!("✓ spawned {name}")),
+                Err(e) => Some(format!("window failed: {e}")),
+            },
+            crate::config::SpawnMode::Session => {
+                // New worktree => branch == name. Stay in the popup (as window mode's
+                // `n` does), so several can be spawned in a row.
+                let sess = session_name(Some(name), &path_str);
+                if crate::tmux::session_exists(&socket, &sess) {
+                    Some(format!("session {sess} already exists"))
+                } else {
+                    match crate::tmux::new_session(
+                        &socket,
+                        &sess,
+                        &path_str,
+                        &sanitize(name),
+                        &self.config.agent.command,
+                    ) {
+                        Ok(agent_win) => {
+                            // Make the Claude window (window 2) the session's current
+                            // window, so a later Enter that reuses this session (via
+                            // switch_client) lands on Claude, not the shell window that
+                            // new_session leaves current.
+                            let _ = crate::tmux::select_window_id(&socket, &agent_win);
+                            Some(format!("✓ spawned {name} in session {sess}"))
+                        }
+                        Err(e) => Some(format!("session failed: {e}")),
+                    }
+                }
+            }
         };
     }
 
@@ -787,7 +818,8 @@ impl App {
             self.message = Some("no worktree selected".into());
             return false;
         };
-        let name = sanitize(&wt.branch.clone().unwrap_or_else(|| wt.path.clone()));
+        let branch = wt.branch.clone();
+        let name = sanitize(&branch.clone().unwrap_or_else(|| wt.path.clone()));
         let path = wt.path.clone();
         let Some(socket) = tmux::current_socket() else {
             self.message = Some("not inside tmux".into());
@@ -797,15 +829,50 @@ impl App {
             self.message = Some("could not resolve the current tmux session".into());
             return false;
         };
-        match tmux::new_window(&socket, &session, &name, &path, &command) {
-            Ok(window_id) => {
-                // Switch to the new window so closing the popup lands the user on it.
-                let _ = tmux::select_window_id(&socket, &window_id);
-                true
+        match self.config.spawn_mode() {
+            crate::config::SpawnMode::Window => {
+                match tmux::new_window(&socket, &session, &name, &path, &command) {
+                    Ok(window_id) => {
+                        // Switch to the new window so closing the popup lands on it.
+                        let _ = tmux::select_window_id(&socket, &window_id);
+                        true
+                    }
+                    Err(e) => {
+                        self.message = Some(format!("start failed: {e}"));
+                        false
+                    }
+                }
             }
-            Err(e) => {
-                self.message = Some(format!("start failed: {e}"));
-                false
+            crate::config::SpawnMode::Session => {
+                let sess = session_name(branch.as_deref(), &path);
+                if crate::tmux::session_exists(&socket, &sess) {
+                    // Idempotent: reuse the existing session instead of erroring.
+                    match crate::tmux::switch_client(&socket, &sess) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.message = Some(format!("switch failed: {e}"));
+                            false
+                        }
+                    }
+                } else {
+                    match crate::tmux::new_session(&socket, &sess, &path, &name, &command) {
+                        Ok(agent_win) => {
+                            // Land on the Claude window (window 2), then attach.
+                            let _ = tmux::select_window_id(&socket, &agent_win);
+                            match crate::tmux::switch_client(&socket, &sess) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    self.message = Some(format!("switch failed: {e}"));
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("start failed: {e}"));
+                            false
+                        }
+                    }
+                }
             }
         }
     }
@@ -897,10 +964,29 @@ impl App {
         let Some(target) = self.pending_remove.take() else {
             return Action::None;
         };
+        // Kill every window rooted in the worktree, not just the agent's own window.
+        // Session mode: shell + agent windows -> tmux destroys the now-empty session.
+        // Window mode: only the agent window is rooted here, so this matches today.
         if let Some((socket, session, window)) = &target.agent {
-            if let Err(e) = crate::tmux::kill_window(socket, session, *window) {
-                self.message = Some(format!("kill window failed: {e}"));
-                return Action::None;
+            let panes = crate::tmux::list_panes(socket);
+            let mut windows = crate::agent::windows_under_path(&panes, &target.path);
+            // Always include the agent's own window: if its pane cwd no longer matches
+            // the worktree path (e.g. symlink divergence), we must still not git-remove
+            // the worktree out from under a live agent.
+            let own = (session.clone(), *window);
+            if !windows.contains(&own) {
+                windows.push(own);
+            }
+            // Kill the highest window index first. With `renumber-windows on`, killing a
+            // lower index renumbers the higher windows down and would invalidate the
+            // indices we still hold; descending order removes the top window each time,
+            // which never shifts the ones still to kill.
+            windows.sort_by_key(|w| std::cmp::Reverse(w.1));
+            for (session, window) in windows {
+                if let Err(e) = crate::tmux::kill_window(socket, &session, window) {
+                    self.message = Some(format!("kill window failed: {e}"));
+                    return Action::None;
+                }
             }
         }
         match crate::worktree::remove_worktree(&target.base_cwd, &target.path, target.dirty) {
@@ -1258,6 +1344,12 @@ fn worktree_root(config: &crate::config::Config) -> std::path::PathBuf {
     expand_tilde(&config.agent.worktree_root)
 }
 
+/// Whether Hydra should open in all-sessions view. In session spawn mode agents live in
+/// their own sessions, so all-sessions is the default scope; `s` still toggles at runtime.
+fn starts_all_sessions(config: &crate::config::Config) -> bool {
+    matches!(config.spawn_mode(), crate::config::SpawnMode::Session)
+}
+
 /// Expand a leading `~` / `~/` to the home directory. Other paths pass through.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
     if path == "~" {
@@ -1292,6 +1384,27 @@ fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c == '/' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A tmux-safe session name for a worktree: the branch if present, else the path's final
+/// segment. `/`, whitespace, `.` and `:` all become `-` — tmux treats `.`/`:` as target
+/// separators (`session:window.pane`), so they must not appear in a name we later target.
+fn session_name(branch: Option<&str>, path: &str) -> String {
+    let raw = branch.map(str::to_string).unwrap_or_else(|| {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    });
+    raw.chars()
+        .map(|c| {
+            if c == '/' || c == '.' || c == ':' || c.is_whitespace() {
                 '-'
             } else {
                 c
@@ -1805,6 +1918,19 @@ mod tests {
     }
 
     #[test]
+    fn session_name_uses_branch_then_basename_and_is_tmux_safe() {
+        // Branch preferred; `/`, `.`, `:`, whitespace all become `-`.
+        assert_eq!(
+            session_name(Some("feature/foo.bar"), "/x/wt"),
+            "feature-foo-bar"
+        );
+        assert_eq!(session_name(Some("a b:c"), "/x"), "a-b-c");
+        // No branch -> final path segment.
+        assert_eq!(session_name(None, "/root/wt-a"), "wt-a");
+        assert_eq!(session_name(None, "/root/wt-a/"), "wt-a");
+    }
+
+    #[test]
     fn footer_keybar_colors_keys_and_labels_from_theme() {
         use super::*;
         // A distinctive, non-default palette so we know the config drove the colors.
@@ -1891,5 +2017,13 @@ mod tests {
             expand_tilde("/abs/path"),
             std::path::PathBuf::from("/abs/path")
         );
+    }
+
+    #[test]
+    fn session_spawn_mode_starts_in_all_sessions_view() {
+        let win = crate::config::Config::parse("");
+        let sess = crate::config::Config::parse("[agent]\nspawn_mode = \"session\"\n");
+        assert!(!starts_all_sessions(&win));
+        assert!(starts_all_sessions(&sess));
     }
 }

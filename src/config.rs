@@ -45,6 +45,9 @@ impl Default for Timings {
 pub struct Agent {
     pub command: String,
     pub worktree_root: String,
+    /// How a newly-started agent is laid out: `"window"` (default) or `"session"`.
+    /// Interpreted via `Config::spawn_mode()`; unknown values behave as `"window"`.
+    pub spawn_mode: String,
 }
 
 impl Default for Agent {
@@ -52,6 +55,7 @@ impl Default for Agent {
         Self {
             command: "claude".to_string(),
             worktree_root: "~/work/tree".to_string(),
+            spawn_mode: "window".to_string(),
         }
     }
 }
@@ -157,6 +161,15 @@ impl Default for Alerts {
     }
 }
 
+/// How Hydra lays out a newly-started agent. `Window` (default) opens one tmux window
+/// in the current session; `Session` opens a dedicated session with a shell window and
+/// an agent window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnMode {
+    Window,
+    Session,
+}
+
 impl Config {
     /// Parse TOML into a `Config`, filling missing fields from defaults. On a syntax or
     /// type error, fall back to all defaults (the config must never break Hydra).
@@ -195,6 +208,15 @@ impl Config {
             self.alerts.enabled = false;
         }
         self
+    }
+
+    /// Interpret the configured spawn mode. Unrecognized values degrade to `Window`
+    /// (a typo must never silently change behavior), matching `parse_color`'s policy.
+    pub fn spawn_mode(&self) -> SpawnMode {
+        match self.agent.spawn_mode.trim().to_ascii_lowercase().as_str() {
+            "session" => SpawnMode::Session,
+            _ => SpawnMode::Window,
+        }
     }
 }
 
@@ -387,5 +409,31 @@ mod tests {
         let unchanged = base.with_env_overrides(Some(""), None);
         assert_eq!(unchanged.agent.worktree_root, "/from/file");
         assert!(unchanged.alerts.enabled);
+    }
+
+    #[test]
+    fn spawn_mode_defaults_to_window() {
+        assert_eq!(Config::default().spawn_mode(), SpawnMode::Window);
+        assert_eq!(Config::parse("").spawn_mode(), SpawnMode::Window);
+    }
+
+    #[test]
+    fn spawn_mode_parses_session_case_insensitively() {
+        assert_eq!(
+            Config::parse("[agent]\nspawn_mode = \"session\"\n").spawn_mode(),
+            SpawnMode::Session
+        );
+        assert_eq!(
+            Config::parse("[agent]\nspawn_mode = \"Session\"\n").spawn_mode(),
+            SpawnMode::Session
+        );
+    }
+
+    #[test]
+    fn spawn_mode_unknown_value_degrades_to_window_without_breaking_config() {
+        // A typo must not fall the whole config back to defaults, just the mode.
+        let cfg = Config::parse("[agent]\nspawn_mode = \"bogus\"\ncommand = \"codex\"\n");
+        assert_eq!(cfg.spawn_mode(), SpawnMode::Window);
+        assert_eq!(cfg.agent.command, "codex");
     }
 }

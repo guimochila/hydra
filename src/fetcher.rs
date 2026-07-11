@@ -80,14 +80,19 @@ fn wait_for_request(rx: &Receiver<Request>, tick: Duration) -> Wake {
 /// Spawn the detached worker thread. Takes ownership of `caches`; config values are
 /// threaded in as plain values, per the project convention. Fetches immediately so
 /// the first snapshot lands as soon as possible after the popup opens.
-pub fn spawn(mut caches: Caches, refresh_ms: u64, stale_after_secs: u64) -> Fetcher {
+pub fn spawn(
+    mut caches: Caches,
+    refresh_ms: u64,
+    stale_after_secs: u64,
+    initial_all_sessions: bool,
+) -> Fetcher {
     let (req_tx, req_rx) = mpsc::channel::<Request>();
     let (snap_tx, snap_rx) = mpsc::channel::<Overview>();
     let tick = Duration::from_millis(refresh_ms.max(1));
     let _ = std::thread::Builder::new()
         .name("hydra-fetch".into())
         .spawn(move || {
-            let mut all_sessions = false;
+            let mut all_sessions = initial_all_sessions;
             loop {
                 let overview = crate::current_overview(&mut caches, stale_after_secs, all_sessions);
                 if snap_tx.send(overview).is_err() {
