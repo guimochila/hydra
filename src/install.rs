@@ -41,6 +41,7 @@ worktree_list_ttl_secs = 5     # throttle for `git worktree list`
 [agent]
 command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
 worktree_root = "~/work/tree"  # where spawned worktrees go (HYDRA_WORKTREE_ROOT wins)
+spawn_mode    = "window"       # "window": one window here; "session": dedicated session (shell + agent)
 
 [popup]                        # tmux-side — re-run `hydra install` after changing
 key    = "a"                   # prefix + this key opens the popup

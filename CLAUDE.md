@@ -38,7 +38,11 @@ Module map (`src/`):
   constant, so a missing/partial/unparseable file yields today's exact behavior. Loaded at
   the entry points (`ui`/`status`/`hook`/`install`) and threaded as plain values into the
   pure core — no globals. Env vars (`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) are folded into
-  `Config` at load, so use sites never re-check env.
+  `Config` at load, so use sites never re-check env. `agent.spawn_mode` (`"window"` |
+  `"session"`) is runtime-read like everything outside `[popup]`: `"session"` spawns each
+  worktree into its own two-window session (shell + agent) instead of a window in the
+  current session, and starts the popup in all-sessions view so those sessions are
+  visible.
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
   (including `attention`, the Notification's "why input is needed" message). No tmux
@@ -64,8 +68,12 @@ Module map (`src/`):
   unified repo-grouped list of both running agents (age/dirty/attention) and idle
   worktrees (`Enter` starts `claude`), `a`/`d`/`1`-`3` prompt replies (NEEDS_INPUT
   gated + state-file re-checked at send time), `x` to remove a worktree (confirm,
-  kills agent window first, forces on dirty, keeps branch), `s` all-sessions toggle,
-  and a colored `capture-pane -e` preview (memoized per selection+snapshot). Data
+  kills every window rooted in the worktree via `agent::windows_under_path` — mode-
+  agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
+  branch), `s` all-sessions toggle, and a colored `capture-pane -e` preview (memoized
+  per selection+snapshot). `spawn_mode` (`n`/`Enter`) branches between `new_window` and
+  `new_session`+`switch_client`; session mode starts the popup in all-sessions view.
+  Data
   arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms and
   never does git/tmux fetch work itself. Selection is tracked by a stable key (agent
   pane id or worktree path). UI behavior is tested via `TestBackend`.
@@ -117,3 +125,9 @@ verified: the cross-socket jump against a real nested tmux (matching logic unit-
 via `match_pane_by_tty`). The command *forms* for send-keys, spawn (worktree +
 new-window), status, and the cross-session jump (`switch-client`, incl. from inside a
 popup) are verified against live tmux.
+
+`spawn_mode` (window|session, default `"window"`) is done: `"session"` gives each
+worktree a dedicated two-window session (shell + agent), `Enter` reuses an existing
+session and lands on the agent window, and removal stays mode-agnostic by killing
+every window rooted in the worktree (`agent::windows_under_path`) rather than
+special-casing sessions.

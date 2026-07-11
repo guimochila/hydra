@@ -177,6 +177,7 @@ worktree_list_ttl_secs = 5     # throttle for git worktree list
 [agent]
 command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
 worktree_root = "~/work/tree"  # where spawned worktrees go
+spawn_mode    = "window"       # "window" or "session" — see below
 
 [popup]                        # re-run `hydra install` after changing
 key    = "a"
@@ -207,6 +208,19 @@ unknown  = "#b35b79"
 [alerts]
 enabled = true                 # HYDRA_ALERTS=0 also disables
 ```
+
+### `spawn_mode`: window vs. session
+
+Controls how `n` (spawn) and `Enter` (start an idle worktree) open a new agent:
+
+- **`"window"`** (default) — each agent opens as a new window in the current tmux
+  session. This is today's behavior.
+- **`"session"`** — each worktree gets its own dedicated tmux session with two windows:
+  a shell (1) and the agent (2). `Enter` switches to that session, landing on the agent
+  window; `n` stays in the popup so you can spawn several in a row. `x` tears the whole
+  session down (both windows are rooted in the worktree, so killing them destroys the
+  now-empty session). In this mode the popup opens in all-sessions view (`s` still
+  toggles it) so the new sessions are visible.
 
 ## How it works
 
