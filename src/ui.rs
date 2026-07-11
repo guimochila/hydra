@@ -967,9 +967,22 @@ impl App {
         // Kill every window rooted in the worktree, not just the agent's own window.
         // Session mode: shell + agent windows -> tmux destroys the now-empty session.
         // Window mode: only the agent window is rooted here, so this matches today.
-        if let Some((socket, _session, _window)) = &target.agent {
+        if let Some((socket, session, window)) = &target.agent {
             let panes = crate::tmux::list_panes(socket);
-            for (session, window) in crate::agent::windows_under_path(&panes, &target.path) {
+            let mut windows = crate::agent::windows_under_path(&panes, &target.path);
+            // Always include the agent's own window: if its pane cwd no longer matches
+            // the worktree path (e.g. symlink divergence), we must still not git-remove
+            // the worktree out from under a live agent.
+            let own = (session.clone(), *window);
+            if !windows.contains(&own) {
+                windows.push(own);
+            }
+            // Kill the highest window index first. With `renumber-windows on`, killing a
+            // lower index renumbers the higher windows down and would invalidate the
+            // indices we still hold; descending order removes the top window each time,
+            // which never shifts the ones still to kill.
+            windows.sort_by_key(|w| std::cmp::Reverse(w.1));
+            for (session, window) in windows {
                 if let Err(e) = crate::tmux::kill_window(socket, &session, window) {
                     self.message = Some(format!("kill window failed: {e}"));
                     return Action::None;
