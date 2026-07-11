@@ -640,15 +640,36 @@ impl App {
             self.message = Some(format!("worktree failed: {e}"));
             return;
         }
-        self.message = match crate::tmux::new_window(
-            &socket,
-            &session,
-            &sanitize(name),
-            &path_str,
-            &self.config.agent.command,
-        ) {
-            Ok(_window_id) => Some(format!("✓ spawned {name}")),
-            Err(e) => Some(format!("window failed: {e}")),
+        self.message = match self.config.spawn_mode() {
+            crate::config::SpawnMode::Window => match crate::tmux::new_window(
+                &socket,
+                &session,
+                &sanitize(name),
+                &path_str,
+                &self.config.agent.command,
+            ) {
+                Ok(_window_id) => Some(format!("✓ spawned {name}")),
+                Err(e) => Some(format!("window failed: {e}")),
+            },
+            crate::config::SpawnMode::Session => {
+                // New worktree => branch == name. Stay in the popup (as window mode's
+                // `n` does), so several can be spawned in a row.
+                let sess = session_name(Some(name), &path_str);
+                if crate::tmux::session_exists(&socket, &sess) {
+                    Some(format!("session {sess} already exists"))
+                } else {
+                    match crate::tmux::new_session(
+                        &socket,
+                        &sess,
+                        &path_str,
+                        &sanitize(name),
+                        &self.config.agent.command,
+                    ) {
+                        Ok(_agent_win) => Some(format!("✓ spawned {name} in session {sess}")),
+                        Err(e) => Some(format!("session failed: {e}")),
+                    }
+                }
+            }
         };
     }
 
@@ -787,7 +808,8 @@ impl App {
             self.message = Some("no worktree selected".into());
             return false;
         };
-        let name = sanitize(&wt.branch.clone().unwrap_or_else(|| wt.path.clone()));
+        let branch = wt.branch.clone();
+        let name = sanitize(&branch.clone().unwrap_or_else(|| wt.path.clone()));
         let path = wt.path.clone();
         let Some(socket) = tmux::current_socket() else {
             self.message = Some("not inside tmux".into());
@@ -797,15 +819,50 @@ impl App {
             self.message = Some("could not resolve the current tmux session".into());
             return false;
         };
-        match tmux::new_window(&socket, &session, &name, &path, &command) {
-            Ok(window_id) => {
-                // Switch to the new window so closing the popup lands the user on it.
-                let _ = tmux::select_window_id(&socket, &window_id);
-                true
+        match self.config.spawn_mode() {
+            crate::config::SpawnMode::Window => {
+                match tmux::new_window(&socket, &session, &name, &path, &command) {
+                    Ok(window_id) => {
+                        // Switch to the new window so closing the popup lands on it.
+                        let _ = tmux::select_window_id(&socket, &window_id);
+                        true
+                    }
+                    Err(e) => {
+                        self.message = Some(format!("start failed: {e}"));
+                        false
+                    }
+                }
             }
-            Err(e) => {
-                self.message = Some(format!("start failed: {e}"));
-                false
+            crate::config::SpawnMode::Session => {
+                let sess = session_name(branch.as_deref(), &path);
+                if crate::tmux::session_exists(&socket, &sess) {
+                    // Idempotent: reuse the existing session instead of erroring.
+                    match crate::tmux::switch_client(&socket, &sess) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            self.message = Some(format!("switch failed: {e}"));
+                            false
+                        }
+                    }
+                } else {
+                    match crate::tmux::new_session(&socket, &sess, &path, &name, &command) {
+                        Ok(agent_win) => {
+                            // Land on the Claude window (window 2), then attach.
+                            let _ = tmux::select_window_id(&socket, &agent_win);
+                            match crate::tmux::switch_client(&socket, &sess) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    self.message = Some(format!("switch failed: {e}"));
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("start failed: {e}"));
+                            false
+                        }
+                    }
+                }
             }
         }
     }
