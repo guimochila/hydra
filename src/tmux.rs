@@ -182,6 +182,61 @@ pub fn new_window(
     }
 }
 
+/// Create a **detached** two-window session for a worktree: window 1 is a plain shell
+/// rooted in `cwd`, window 2 runs `command` (the agent) named `agent_window_name`.
+/// Returns the agent window's id so the caller can focus it. Used by session spawn mode.
+/// Errors carry stderr. Socket-parameterized like every other call here.
+pub fn new_session(
+    socket: &str,
+    session_name: &str,
+    cwd: &str,
+    agent_window_name: &str,
+    command: &str,
+) -> std::io::Result<String> {
+    let out = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "-n",
+            "shell",
+            "-c",
+            cwd,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    // Append the agent window; `new_window` inserts after the last window and returns
+    // its id, exactly as in window spawn mode.
+    new_window(socket, session_name, agent_window_name, cwd, command)
+}
+
+/// Whether a session named `name` exists on `socket` (via `has-session`). Used to make
+/// session spawning idempotent (switch to an existing session rather than erroring).
+pub fn session_exists(socket: &str, name: &str) -> bool {
+    Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args(["has-session", "-t", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Attach the current client (e.g. the popup's owning client) to `session` on `socket`.
+/// Used to land on a freshly-created (or already-existing) session-mode session. Run
+/// from inside the popup, tmux resolves the popup's owning client — same mechanism as
+/// `jump_to`'s cross-session switch.
+pub fn switch_client(socket: &str, session: &str) -> std::io::Result<()> {
+    run(socket, &["switch-client", "-t", session])
+}
+
 /// Make `window_id` (e.g. `@7`) the current window on its session.
 pub fn select_window_id(socket: &str, window_id: &str) -> std::io::Result<()> {
     run(socket, &["select-window", "-t", window_id])
