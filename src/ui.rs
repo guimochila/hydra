@@ -32,6 +32,7 @@ pub fn run() -> std::io::Result<()> {
     }
     let (config, config_notice) = crate::config::load_reporting();
     let colors = TuiColors::from_config(&config.theme.tui);
+    let all_sessions = starts_all_sessions(&config);
     // The caches move into the background worker; the UI only receives snapshots.
     let caches = Caches::new(
         config.timings.dirty_ttl_secs,
@@ -41,13 +42,15 @@ pub fn run() -> std::io::Result<()> {
         caches,
         config.timings.refresh_ms,
         config.timings.stale_after_secs,
+        all_sessions,
     );
     let mut terminal = ratatui::init();
     let mut app = App {
         show_preview: true,
         colors,
-        config,
+        all_sessions,
         message: config_notice,
+        config,
         ..App::default()
     };
     let result = app.run(&mut terminal, &fetcher);
@@ -1328,6 +1331,12 @@ fn worktree_root(config: &crate::config::Config) -> std::path::PathBuf {
     expand_tilde(&config.agent.worktree_root)
 }
 
+/// Whether Hydra should open in all-sessions view. In session spawn mode agents live in
+/// their own sessions, so all-sessions is the default scope; `s` still toggles at runtime.
+fn starts_all_sessions(config: &crate::config::Config) -> bool {
+    matches!(config.spawn_mode(), crate::config::SpawnMode::Session)
+}
+
 /// Expand a leading `~` / `~/` to the home directory. Other paths pass through.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
     if path == "~" {
@@ -1995,5 +2004,13 @@ mod tests {
             expand_tilde("/abs/path"),
             std::path::PathBuf::from("/abs/path")
         );
+    }
+
+    #[test]
+    fn session_spawn_mode_starts_in_all_sessions_view() {
+        let win = crate::config::Config::parse("");
+        let sess = crate::config::Config::parse("[agent]\nspawn_mode = \"session\"\n");
+        assert!(!starts_all_sessions(&win));
+        assert!(starts_all_sessions(&sess));
     }
 }
