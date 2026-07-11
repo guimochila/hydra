@@ -656,8 +656,13 @@ impl App {
             },
             crate::config::SpawnMode::Session => {
                 // New worktree => branch == name. Stay in the popup (as window mode's
-                // `n` does), so several can be spawned in a row.
-                let sess = session_name(Some(name), &path_str);
+                // `n` does), so several can be spawned in a row. Scope the session name by
+                // the repo (of `cwd`, where the worktree was created) so same-branch
+                // spawns in different repos don't collide on one session name.
+                let repo = crate::worktree::resolve(&cwd)
+                    .map(|w| w.repo_name)
+                    .unwrap_or_default();
+                let sess = session_name(&repo, Some(name), &path_str);
                 if crate::tmux::session_exists(&socket, &sess) {
                     Some(format!("session {sess} already exists"))
                 } else {
@@ -821,6 +826,7 @@ impl App {
         let branch = wt.branch.clone();
         let name = sanitize(&branch.clone().unwrap_or_else(|| wt.path.clone()));
         let path = wt.path.clone();
+        let repo = wt.repo_name.clone();
         let Some(socket) = tmux::current_socket() else {
             self.message = Some("not inside tmux".into());
             return false;
@@ -844,7 +850,7 @@ impl App {
                 }
             }
             crate::config::SpawnMode::Session => {
-                let sess = session_name(branch.as_deref(), &path);
+                let sess = session_name(&repo, branch.as_deref(), &path);
                 if crate::tmux::session_exists(&socket, &sess) {
                     // Idempotent: reuse the existing session instead of erroring.
                     match crate::tmux::switch_client(&socket, &sess) {
@@ -1392,16 +1398,20 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// A tmux-safe session name for a worktree: the branch if present, else the path's final
-/// segment. `/`, whitespace, `.` and `:` all become `-` — tmux treats `.`/`:` as target
-/// separators (`session:window.pane`), so they must not appear in a name we later target.
-fn session_name(branch: Option<&str>, path: &str) -> String {
-    let raw = branch.map(str::to_string).unwrap_or_else(|| {
+/// A tmux-safe, **repo-scoped** session name for a worktree: `<repo>-<leaf>`, where `leaf`
+/// is the branch if present, else the path's final segment. The `<repo>` prefix (the repo
+/// directory name) disambiguates worktrees that share a branch name across different repos,
+/// so `Enter`/`n` can't collide on (or switch to) the wrong repo's session. `/`, whitespace,
+/// `.` and `:` all become `-` — tmux treats `.`/`:` as target separators (`session:window.pane`),
+/// so they must not appear in a name we later target.
+fn session_name(repo: &str, branch: Option<&str>, path: &str) -> String {
+    let leaf = branch.map(str::to_string).unwrap_or_else(|| {
         std::path::Path::new(path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string())
     });
+    let raw = format!("{repo}-{leaf}");
     raw.chars()
         .map(|c| {
             if c == '/' || c == '.' || c == ':' || c.is_whitespace() {
@@ -1918,16 +1928,24 @@ mod tests {
     }
 
     #[test]
-    fn session_name_uses_branch_then_basename_and_is_tmux_safe() {
-        // Branch preferred; `/`, `.`, `:`, whitespace all become `-`.
+    fn session_name_is_repo_scoped_branch_then_basename_and_tmux_safe() {
+        // Repo prefix disambiguates same-branch worktrees across different repos.
+        assert_eq!(session_name("hydra", Some("main"), "/a/wt"), "hydra-main");
         assert_eq!(
-            session_name(Some("feature/foo.bar"), "/x/wt"),
-            "feature-foo-bar"
+            session_name("cet-services", Some("main"), "/b/wt"),
+            "cet-services-main"
         );
-        assert_eq!(session_name(Some("a b:c"), "/x"), "a-b-c");
-        // No branch -> final path segment.
-        assert_eq!(session_name(None, "/root/wt-a"), "wt-a");
-        assert_eq!(session_name(None, "/root/wt-a/"), "wt-a");
+        // Branch preferred over path; `/`, `.`, `:`, whitespace all become `-`.
+        assert_eq!(
+            session_name("repo", Some("feature/foo.bar"), "/x/wt"),
+            "repo-feature-foo-bar"
+        );
+        assert_eq!(session_name("repo", Some("a b:c"), "/x"), "repo-a-b-c");
+        // No branch -> final path segment, still repo-scoped.
+        assert_eq!(session_name("repo", None, "/root/wt-a"), "repo-wt-a");
+        assert_eq!(session_name("repo", None, "/root/wt-a/"), "repo-wt-a");
+        // An unsafe char in the repo name is normalized too.
+        assert_eq!(session_name("my.repo", Some("x"), "/p"), "my-repo-x");
     }
 
     #[test]
