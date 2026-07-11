@@ -219,22 +219,28 @@ pub fn new_session(
 
 /// Whether a session named `name` exists on `socket` (via `has-session`). Used to make
 /// session spawning idempotent (switch to an existing session rather than erroring).
+/// `=name` forces an exact match — a bare name would also match by prefix, so a branch
+/// name that is a prefix of another session's name must not report a false positive.
+/// Captures output so tmux's "can't find session" stderr (the common path) never leaks
+/// into the popup's pty.
 pub fn session_exists(socket: &str, name: &str) -> bool {
+    let target = format!("={name}");
     Command::new("tmux")
         .arg("-S")
         .arg(socket)
-        .args(["has-session", "-t", name])
-        .status()
-        .map(|s| s.success())
+        .args(["has-session", "-t", &target])
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 /// Attach the current client (e.g. the popup's owning client) to `session` on `socket`.
 /// Used to land on a freshly-created (or already-existing) session-mode session. Run
 /// from inside the popup, tmux resolves the popup's owning client — same mechanism as
-/// `jump_to`'s cross-session switch.
+/// `jump_to`'s cross-session switch. `=session` forces an exact match (a bare name would
+/// also match by prefix).
 pub fn switch_client(socket: &str, session: &str) -> std::io::Result<()> {
-    run(socket, &["switch-client", "-t", session])
+    run(socket, &["switch-client", "-t", &format!("={session}")])
 }
 
 /// Make `window_id` (e.g. `@7`) the current window on its session.
