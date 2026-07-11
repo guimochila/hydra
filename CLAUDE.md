@@ -72,8 +72,7 @@ Module map (`src/`):
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
   branch), `s` all-sessions toggle, and a colored `capture-pane -e` preview (memoized
   per selection+snapshot). `spawn_mode` (`n`/`Enter`) branches between `new_window` and
-  `new_session`+`switch_client`; session mode starts the popup in all-sessions view.
-  Data
+  `new_session`+`switch_client`; session mode starts the popup in all-sessions view. Data
   arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms and
   never does git/tmux fetch work itself. Selection is tracked by a stable key (agent
   pane id or worktree path). UI behavior is tested via `TestBackend`.
