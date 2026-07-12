@@ -213,8 +213,22 @@ pub fn new_session(
         ));
     }
     // Append the agent window; `new_window` inserts after the last window and returns
-    // its id, exactly as in window spawn mode.
-    new_window(socket, session_name, agent_window_name, cwd, command)
+    // its id, exactly as in window spawn mode. If it fails, roll back the just-created
+    // (shell-only) session so a partial spawn never leaves an orphan session behind.
+    match new_window(socket, session_name, agent_window_name, cwd, command) {
+        Ok(window_id) => Ok(window_id),
+        Err(e) => {
+            let _ = kill_session(socket, session_name);
+            Err(e)
+        }
+    }
+}
+
+/// Kill the session named `name` on `socket` (via `kill-session`). `=name` forces an exact
+/// match (a bare name would also match by prefix). Used to roll back a partially-created
+/// session in `new_session`.
+pub fn kill_session(socket: &str, name: &str) -> std::io::Result<()> {
+    run(socket, &["kill-session", "-t", &format!("={name}")])
 }
 
 /// Whether a session named `name` exists on `socket` (via `has-session`). Used to make
