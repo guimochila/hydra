@@ -159,13 +159,24 @@ pub fn format_age(secs: u64) -> String {
     }
 }
 
-/// Worktrees of the project that have no agent running in them. `project.entries` paths
-/// are already canonical; agent worktree roots are canonicalized here to match.
-pub fn idle_from(agents: &[Agent], project: &ProjectWorktrees) -> Vec<IdleWorktree> {
-    let occupied: std::collections::HashSet<String> = agents
+/// Canonical worktree roots that have a live agent — the occupancy set for `idle_from`.
+/// Deliberately spans EVERY session on the socket, not just the displayed (possibly
+/// session-filtered) agents: in session spawn mode an agent lives in its own session, and
+/// its worktree must not be offered as "idle" just because the current view is scoped to a
+/// different session. Pure; `project.entries` are already canonical so we canonicalize here.
+pub fn occupied_roots(agents: &[Agent]) -> std::collections::HashSet<String> {
+    agents
         .iter()
         .filter_map(|a| a.worktree.as_ref().map(|w| canon(&w.root)))
-        .collect();
+        .collect()
+}
+
+/// Worktrees of the project that have no agent running in them. `occupied` is the set of
+/// canonical roots from `occupied_roots`; `project.entries` paths are already canonical.
+pub fn idle_from(
+    occupied: &std::collections::HashSet<String>,
+    project: &ProjectWorktrees,
+) -> Vec<IdleWorktree> {
     project
         .entries
         .iter()
@@ -309,10 +320,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_from_excludes_worktrees_with_a_running_agent() {
-        // Agent occupies /wt/a; /wt/b and /repo/main are idle.
-        let mut occupied_agent = agent_with("%1", Status::Idle, 1, Some(("/k", "proj", Some("a"))));
-        occupied_agent.worktree.as_mut().unwrap().root = "/wt/a".into();
+    fn idle_from_excludes_occupied_worktrees() {
+        // /wt/a is occupied; /wt/b and /repo/main are idle.
+        let occupied = std::collections::HashSet::from([canon("/wt/a")]);
         let project = ProjectWorktrees {
             repo_key: "/k".into(),
             repo_name: "proj".into(),
@@ -322,9 +332,26 @@ mod tests {
                 ("/wt/b".into(), Some("b".into())),
             ],
         };
-        let idle = idle_from(&[occupied_agent], &project);
+        let idle = idle_from(&occupied, &project);
         let paths: Vec<&str> = idle.iter().map(|w| w.path.as_str()).collect();
         assert_eq!(paths, vec!["/repo/main", "/wt/b"]);
+    }
+
+    #[test]
+    fn occupied_roots_spans_every_session_and_canonicalizes() {
+        // Two agents in DIFFERENT sessions, each in its own worktree. Occupancy must not
+        // be session-scoped: both roots count, so neither shows as idle in any view.
+        let mut a = agent_with("%1", Status::Working, 1, Some(("/k", "proj", Some("a"))));
+        a.pane.session_name = "sess-a".into();
+        a.worktree.as_mut().unwrap().root = "/wt/a".into();
+        let mut b = agent_with("%2", Status::Idle, 1, Some(("/k", "proj", Some("b"))));
+        b.pane.session_name = "sess-b".into();
+        b.worktree.as_mut().unwrap().root = "/wt/b".into();
+
+        let roots = occupied_roots(&[a, b]);
+        assert!(roots.contains(&canon("/wt/a")));
+        assert!(roots.contains(&canon("/wt/b")));
+        assert_eq!(roots.len(), 2);
     }
 
     #[test]
