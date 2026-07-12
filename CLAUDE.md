@@ -79,7 +79,10 @@ Module map (`src/`):
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
   indicator (tmux polls it from `status-right`).
 - `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT
-  (fired from `hook.rs`); fire-and-forget, `HYDRA_ALERTS=0` disables.
+  (fired from `hook.rs`); fire-and-forget, `HYDRA_ALERTS=0` disables. Shown via the
+  cross-platform `notify-rust` crate, but that call *blocks*, so `spawn_notify` runs it
+  out-of-process: it launches `hydra notify <title> <body>` (an internal subcommand in
+  `main.rs`) detached and returns instantly, keeping the hook cheap.
 - `install.rs` — merges hooks into `~/.claude/settings.json` and a marked block into
   `~/.tmux.conf`; both idempotent and reversible.
 

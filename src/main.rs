@@ -6,6 +6,10 @@
 //!   hydra hook <event> Record a lifecycle event (installed into Claude Code hooks).
 //!   hydra install      Install hooks + a tmux popup keybinding.
 //!   hydra uninstall    Remove them.
+//!
+//! Internal (not shown in help): `hydra notify <title> <body>` shows one desktop
+//! notification and exits. The hook spawns it detached so the blocking `notify-rust`
+//! call never slows the hook down (see `alert.rs`).
 
 mod agent;
 mod alert;
@@ -34,6 +38,16 @@ fn main() -> ExitCode {
             args.get(2).map(String::as_str).unwrap_or(""),
         ),
         Some("hook") => hook::run(args.get(1).map(String::as_str).unwrap_or("")),
+        Some("notify") => {
+            // Internal: shows one desktop notification and exits. Spawned detached by
+            // the hook (via alert::spawn_notify) so notify-rust's blocking call never
+            // slows the hook. Kept out of `print_help` — not a user-facing command.
+            alert::show(
+                args.get(1).map(String::as_str).unwrap_or(""),
+                args.get(2).map(String::as_str).unwrap_or(""),
+            );
+            Ok(())
+        }
         Some("install") => install::install(),
         Some("uninstall") => install::uninstall(),
         Some("help") | Some("-h") | Some("--help") => {

@@ -20,6 +20,9 @@ ratatui = "0.30"
 dirs = "6"
 toml = "1"
 ansi-to-tui = "8.0.1"
+# Cross-platform desktop notifications. Default features use the pure-Rust zbus
+# backend on Linux/BSD (no libdbus C dependency); macOS uses mac-notification-sys.
+notify-rust = "4"
 
 [profile.release]
 strip = true
