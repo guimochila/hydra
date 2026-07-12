@@ -97,7 +97,24 @@ pub fn current_overview(
     }
 
     let session_filter = (!all_sessions).then_some(session.as_str());
-    let agents = agent::collect(session_filter, states, &panes, now, caches, stale_after);
+    let agents = agent::collect(
+        session_filter,
+        states.clone(),
+        &panes,
+        now,
+        caches,
+        stale_after,
+    );
+
+    // Occupancy for idle-worktree discovery spans EVERY session on the socket, not just
+    // the displayed (session-filtered) agents — a session-mode agent lives in its own
+    // session, so its worktree must not appear idle in a session-scoped view. Resolve
+    // worktree roots only (cache is already warm from `collect`); no dirty/git.
+    let mut all_agents = agent::join_and_sort(states, &panes, None, now, stale_after);
+    for a in &mut all_agents {
+        a.worktree = caches.worktree.resolve(&a.pane.cwd);
+    }
+    let occupied = agent::occupied_roots(&all_agents);
 
     // Idle worktrees for every repo in view: each agent's repo plus the popup's own
     // cwd (when it's in a repo) — deduped by repo identity, first anchor wins.
@@ -114,7 +131,7 @@ pub fn current_overview(
         if !seen_repos.insert(project.repo_key.clone()) {
             continue;
         }
-        idle.extend(agent::idle_from(&agents, &project));
+        idle.extend(agent::idle_from(&occupied, &project));
     }
 
     Overview { agents, idle }
