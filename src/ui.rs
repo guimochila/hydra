@@ -1387,9 +1387,16 @@ fn delete_last_word(s: &mut String) {
 /// Make a name safe as a single path segment (slashes/whitespace → `-`). The branch
 /// keeps the original name; only the worktree directory leaf is sanitized.
 fn sanitize(name: &str) -> String {
+    replace_unsafe(name, &[])
+}
+
+/// Shared core of `sanitize` and `session_name`: replace `/`, whitespace, and any char in
+/// `also` with `-`. `session_name` passes `['.', ':']` (tmux target separators) as `also`;
+/// path-segment `sanitize` passes none.
+fn replace_unsafe(name: &str, also: &[char]) -> String {
     name.chars()
         .map(|c| {
-            if c == '/' || c.is_whitespace() {
+            if c == '/' || c.is_whitespace() || also.contains(&c) {
                 '-'
             } else {
                 c
@@ -1411,16 +1418,7 @@ fn session_name(repo: &str, branch: Option<&str>, path: &str) -> String {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string())
     });
-    let raw = format!("{repo}-{leaf}");
-    raw.chars()
-        .map(|c| {
-            if c == '/' || c == '.' || c == ':' || c.is_whitespace() {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect()
+    replace_unsafe(&format!("{repo}-{leaf}"), &['.', ':'])
 }
 
 #[cfg(test)]
