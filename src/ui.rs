@@ -193,7 +193,7 @@ const KEYBAR: &[(&str, &str)] = &[
     ("⇥", "next⚠"),
     ("/", "filter"),
     ("p", "preview"),
-    ("s", "sess"),
+    ("s", "scope"),
     ("q", "quit"),
 ];
 
@@ -235,8 +235,11 @@ struct App {
     colors: TuiColors,
     /// Whether the preview pane is shown.
     show_preview: bool,
-    /// Show agents from every session on the socket, not just the current one.
+    /// Flip the default repo-scoped view to every session on the socket.
     all_sessions: bool,
+    /// Header label for the active view scope, taken from the latest snapshot
+    /// (`current_overview` computes it so the UI does no git/tmux work).
+    scope_label: String,
     /// All agents this tick (status-sorted), before filtering.
     agents: Vec<Agent>,
     /// All idle worktrees this tick, before filtering.
@@ -284,6 +287,7 @@ impl App {
             while let Ok(overview) = fetcher.snap_rx.try_recv() {
                 self.agents = overview.agents;
                 self.idle = overview.idle;
+                self.scope_label = overview.scope_label;
                 fresh = true;
             }
             if fresh {
@@ -1046,7 +1050,7 @@ impl App {
             let msg = if !self.loaded {
                 "  loading…" // the popup opens before the worker's first snapshot
             } else if self.filter.is_empty() {
-                "  no Claude Code agents in this session"
+                "  no Claude Code agents or worktrees in view"
             } else {
                 "  no agents match filter"
             };
@@ -1107,14 +1111,12 @@ impl App {
     }
 
     fn title(&self) -> String {
-        let session = if self.all_sessions {
-            "all sessions".to_string()
+        // `scope_label` comes straight from the snapshot (repo name / "all sessions" /
+        // session name); before the first snapshot it's empty.
+        let scope = if self.scope_label.is_empty() {
+            "…"
         } else {
-            self.agents
-                .first()
-                .map(|a| a.pane.session_name.clone())
-                .or_else(|| tmux::current_socket().and_then(|s| tmux::current_session(&s)))
-                .unwrap_or_else(|| "?".into())
+            self.scope_label.as_str()
         };
         let needs = self
             .agents
@@ -1123,9 +1125,9 @@ impl App {
             .count();
         let total = self.agents.len();
         if needs > 0 {
-            format!(" Hydra · {session} · {total} agents · ⚠ {needs} ")
+            format!(" Hydra · {scope} · {total} agents · ⚠ {needs} ")
         } else {
-            format!(" Hydra · {session} · {total} agents ")
+            format!(" Hydra · {scope} · {total} agents ")
         }
     }
 
@@ -1821,6 +1823,37 @@ mod tests {
         assert!(text.contains("feat-idle"), "idle worktree rendered");
         assert!(text.contains("start ⏎"), "start affordance rendered");
         assert!(text.contains("⚠ 1"), "title shows the needs-input count");
+    }
+
+    #[test]
+    fn title_shows_the_scope_label_from_the_snapshot() {
+        // Agent lives in session "proj", but the snapshot's scope is the repo — the
+        // header must reflect the repo name, not the agent's session.
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        app.scope_label = "cet-services".into();
+        app.show_preview = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("cet-services"),
+            "header shows the scope label"
+        );
     }
 
     #[test]

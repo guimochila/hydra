@@ -7,7 +7,7 @@
 
 use crate::state::{AgentState, Status};
 use crate::tmux::Pane;
-use crate::worktree::{Caches, IdleWorktree, ProjectWorktrees, WorktreeInfo};
+use crate::worktree::{IdleWorktree, ProjectWorktrees, WorktreeInfo};
 
 /// A working agent that is joined to a live pane and ready to display.
 #[derive(Debug, Clone)]
@@ -64,25 +64,6 @@ pub fn join_and_sort(
             .cmp(&status_rank(b.effective_status))
             .then(a.pane.window_index.cmp(&b.pane.window_index))
     });
-    agents
-}
-
-/// Full pipeline: join `states` with the given live `panes`, and resolve each
-/// surviving agent's worktree and (throttled) uncommitted-change count. The caller
-/// provides `panes` (one `list_panes` call serves both this join and the GC).
-pub fn collect(
-    session_name: Option<&str>,
-    states: Vec<AgentState>,
-    panes: &[Pane],
-    now: u64,
-    caches: &mut Caches,
-    stale_after: u64,
-) -> Vec<Agent> {
-    let mut agents = join_and_sort(states, panes, session_name, now, stale_after);
-    for agent in &mut agents {
-        agent.worktree = caches.worktree.resolve(&agent.pane.cwd);
-        agent.dirty = caches.dirty.count(&agent.pane.cwd, now);
-    }
     agents
 }
 
@@ -206,6 +187,47 @@ fn canon(path: &str) -> String {
     std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string())
+}
+
+/// Which subset of the socket's agents the display shows. `Repo` compares each
+/// agent's resolved `worktree.repo_key`, so agents must already have their worktree
+/// resolved before filtering by it; `Session` and `All` need no worktree.
+pub enum Scope<'a> {
+    /// Only agents in this tmux session — the fallback when the popup's cwd isn't in
+    /// a repo (so there's no repo identity to scope by).
+    Session(&'a str),
+    /// Agents whose worktree shares this repo identity, across every session on the
+    /// socket. The default view when the popup opens inside a repo/worktree.
+    Repo(&'a str),
+    /// Every agent on the socket, regardless of session or repo.
+    All,
+}
+
+/// Pick the display scope from the `s`-toggle state and the popup's context. The
+/// default (toggle off) is repo-scoped when the popup's cwd resolves to a repo, so a
+/// worktree sees the whole repo's agents across sessions; it falls back to the current
+/// session only when there's no repo identity to scope by. The toggle on means the
+/// whole socket.
+pub fn choose_scope<'a>(
+    all_sessions: bool,
+    popup_repo_key: Option<&'a str>,
+    session: &'a str,
+) -> Scope<'a> {
+    match (all_sessions, popup_repo_key) {
+        (true, _) => Scope::All,
+        (false, Some(key)) => Scope::Repo(key),
+        (false, None) => Scope::Session(session),
+    }
+}
+
+/// Whether `agent` belongs in the given display `scope`. A worktree-less agent never
+/// matches a `Repo` scope (no `repo_key` to compare).
+pub fn matches_scope(agent: &Agent, scope: &Scope) -> bool {
+    match scope {
+        Scope::Session(name) => agent.pane.session_name == *name,
+        Scope::Repo(key) => agent.worktree.as_ref().is_some_and(|w| w.repo_key == *key),
+        Scope::All => true,
+    }
 }
 
 /// Case-insensitive substring match against branch, repo, task summary and window name.
@@ -409,6 +431,44 @@ mod tests {
         assert_eq!(format_age(90), "1m");
         assert_eq!(format_age(3600), "1h");
         assert_eq!(format_age(90_000), "1d");
+    }
+
+    #[test]
+    fn choose_scope_defaults_to_repo_then_falls_back_to_session() {
+        // Popup in a repo, toggle off → repo-scoped (across sessions).
+        assert!(matches!(
+            choose_scope(false, Some("/k"), "proj"),
+            Scope::Repo("/k")
+        ));
+        // Popup NOT in a repo, toggle off → session-scoped fallback.
+        assert!(matches!(
+            choose_scope(false, None, "proj"),
+            Scope::Session("proj")
+        ));
+        // Toggle on → all sessions, regardless of repo context.
+        assert!(matches!(choose_scope(true, Some("/k"), "proj"), Scope::All));
+        assert!(matches!(choose_scope(true, None, "proj"), Scope::All));
+    }
+
+    #[test]
+    fn matches_scope_filters_by_session_repo_or_all() {
+        // agent_with puts the pane in session "proj"; repo_key comes from the worktree.
+        let a = agent_with("%1", Status::Idle, 1, Some(("/k1", "alpha", None)));
+        let b = agent_with("%2", Status::Idle, 1, None); // no worktree
+
+        // Session scope keys off the tmux session name.
+        assert!(matches_scope(&a, &Scope::Session("proj")));
+        assert!(!matches_scope(&a, &Scope::Session("other")));
+
+        // Repo scope keys off the resolved worktree's repo_key, across sessions.
+        assert!(matches_scope(&a, &Scope::Repo("/k1")));
+        assert!(!matches_scope(&a, &Scope::Repo("/k2")));
+        // A worktree-less agent can never match a repo scope.
+        assert!(!matches_scope(&b, &Scope::Repo("/k1")));
+
+        // All keeps everything, worktree or not.
+        assert!(matches_scope(&a, &Scope::All));
+        assert!(matches_scope(&b, &Scope::All));
     }
 
     #[test]

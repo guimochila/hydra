@@ -28,8 +28,9 @@ leaving the popup.
 
 ## Features
 
-- 👁️ **One view of every agent** — all Claude Code sessions in your tmux session, grouped
-  by git repo, with a live *working / needs-input / idle* status.
+- 👁️ **One view of every agent** — every Claude Code agent in the current repo, across all
+  your tmux sessions, grouped by git repo, with a live *working / needs-input / idle*
+  status (`s` widens to every session on the server).
 - ⌨️ **Vim-native navigation** — `j`/`k`, `gg`/`G`, `/` to filter, `Enter` to jump to an
   agent's window.
 - ✅ **Act without switching** — approve (`a`), deny (`d`) or pick an option (`1`–`3`)
@@ -110,7 +111,7 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `n` | spawn a new agent: worktree + tmux window running `claude` |
 | `x` | remove the selected worktree (confirm with `y`) |
 | `p` | toggle the preview pane |
-| `s` | toggle all-sessions view (every session on this tmux server) |
+| `s` | toggle scope: this repo (across all sessions) ⟷ every session on this tmux server |
 | `/` | filter (branch / repo / summary / window) |
 | `r` | refresh |
 | `q` / `Esc` | quit (Esc clears an active filter first) |
