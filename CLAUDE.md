@@ -28,8 +28,13 @@ Module map (`src/`):
 
 - `main.rs` — CLI dispatch (`hydra`, `ls`, `status`, `hook`, `install`, `uninstall`,
   `version`) and `current_overview()`, the shared "resolve socket+session → agents +
-  idle worktrees" helper (session-scoped or `all_sessions`; idle worktrees for every
-  repo in view; GC's dead state files as a side effect).
+  idle worktrees" helper. Resolves every agent's worktree once (serving both occupancy
+  and the display filter), then picks a display `Scope` via `agent::choose_scope`:
+  repo-scoped by default (this repo's agents across sessions, keyed on the popup cwd's
+  `repo_key`), session-scoped when the popup cwd isn't in a repo, or `all_sessions`
+  (whole socket) when the `s` toggle is on. Returns a `scope_label` for the header so
+  the UI does no git/tmux work. Idle worktrees for every repo in view; GC's dead state
+  files as a side effect.
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
   (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files.
   **The only shared contract between the hook writer and the TUI reader.**
@@ -61,18 +66,23 @@ Module map (`src/`):
   `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove. Repo identity
   (`repo_key`) is the canonicalized common git dir (`abs_common_dir`) so main and
   linked worktrees share one key.
-- `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, filter to session,
-  staleness, sort) and `collect` (adds worktree + dirty). Also `idle_from` (project
-  worktrees − occupied), `matches_filter`/`worktree_matches_filter`, `format_age`.
+- `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, optional session
+  filter, staleness, sort). Display scoping is pure and tested: `Scope`
+  (Session/Repo/All), `choose_scope` (toggle + popup repo_key → scope) and
+  `matches_scope` (per-agent predicate; a worktree-less agent never matches `Repo`).
+  Also `idle_from` (project worktrees − occupied),
+  `matches_filter`/`worktree_matches_filter`, `format_age`.
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
   unified repo-grouped list of both running agents (age/dirty/attention) and idle
   worktrees (`Enter` starts `claude`), `a`/`d`/`1`-`3` prompt replies (NEEDS_INPUT
   gated + state-file re-checked at send time), `x` to remove a worktree (confirm,
   kills every window rooted in the worktree via `agent::windows_under_path` — mode-
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
-  branch), `s` all-sessions toggle, and a colored `capture-pane -e` preview (memoized
-  per selection+snapshot). `spawn_mode` (`n`/`Enter`) branches between `new_window` and
-  `new_session`+`switch_client`; session mode starts the popup in all-sessions view. Data
+  branch), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored `capture-pane -e`
+  preview (memoized per selection+snapshot). The header scope label comes from the
+  snapshot's `scope_label` (no git/tmux on the UI thread). `spawn_mode` (`n`/`Enter`)
+  branches between `new_window` and `new_session`+`switch_client`; session mode starts the
+  popup in all-sessions view. Data
   arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms and
   never does git/tmux fetch work itself. Selection is tracked by a stable key (agent
   pane id or worktree path). UI behavior is tested via `TestBackend`.

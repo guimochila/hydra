@@ -74,11 +74,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// The current session's running agents plus the project's idle worktrees.
+/// The in-scope running agents plus the project's idle worktrees.
 #[derive(Default)]
 pub struct Overview {
     pub agents: Vec<agent::Agent>,
     pub idle: Vec<worktree::IdleWorktree>,
+    /// Human label for the active view scope (repo name / `"all sessions"` / session
+    /// name), computed here so the UI thread renders the header without any git/tmux
+    /// work of its own.
+    pub scope_label: String,
 }
 
 /// Resolve the current socket/session, collect agents (session-scoped, or every
@@ -110,35 +114,54 @@ pub fn current_overview(
         let _ = state::remove_state(&sock, &pane_id);
     }
 
-    let session_filter = (!all_sessions).then_some(session.as_str());
-    let agents = agent::collect(
-        session_filter,
-        states.clone(),
-        &panes,
-        now,
-        caches,
-        stale_after,
-    );
-
-    // Occupancy for idle-worktree discovery spans EVERY session on the socket, not just
-    // the displayed (session-filtered) agents — a session-mode agent lives in its own
-    // session, so its worktree must not appear idle in a session-scoped view. Resolve
-    // worktree roots only (cache is already warm from `collect`); no dirty/git.
+    // Resolve every agent's worktree once (roots + repo_key). This one pass serves both
+    // occupancy — which must span EVERY session on the socket so a session-mode agent's
+    // worktree never shows as idle — and the repo-scoped display filter below.
     let mut all_agents = agent::join_and_sort(states, &panes, None, now, stale_after);
     for a in &mut all_agents {
         a.worktree = caches.worktree.resolve(&a.pane.cwd);
     }
     let occupied = agent::occupied_roots(&all_agents);
 
-    // Idle worktrees for every repo in view: each agent's repo plus the popup's own
-    // cwd (when it's in a repo) — deduped by repo identity, first anchor wins.
+    // The popup's own cwd → its repo identity. Drives both the default scope (repo-scoped
+    // when we're inside a repo) and idle discovery.
     let popup_cwd = std::env::current_dir()
         .ok()
-        .map(|p| p.display().to_string())
-        .filter(|p| caches.worktree.resolve(p).is_some());
+        .map(|p| p.display().to_string());
+    let popup_wt = popup_cwd
+        .as_deref()
+        .and_then(|p| caches.worktree.resolve(p));
+    let popup_repo_key = popup_wt.as_ref().map(|w| w.repo_key.as_str());
+
+    // Default view is repo-scoped (this repo's agents across sessions); `s` flips to the
+    // whole socket; a non-repo popup cwd falls back to the current session.
+    let scope = agent::choose_scope(all_sessions, popup_repo_key, &session);
+    let scope_label = match &scope {
+        agent::Scope::All => "all sessions".to_string(),
+        // In repo scope popup_wt is always Some (that's why we chose Repo).
+        agent::Scope::Repo(_) => popup_wt
+            .as_ref()
+            .map(|w| w.repo_name.clone())
+            .unwrap_or_else(|| session.clone()),
+        agent::Scope::Session(_) => session.clone(),
+    };
+
+    // Display set: filter the resolved agents by scope, then add throttled dirty counts
+    // only for what's shown.
+    let mut agents: Vec<agent::Agent> = all_agents
+        .into_iter()
+        .filter(|a| agent::matches_scope(a, &scope))
+        .collect();
+    for a in &mut agents {
+        a.dirty = caches.dirty.count(&a.pane.cwd, now);
+    }
+
+    // Idle worktrees for every repo in view: each displayed agent's repo plus the popup's
+    // own cwd (when it's in a repo) — deduped by repo identity, first anchor wins.
+    let popup_anchor = popup_wt.as_ref().and(popup_cwd.as_deref());
     let mut idle = Vec::new();
     let mut seen_repos = std::collections::HashSet::new();
-    for anchor in agent::idle_anchors(&agents, popup_cwd.as_deref()) {
+    for anchor in agent::idle_anchors(&agents, popup_anchor) {
         let Some(project) = caches.wt_list.get(&anchor, now) else {
             continue;
         };
@@ -148,7 +171,11 @@ pub fn current_overview(
         idle.extend(agent::idle_from(&occupied, &project));
     }
 
-    Overview { agents, idle }
+    Overview {
+        agents,
+        idle,
+        scope_label,
+    }
 }
 
 fn list_command() -> std::io::Result<()> {
