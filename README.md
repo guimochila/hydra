@@ -136,9 +136,10 @@ source, so worktrees are found wherever they live.
 ### Notifications
 
 When an agent transitions into "needs input", Hydra fires a desktop notification —
-including the reason — via the cross-platform [`notify-rust`](https://crates.io/crates/notify-rust)
-library (zbus on Linux/BSD, the native notifier on macOS), so you don't have to watch
-the popup. Set `HYDRA_ALERTS=0` to disable.
+including the reason — so you don't have to watch the popup. On macOS it uses the
+built-in `osascript` (`display notification`); on Linux/Windows it uses the
+cross-platform [`notify-rust`](https://crates.io/crates/notify-rust) library (zbus on
+Linux/BSD). Set `HYDRA_ALERTS=0` to disable.
 
 ### Removing worktrees
 

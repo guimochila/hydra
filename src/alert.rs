@@ -2,12 +2,21 @@
 //! they don't have to keep opening the popup to notice.
 //!
 //! Fired from the hook (see `hook.rs`) only on the *transition* into NEEDS_INPUT.
-//! Best-effort and fire-and-forget: the actual desktop notification is shown by
-//! `notify-rust`, which is an in-process (blocking) library. To keep the hook fast
-//! (see `CLAUDE.md`: "Keep hook.rs cheap"), we don't call it inline — instead
-//! `spawn_notify` launches `hydra notify <title> <body>` as a detached child that
-//! calls `show` and exits, so the hook returns instantly. Firing is gated by the
-//! caller via `[alerts].enabled` (or `HYDRA_ALERTS=0`).
+//! Best-effort and fire-and-forget: firing is gated by the caller via
+//! `[alerts].enabled` (or `HYDRA_ALERTS=0`), and the hook must stay cheap
+//! (see `CLAUDE.md`: "Keep hook.rs cheap"), so `notify` never blocks it.
+//!
+//! The delivery mechanism is per-OS:
+//!   - macOS: shell out to `osascript` (an Apple-signed binary whose `display
+//!     notification` is entitled to post to Notification Center). Spawning it is itself
+//!     the detach, so there's no extra indirection. We can't use `notify-rust` here:
+//!     its macOS backend (`mac-notification-sys`) is built on the deprecated
+//!     `NSUserNotification` API, which silently no-ops on modern macOS for a
+//!     non-bundled CLI binary (the call returns `Ok` but nothing is ever displayed).
+//!   - Linux/Windows: `notify-rust`, an in-process library whose `.show()` *blocks*
+//!     (D-Bus / WinRT round-trip). To keep the hook fast we don't call it inline —
+//!     `spawn_notify` launches `hydra notify <title> <body>` as a detached child that
+//!     calls `show` and exits, so the hook returns instantly.
 
 use std::process::{Command, Stdio};
 
@@ -20,7 +29,44 @@ const TITLE: &str = "🐍 Hydra";
 /// the caller (the hook) never blocks. Whether alerts fire at all is decided by the
 /// caller (config-gated).
 pub fn needs_input(cwd: &str, message: Option<&str>) {
-    spawn_notify(TITLE, &alert_body(cwd, message));
+    notify(TITLE, &alert_body(cwd, message));
+}
+
+/// Deliver one desktop notification, fire-and-forget. Per-OS mechanism (see module
+/// docs): macOS spawns `osascript` directly; elsewhere we spawn the detached
+/// `hydra notify` child so `notify-rust`'s blocking call never slows the hook.
+#[cfg(target_os = "macos")]
+fn notify(title: &str, body: &str) {
+    let _ = Command::new("osascript")
+        .args(osascript_args(title, body))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify(title: &str, body: &str) {
+    spawn_notify(title, body);
+}
+
+/// The `osascript` argv for `display notification`. `title`/`body` ride in as
+/// `on run argv` items rather than being interpolated into the AppleScript source, so
+/// they need no escaping and survive quotes/backslashes/newlines intact (unlike a
+/// quoted string literal). Pure so it can be unit-tested.
+#[cfg(target_os = "macos")]
+fn osascript_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 9] {
+    [
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 1 of argv) with title (item 2 of argv)",
+        "-e",
+        "end run",
+        "--",
+        body,  // item 1 of argv
+        title, // item 2 of argv
+    ]
 }
 
 /// The notification body: the worktree label plus the reason, or a generic fallback.
@@ -45,7 +91,9 @@ fn dir_label(cwd: &str) -> String {
 /// Spawn `hydra notify <title> <body>` detached and return immediately. Args go
 /// through argv (no shell), so `title`/`body` need no escaping regardless of content.
 /// Best-effort: a missing `current_exe` or spawn failure is silently ignored, matching
-/// the fire-and-forget contract.
+/// the fire-and-forget contract. Non-macOS only — macOS spawns `osascript` directly
+/// (see `notify`), so it never routes through the `hydra notify` / `notify-rust` path.
+#[cfg(not(target_os = "macos"))]
 fn spawn_notify(title: &str, body: &str) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -97,5 +145,32 @@ mod tests {
             alert_body("/Users/me/proj/wt-a", None),
             "wt-a needs your input"
         );
+    }
+
+    // The escaping-free contract: title/body ride in as `on run argv` items and are
+    // never interpolated into the AppleScript source, so adversarial text (quotes,
+    // backslashes, newlines) reaches Notification Center intact rather than breaking or
+    // being stripped from the script literal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn osascript_passes_text_as_argv_not_interpolated() {
+        let body = "wt-a: run `ls` with \"quotes\" \\ and\nnewline";
+        let title = "🐍 Hydra";
+        let args = osascript_args(title, body);
+
+        // The AppleScript source references argv positionally and never embeds the text.
+        assert!(args.contains(&"display notification (item 1 of argv) with title (item 2 of argv)"));
+        for a in &args {
+            assert!(
+                !a.contains("quotes") || *a == body,
+                "text leaked into the script source: {a:?}"
+            );
+        }
+
+        // `--` separates osascript's own flags from the argv passed to `on run`, and
+        // body/title follow in that exact order (item 1 = body, item 2 = title).
+        let sep = args.iter().position(|a| *a == "--").expect("-- present");
+        assert_eq!(args[sep + 1], body);
+        assert_eq!(args[sep + 2], title);
     }
 }
