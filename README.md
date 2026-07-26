@@ -33,10 +33,13 @@ leaving the popup.
   status (`s` widens to every session on the server).
 - ⌨️ **Vim-native navigation** — `j`/`k`, `gg`/`G`, `/` to filter, `Enter` to jump to an
   agent's window.
-- ✅ **Act without switching** — approve (`a`), deny (`d`) or pick an option (`1`–`3`)
-  on a pending prompt, or send a message (`i`) to any agent from the popup.
+- ✅ **Act without switching** — approve (`a`), deny (`d`) or pick an option (`1`–`9`)
+  on a pending prompt, send a message (`i`) to any agent, or interrupt a runaway
+  one (`I`) from the popup.
 - 🌱 **Spawn & reap worktrees** — `n` creates a git worktree on a fresh branch and starts
-  an agent in it; `x` tears a worktree down when you're done.
+  an agent in it (optionally with its first task: `name: prompt`); `c` resumes an idle
+  worktree's last conversation; a `merged`/`↑↓` badge shows which worktrees are safe to
+  reap with `x`.
 - 🔔 **Attention alerts** — a desktop notification the moment an agent needs your input,
   so you don't have to babysit the popup.
 - 📊 **Status-line indicator** — a daemon-free `⚠ N NEEDS INPUT` badge in your tmux status
@@ -106,9 +109,11 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `Enter` | jump to the agent's window — or, on an idle worktree, start `claude` there |
 | `a` | approve a pending prompt (accept the highlighted default) |
 | `d` | deny a pending prompt (Escape) |
-| `1`–`3` | pick option N of a multi-option prompt (sends the digit) |
+| `1`–`9` | pick option N of a multi-option prompt (sends the digit) |
 | `i` | send a message to the agent |
-| `n` | spawn a new agent: worktree + tmux window running `claude` |
+| `I` | interrupt a working agent — sends Escape after a `y/N` confirm |
+| `n` | spawn a new agent: worktree + tmux window running `claude` (`name: prompt` gives it its first task) |
+| `c` | resume the selected idle worktree's last conversation (`claude --continue`) |
 | `x` | remove the selected worktree (confirm with `y`) |
 | `p` | toggle the preview pane |
 | `s` | toggle scope: this repo (across all sessions) ⟷ every session on this tmux server |
@@ -116,9 +121,9 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `r` | refresh |
 | `q` / `Esc` | quit (Esc clears an active filter first) |
 
-`a`/`d`/`1`–`3` only act when the selected agent is actually waiting for input — the
-state file is re-checked at the last moment so a keystroke can't land on an agent
-that already moved on. The filter/send/spawn inputs support `Ctrl-U` (clear) and
+`a`/`d`/`1`–`9` only act when the selected agent is actually waiting for input, and
+`I` only when it is actually working — the state file is re-checked at the last
+moment so a keystroke can't land on an agent that already moved on. The filter/send/spawn inputs support `Ctrl-U` (clear) and
 `Ctrl-W` (delete word).
 
 Each row shows the agent's status glyph, how long it's been in that state (`4m`), its
@@ -129,9 +134,12 @@ live snapshot of the selected agent's screen, in color.
 
 The list also includes **existing worktrees that have no agent yet**, shown dimmed
 under their repo — for every repo in view (each agent's repo plus the one the popup
-was opened from). Press `Enter` on one to start `claude` in it — so you can pick up
-a worktree you created earlier without leaving Hydra. `git worktree list` is the
-source, so worktrees are found wherever they live.
+was opened from). Press `Enter` on one to start `claude` in it, or `c` to continue
+its last conversation — so you can pick up a worktree you created earlier without
+leaving Hydra. Each carries an ahead/behind badge vs the repo's default branch:
+`merged` (nothing left to merge — safe to remove) or `↑2 ↓1`. Selecting one shows
+its recent commits and uncommitted files in the preview pane. `git worktree list`
+is the source, so worktrees are found wherever they live.
 
 ### Notifications
 
@@ -151,10 +159,13 @@ surfaced in the prompt and require confirming a forced removal. The **branch is 
 ### Spawning agents
 
 `n` creates a git worktree on a new branch off the repo's default branch, then opens a
-tmux window running `claude` in it. Worktrees go under `~/work/tree/<name>` by default;
-override with `HYDRA_WORKTREE_ROOT`. Spawning anchors on an existing agent to locate
-the repo and session — or, when there is none yet, on the directory the popup was
-opened from (it just has to be inside a git repo).
+tmux window running `claude` in it. Type `name: fix the api tests` to hand the new
+agent its first task on launch — the prompt is passed as `claude "fix the api tests"`.
+If the branch already exists (say, from an earlier spawn whose worktree you removed),
+it is checked out instead of erroring. Worktrees go under `~/work/tree/<name>` by
+default; override with `HYDRA_WORKTREE_ROOT`. Spawning anchors on an existing agent to
+locate the repo and session — or, when there is none yet, on the directory the popup
+was opened from (it just has to be inside a git repo).
 
 ## Configuration
 
@@ -176,11 +187,13 @@ stale_after_secs       = 900   # WORKING agent silent this long → UNKNOWN
 refresh_ms             = 250   # popup refresh tick
 dirty_ttl_secs         = 3     # throttle for git-status dirty counts
 worktree_list_ttl_secs = 5     # throttle for git worktree list
+ahead_behind_ttl_secs  = 30    # throttle for idle-worktree ahead/behind badges
 
 [agent]
-command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
-worktree_root = "~/work/tree"  # where spawned worktrees go
-spawn_mode    = "window"       # "window" or "session" — see below
+command        = "claude"            # launched by `n` (spawn) and Enter (start in worktree)
+resume_command = "claude --continue" # launched by `c` (resume an idle worktree)
+worktree_root  = "~/work/tree"       # where spawned worktrees go
+spawn_mode     = "window"            # "window" or "session" — see below
 
 [popup]                        # re-run `hydra install` after changing
 key    = "a"
@@ -210,6 +223,9 @@ unknown  = "#b35b79"
 
 [alerts]
 enabled = true                 # HYDRA_ALERTS=0 also disables
+
+[status]
+scope = "socket"               # status-line counts: "socket" (all sessions) or "session"
 ```
 
 ### `spawn_mode`: window vs. session
@@ -251,6 +267,7 @@ hydra status <sock> <s>  Print the status-line indicator for a session
 hydra hook <event>       Record a Claude Code lifecycle event (used by hooks)
 hydra install            Install hooks + tmux popup keybinding + status indicator
 hydra uninstall          Remove everything Hydra installed
+hydra doctor             Check install health (hooks, binding, runtime dir)
 hydra version            Print the hydra version
 ```
 

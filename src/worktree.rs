@@ -28,6 +28,10 @@ pub struct IdleWorktree {
     pub branch: Option<String>,
     pub repo_key: String,
     pub repo_name: String,
+    /// (ahead, behind) of this worktree's branch vs the repo's default branch, for
+    /// the cleanup badge (ahead == 0 renders as `merged`). `None` when unknown or
+    /// when the worktree IS the default branch.
+    pub ahead_behind: Option<(usize, usize)>,
 }
 
 /// All worktrees of one repo, as listed by `git worktree list`.
@@ -35,6 +39,8 @@ pub struct IdleWorktree {
 pub struct ProjectWorktrees {
     pub repo_key: String,
     pub repo_name: String,
+    /// The repo's default branch (base for ahead/behind badges and spawns).
+    pub default_branch: String,
     /// (absolute path, branch) per worktree; branch is `None` when detached.
     pub entries: Vec<(String, Option<String>)>,
 }
@@ -99,6 +105,47 @@ impl DirtyCache {
     }
 }
 
+/// Re-check a worktree's ahead/behind counts at most every `AHEAD_BEHIND_TTL_SECS`.
+/// They only change on commits, so this can be much lazier than the dirty count.
+const AHEAD_BEHIND_TTL_SECS: u64 = 30;
+
+/// path → (checked_at, counts) throttled cache of ahead/behind vs the default branch.
+pub struct AheadBehindCache {
+    map: HashMap<String, (u64, Option<(usize, usize)>)>,
+    ttl: u64,
+}
+
+impl Default for AheadBehindCache {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl: AHEAD_BEHIND_TTL_SECS,
+        }
+    }
+}
+
+impl AheadBehindCache {
+    /// Construct with an explicit TTL (from config).
+    pub fn with_ttl(ttl: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Ahead/behind of `cwd` vs `base`, recomputed only when older than the TTL.
+    pub fn get(&mut self, cwd: &str, base: &str, now: u64) -> Option<(usize, usize)> {
+        if let Some((checked_at, counts)) = self.map.get(cwd) {
+            if now.saturating_sub(*checked_at) < self.ttl {
+                return *counts;
+            }
+        }
+        let counts = ahead_behind(cwd, base);
+        self.map.insert(cwd.to_string(), (now, counts));
+        counts
+    }
+}
+
 /// The caches the agent pipeline threads through: stable worktree identity + volatile
 /// dirty counts. Bundled so callers pass one thing.
 #[derive(Default)]
@@ -106,15 +153,17 @@ pub struct Caches {
     pub worktree: WorktreeCache,
     pub dirty: DirtyCache,
     pub wt_list: WorktreeListCache,
+    pub ahead: AheadBehindCache,
 }
 
 impl Caches {
     /// Build caches with config-derived TTLs.
-    pub fn new(dirty_ttl: u64, wt_list_ttl: u64) -> Self {
+    pub fn new(dirty_ttl: u64, wt_list_ttl: u64, ahead_ttl: u64) -> Self {
         Self {
             worktree: WorktreeCache::default(),
             dirty: DirtyCache::with_ttl(dirty_ttl),
             wt_list: WorktreeListCache::with_ttl(wt_list_ttl),
+            ahead: AheadBehindCache::with_ttl(ahead_ttl),
         }
     }
 
@@ -122,8 +171,9 @@ impl Caches {
     /// PRESERVING the configured TTLs (a bare `Default` would reset them to the built-in
     /// constants). Called after a mutation (spawn/remove) so the change shows immediately.
     pub fn invalidate(&mut self) {
-        let (dirty_ttl, wt_list_ttl) = (self.dirty.ttl, self.wt_list.ttl);
-        *self = Caches::new(dirty_ttl, wt_list_ttl);
+        let (dirty_ttl, wt_list_ttl, ahead_ttl) =
+            (self.dirty.ttl, self.wt_list.ttl, self.ahead.ttl);
+        *self = Caches::new(dirty_ttl, wt_list_ttl, ahead_ttl);
     }
 }
 
@@ -153,18 +203,37 @@ pub fn default_branch(cwd: &str) -> String {
     "main".to_string()
 }
 
-/// Create a new worktree at `path` on a new branch `branch` based on `base_branch`,
-/// run from `base_cwd` (any existing worktree of the repo). Errors carry git's stderr.
+/// Create a worktree at `path` on branch `branch`, run from `base_cwd` (any existing
+/// worktree of the repo). A branch that doesn't exist yet is created from
+/// `base_branch`; an existing one is checked out as-is — so re-spawning a name whose
+/// worktree was removed resumes that branch instead of failing on `-b`. (git itself
+/// still errors if the branch is checked out in another worktree.) Errors carry
+/// git's stderr.
 pub fn create_worktree(
     base_cwd: &str,
     path: &str,
     branch: &str,
     base_branch: &str,
 ) -> std::io::Result<()> {
+    let exists = git(
+        base_cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_some();
+    let args: Vec<&str> = if exists {
+        vec!["worktree", "add", path, branch]
+    } else {
+        vec!["worktree", "add", "-b", branch, path, base_branch]
+    };
     let out = Command::new("git")
         .arg("-C")
         .arg(base_cwd)
-        .args(["worktree", "add", "-b", branch, path, base_branch])
+        .args(&args)
         .output()?;
     if out.status.success() {
         Ok(())
@@ -264,8 +333,42 @@ pub fn list_worktrees(cwd: &str) -> Option<ProjectWorktrees> {
     Some(ProjectWorktrees {
         repo_name: repo_name_from_common_dir(&common_dir),
         repo_key: common_dir,
+        default_branch: default_branch(cwd),
         entries,
     })
+}
+
+/// Preview text for an idle worktree: its recent commits, plus uncommitted files
+/// when there are any. Shown in the popup's preview pane (fetched by the worker).
+pub fn preview(path: &str) -> String {
+    let log = git(path, &["log", "--oneline", "-8"]).unwrap_or_default();
+    match git(path, &["status", "--short"]) {
+        Some(status) => format!("{log}\n\n— uncommitted —\n{status}"),
+        None => log,
+    }
+}
+
+/// (ahead, behind) of `cwd`'s HEAD relative to `base` — commits only on HEAD vs only
+/// on `base`. `None` when git fails (e.g. `base` doesn't exist).
+pub fn ahead_behind(cwd: &str, base: &str) -> Option<(usize, usize)> {
+    let out = git(
+        cwd,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{base}"),
+        ],
+    )?;
+    parse_ahead_behind(&out)
+}
+
+/// Parse `git rev-list --left-right --count` output (`"<ahead>\t<behind>"`).
+fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
+    let mut f = out.split_whitespace();
+    let ahead = f.next()?.parse().ok()?;
+    let behind = f.next()?.parse().ok()?;
+    Some((ahead, behind))
 }
 
 /// Parse `git worktree list --porcelain` into (path, branch) pairs. Bare entries are
@@ -380,6 +483,136 @@ fn repo_name_from_common_dir(common_dir: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Build a throwaway git repo with one commit on `main`, returning its path.
+    /// Callers must remove it (and any worktrees) when done.
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hydra-wt-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        dir
+    }
+
+    #[test]
+    fn create_worktree_reuses_an_existing_branch() {
+        let repo = temp_repo("reuse");
+        let repo_s = repo.display().to_string();
+        // The branch already exists (e.g. a previous spawn created it, worktree since
+        // removed): create_worktree must check it out instead of failing on `-b`.
+        let out = Command::new("git")
+            .args(["-C", &repo_s, "branch", "feat"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let wt = repo.join("wt-feat");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "feat", "main").expect("reuses the existing branch");
+        assert_eq!(
+            git(&wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+            Some("feat")
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn create_worktree_still_creates_a_new_branch() {
+        let repo = temp_repo("new");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-fresh");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "fresh", "main").expect("creates a new branch");
+        assert_eq!(
+            git(&wt_s, &["rev-parse", "--abbrev-ref", "HEAD"]).as_deref(),
+            Some("fresh")
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn parses_ahead_behind_counts() {
+        assert_eq!(parse_ahead_behind("2\t5"), Some((2, 5)));
+        assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
+        assert_eq!(parse_ahead_behind("garbage"), None);
+        assert_eq!(parse_ahead_behind(""), None);
+    }
+
+    #[test]
+    fn ahead_behind_counts_commits_against_the_base_branch() {
+        let repo = temp_repo("ab");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-feat");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "feat", "main").unwrap();
+        // Distinct messages: two empty commits with identical message, author AND
+        // timestamp (same second) would hash to the same sha — and the branches
+        // would silently point at one shared commit, making ahead/behind (0, 0).
+        let commit = |cwd: &str, msg: &str| {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    cwd,
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    msg,
+                ])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        };
+        commit(&wt_s, "on-feat"); // one commit only on feat…
+        commit(&repo_s, "on-main"); // …and one only on main
+        assert_eq!(ahead_behind(&wt_s, "main"), Some((1, 1)));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn preview_shows_recent_log_and_uncommitted_files() {
+        let repo = temp_repo("prev");
+        std::fs::write(repo.join("newfile.txt"), "x").unwrap();
+        let text = preview(&repo.display().to_string());
+        assert!(text.contains("init"), "recent commit subject shown");
+        assert!(text.contains("newfile.txt"), "uncommitted file shown");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn list_worktrees_reports_the_default_branch() {
+        let repo = temp_repo("db");
+        let repo_s = repo.display().to_string();
+        let project = list_worktrees(&repo_s).unwrap();
+        assert_eq!(project.default_branch, "main");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn repo_name_from_standard_git_dir() {
         assert_eq!(
@@ -426,16 +659,19 @@ mod tests {
 
     #[test]
     fn invalidate_preserves_configured_ttls_and_clears_data() {
-        let mut caches = Caches::new(11, 22);
+        let mut caches = Caches::new(11, 22, 33);
         caches.dirty.map.insert("x".into(), (0, 5));
         caches.wt_list.map.insert("y".into(), (0, None));
+        caches.ahead.map.insert("z".into(), (0, Some((1, 2))));
         caches.invalidate();
         assert_eq!(caches.dirty.ttl, 11, "dirty TTL must survive invalidate");
         assert_eq!(
             caches.wt_list.ttl, 22,
             "wt_list TTL must survive invalidate"
         );
+        assert_eq!(caches.ahead.ttl, 33, "ahead TTL must survive invalidate");
         assert!(caches.dirty.map.is_empty(), "cached data must be cleared");
         assert!(caches.wt_list.map.is_empty(), "cached data must be cleared");
+        assert!(caches.ahead.map.is_empty(), "cached data must be cleared");
     }
 }

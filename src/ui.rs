@@ -10,6 +10,7 @@
 //! is tracked by pane id so it sticks to the same agent as the list reorders.
 
 use crate::agent::{self, Agent};
+use crate::fetcher::PreviewTarget;
 use crate::state::Status;
 use crate::tmux;
 use crate::worktree::{Caches, IdleWorktree};
@@ -37,6 +38,7 @@ pub fn run() -> std::io::Result<()> {
     let caches = Caches::new(
         config.timings.dirty_ttl_secs,
         config.timings.worktree_list_ttl_secs,
+        config.timings.ahead_behind_ttl_secs,
     );
     let fetcher = crate::fetcher::spawn(
         caches,
@@ -64,8 +66,11 @@ enum Action {
     Quit,
     /// Jump to the selected agent's window, then exit.
     Jump,
-    /// Start `claude` in the selected idle worktree, then exit.
-    Start,
+    /// Start an agent in the selected idle worktree, then exit. `resume` picks the
+    /// configured resume command (continue the last conversation) over a fresh start.
+    Start {
+        resume: bool,
+    },
     /// Ask the fetch worker for an immediate refetch; `invalidate` drops its caches
     /// first (after a mutation, so the change shows on the next snapshot).
     Refresh {
@@ -184,12 +189,14 @@ const INPUT_POLL_MS: u64 = 50;
 const KEYBAR: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("⏎", "start/jump"),
+    ("c", "resume"),
     ("a", "✓"),
     ("d", "✗"),
-    ("1-3", "pick"),
+    ("1-9", "pick"),
     ("i", "send"),
     ("n", "new"),
     ("x", "remove"),
+    ("I", "interrupt"),
     ("⇥", "next⚠"),
     ("/", "filter"),
     ("p", "preview"),
@@ -263,16 +270,19 @@ struct App {
     selected_key: Option<String>,
     /// A worktree removal awaiting y/N confirmation.
     pending_remove: Option<RemoveTarget>,
+    /// An interrupt of a working agent awaiting y/N confirmation:
+    /// (socket, pane_id, window_index).
+    pending_interrupt: Option<(String, String, u32)>,
     /// Transient status line (e.g. "✓ approved win 4"); cleared on the next keypress.
     message: Option<String>,
     /// Whether the first snapshot has arrived (before that, show "loading…").
     loaded: bool,
-    /// Bumped per received snapshot; part of the preview memo key.
-    data_seq: u64,
-    /// (pane id, data_seq) the current `preview_text` was captured for.
-    preview_cache: Option<(String, u64)>,
-    /// Captured screen content of the selected agent (with SGR sequences).
-    preview_text: String,
+    /// The latest snapshot's preview: the worker-fetched text and the target it was
+    /// fetched for. Rendered only while it still matches the current selection.
+    preview: Option<(PreviewTarget, String)>,
+    /// The preview target last requested from the worker, to avoid re-sending an
+    /// identical request every input poll.
+    last_preview_req: Option<PreviewTarget>,
 }
 
 impl App {
@@ -288,14 +298,14 @@ impl App {
                 self.agents = overview.agents;
                 self.idle = overview.idle;
                 self.scope_label = overview.scope_label;
+                self.preview = overview.preview;
                 fresh = true;
             }
             if fresh {
                 self.loaded = true;
-                self.data_seq += 1;
                 self.rebuild_rows();
             }
-            self.refresh_preview();
+            self.sync_preview_request(fetcher);
             terminal.draw(|f| self.draw(f))?;
 
             // Short poll so keys AND snapshots are both picked up promptly (the
@@ -311,14 +321,19 @@ impl App {
                             self.jump()?;
                             break;
                         }
-                        Action::Start => {
+                        Action::Start { resume } => {
                             // Only exit on success; on failure stay open and show why.
-                            if self.start_selected_worktree() {
+                            if self.start_selected_worktree(resume) {
                                 break;
                             }
                         }
                         Action::Refresh { invalidate } => {
-                            fetcher.request_refresh(invalidate, self.all_sessions);
+                            fetcher.request_refresh(
+                                invalidate,
+                                self.all_sessions,
+                                self.desired_preview(),
+                            );
+                            self.last_preview_req = self.desired_preview();
                         }
                         Action::None => {}
                     }
@@ -328,23 +343,39 @@ impl App {
         Ok(())
     }
 
-    /// Memoized capture of the selected agent's screen: one tmux call per selection
-    /// change or data snapshot, none on pure-keystroke redraws.
-    fn refresh_preview(&mut self) {
+    /// The preview the worker should be fetching right now: the selection's target
+    /// while the preview pane is shown, nothing otherwise.
+    fn desired_preview(&self) -> Option<PreviewTarget> {
         if !self.show_preview {
-            return;
+            return None;
         }
-        let Some(a) = self.selected_agent() else {
-            self.preview_cache = None;
-            self.preview_text.clear();
-            return;
-        };
-        let key = (a.pane.pane_id.clone(), self.data_seq);
-        if self.preview_cache.as_ref() == Some(&key) {
-            return;
+        self.preview_target_for_selection()
+    }
+
+    /// Preview target of the selected row: a live pane capture for an agent, a git
+    /// summary for an idle worktree.
+    fn preview_target_for_selection(&self) -> Option<PreviewTarget> {
+        if let Some(a) = self.selected_agent() {
+            return Some(PreviewTarget::Pane {
+                socket: a.state.socket.clone(),
+                pane_id: a.pane.pane_id.clone(),
+            });
         }
-        self.preview_text = tmux::capture_pane(&a.state.socket, &a.pane.pane_id);
-        self.preview_cache = Some(key);
+        self.selected_worktree().map(|w| PreviewTarget::Worktree {
+            path: w.path.clone(),
+        })
+    }
+
+    /// Tell the worker when the preview target changes (selection moved, preview
+    /// toggled, rows rebuilt) so the next snapshot carries the right text. The
+    /// worker keeps refreshing the last target on its own tick — this only needs to
+    /// fire on changes, keeping the input loop free of tmux/git work entirely.
+    fn sync_preview_request(&mut self, fetcher: &crate::fetcher::Fetcher) {
+        let desired = self.desired_preview();
+        if desired != self.last_preview_req {
+            fetcher.request_refresh(false, self.all_sessions, desired.clone());
+            self.last_preview_req = desired;
+        }
     }
 
     /// Rebuild the filtered views and the header/agent/worktree rows, grouped by repo
@@ -537,10 +568,11 @@ impl App {
             }
             KeyCode::Tab => self.select_next_needs_input(),
             KeyCode::Char('x') => self.begin_remove(),
+            KeyCode::Char('I') => self.begin_interrupt(),
             // Interaction (Phase 3): approve/deny a pending prompt, or compose a message.
             KeyCode::Char('a') => self.respond(Response::Approve),
             KeyCode::Char('d') => self.respond(Response::Deny),
-            KeyCode::Char(c @ '1'..='3') => self.respond(Response::Pick(c)),
+            KeyCode::Char(c @ '1'..='9') => self.respond(Response::Pick(c)),
             KeyCode::Char('i') => {
                 if self.selected_agent().is_some() {
                     self.send_input.clear();
@@ -548,7 +580,12 @@ impl App {
                 }
             }
             KeyCode::Enter if self.selected_agent().is_some() => return Action::Jump,
-            KeyCode::Enter if self.selected_worktree().is_some() => return Action::Start,
+            KeyCode::Enter if self.selected_worktree().is_some() => {
+                return Action::Start { resume: false }
+            }
+            KeyCode::Char('c') if self.selected_worktree().is_some() => {
+                return Action::Start { resume: true }
+            }
             _ => {}
         }
         Action::None
@@ -633,12 +670,19 @@ impl App {
     /// Create a worktree + tmux window running `claude` for a new agent. Uses an
     /// existing agent (selected, else first) to infer the repo, socket and session,
     /// falling back to the popup's own cwd when no agent exists yet — so the first
-    /// agent of a session can be spawned from Hydra too.
-    fn spawn_agent(&mut self, name: &str) {
+    /// agent of a session can be spawned from Hydra too. Input is `name[: prompt]`:
+    /// with a prompt, the agent is launched with it as its first task.
+    fn spawn_agent(&mut self, input: &str) {
+        let (name, prompt) = parse_spawn_input(input);
+        if name.is_empty() {
+            self.message = Some("spawn needs a name (name[: prompt])".into());
+            return;
+        }
         let Some((socket, session, cwd)) = self.spawn_context() else {
             self.message = Some("spawn needs an agent, or open the popup from a git repo".into());
             return;
         };
+        let command = agent_command_with_prompt(&self.config.agent.command, prompt);
         let path = worktree_root(&self.config).join(sanitize(name));
         let path_str = path.display().to_string();
         let base = crate::worktree::default_branch(&cwd);
@@ -653,7 +697,7 @@ impl App {
                 &session,
                 &sanitize(name),
                 &path_str,
-                &self.config.agent.command,
+                &command,
             ) {
                 Ok(_window_id) => Some(format!("✓ spawned {name}")),
                 Err(e) => Some(format!("window failed: {e}")),
@@ -675,7 +719,7 @@ impl App {
                         &sess,
                         &path_str,
                         &sanitize(name),
-                        &self.config.agent.command,
+                        &command,
                     ) {
                         Ok(agent_win) => {
                             // Make the Claude window (window 2) the session's current
@@ -813,16 +857,22 @@ impl App {
         self.set_selected_row(Some(next));
     }
 
-    /// Start `claude` in the selected idle worktree: open a new window (named after the
+    /// Start an agent in the selected idle worktree: open a new window (named after the
     /// branch) in the current session, in the worktree's directory. The new agent then
     /// appears via its own SessionStart hook. `new-window` switches to it, so exiting the
-    /// popup lands the user on the new agent.
+    /// popup lands the user on the new agent. `resume` runs the configured resume
+    /// command (`claude --continue`) so the worktree's last conversation picks up
+    /// where it left off, instead of a fresh start.
     ///
     /// Returns `true` on success (caller exits the popup). On any failure it records a
     /// footer message and returns `false` so the popup stays open with the reason
     /// visible, rather than closing silently.
-    fn start_selected_worktree(&mut self) -> bool {
-        let command = self.config.agent.command.clone();
+    fn start_selected_worktree(&mut self, resume: bool) -> bool {
+        let command = if resume {
+            self.config.agent.resume_command.clone()
+        } else {
+            self.config.agent.command.clone()
+        };
         let Some(wt) = self.selected_worktree() else {
             self.message = Some("no worktree selected".into());
             return false;
@@ -956,13 +1006,61 @@ impl App {
 
     fn handle_confirm_key(&mut self, code: KeyCode) -> Action {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.do_remove(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if self.pending_interrupt.is_some() {
+                    self.do_interrupt()
+                } else {
+                    self.do_remove()
+                }
+            }
             _ => {
                 self.pending_remove = None;
+                self.pending_interrupt = None;
                 self.mode = Mode::Normal;
                 Action::None
             }
         }
+    }
+
+    /// Begin interrupting the selected agent: gated on it actually WORKING (an idle
+    /// or waiting agent has nothing to interrupt; a stray Escape into a prompt would
+    /// dismiss it), confirmed before anything is sent.
+    fn begin_interrupt(&mut self) {
+        let Some((_, _, window, status)) = self.selected_target() else {
+            return;
+        };
+        if status != Status::Working {
+            self.message = Some(format!("win {window} isn't working"));
+            return;
+        }
+        let a = self.selected_agent().expect("selected_target came from it");
+        self.pending_interrupt = Some((
+            a.state.socket.clone(),
+            a.pane.pane_id.clone(),
+            a.pane.window_index,
+        ));
+        self.mode = Mode::Confirm;
+    }
+
+    /// Perform the confirmed interrupt: re-read the state file at the last moment
+    /// (same discipline as `respond`) so the Escape can't hit an agent that already
+    /// stopped or is now waiting on a prompt — then send Escape, which stops
+    /// Claude Code's current turn.
+    fn do_interrupt(&mut self) -> Action {
+        self.mode = Mode::Normal;
+        let Some((socket, pane, window)) = self.pending_interrupt.take() else {
+            return Action::None;
+        };
+        let fresh = crate::state::read_one(&socket, &pane).map(|s| s.status);
+        if fresh != Some(Status::Working) {
+            self.message = Some(format!("win {window} is no longer working"));
+            return Action::None;
+        }
+        self.message = Some(match tmux::send_key(&socket, &pane, "Escape") {
+            Ok(()) => format!("✓ interrupted win {window}"),
+            Err(e) => format!("interrupt failed: {e}"),
+        });
+        Action::None
     }
 
     /// Perform the confirmed removal: kill the agent's window (if any), then
@@ -1032,7 +1130,7 @@ impl App {
                 .split(frame.area());
 
         // Split the body into list + preview when the preview is on and there's room.
-        let preview_on = self.show_preview && self.selected_agent().is_some();
+        let preview_on = self.show_preview && self.preview_target_for_selection().is_some();
         let (list_area, preview_area) = if preview_on {
             let cols = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
                 .split(chunks[0]);
@@ -1086,23 +1184,34 @@ impl App {
     }
 
     fn draw_preview(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let Some(a) = self.selected_agent() else {
+        let Some(target) = self.preview_target_for_selection() else {
             return;
         };
-        let title = format!(" preview · win {} ", a.pane.window_index);
+        let title = if let Some(a) = self.selected_agent() {
+            format!(" preview · win {} ", a.pane.window_index)
+        } else if let Some(w) = self.selected_worktree() {
+            let label = w.branch.clone().unwrap_or_else(|| w.path.clone());
+            format!(" preview · {} ", agent::truncate(&label, 30))
+        } else {
+            " preview ".to_string()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
             .title_style(Style::default().add_modifier(Modifier::DIM));
-        // Show the tail of the agent's visible screen (the most recent output/prompt),
-        // with its real colors: capture-pane -e keeps the SGR sequences and
-        // ansi-to-tui turns them into styled ratatui lines. Unparseable output falls
-        // back to plain text rather than an empty preview. The capture itself is
-        // memoized in `refresh_preview`.
-        let text = self
-            .preview_text
+        // The text is fetched by the worker (`Overview::preview`); the UI never
+        // shells out. While the snapshot's target lags the selection (just moved),
+        // show a placeholder — the requested snapshot arrives within a tick.
+        let raw = match &self.preview {
+            Some((t, text)) if *t == target => text.as_str(),
+            _ => "…",
+        };
+        // Show the tail (the most recent output/prompt) with its real colors:
+        // capture-pane -e keeps the SGR sequences and ansi-to-tui turns them into
+        // styled ratatui lines. Unparseable output falls back to plain text.
+        let text = raw
             .into_text()
-            .unwrap_or_else(|_| ratatui::text::Text::raw(self.preview_text.clone()));
+            .unwrap_or_else(|_| ratatui::text::Text::raw(raw));
         let rows = area.height.saturating_sub(2) as usize;
         let skip = text.lines.len().saturating_sub(rows);
         let tail: Vec<Line> = text.lines.into_iter().skip(skip).collect();
@@ -1155,30 +1264,41 @@ impl App {
                 Span::raw(self.spawn_input.clone()),
                 Span::styled("▊", Style::default().fg(Color::Blue)),
                 Span::raw("  ").dim(),
-                Span::raw("⏎ create worktree+claude  Esc cancel").dim(),
+                Span::raw("name[: prompt]  ⏎ create worktree+agent  Esc cancel").dim(),
             ]),
             Mode::Confirm => {
-                let mut spans = vec![Span::styled(
-                    format!(
-                        " remove worktree {}?",
-                        self.pending_remove
-                            .as_ref()
-                            .map(|t| t.branch.as_str())
-                            .unwrap_or("")
-                    ),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )];
-                if let Some(t) = &self.pending_remove {
-                    if t.agent.is_some() {
-                        spans.push(Span::raw(" kills its agent").dim());
+                let mut spans = if let Some((_, _, window)) = &self.pending_interrupt {
+                    vec![
+                        Span::styled(
+                            format!(" interrupt win {window}?"),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" sends Esc, stopping its current turn").dim(),
+                    ]
+                } else {
+                    let mut spans = vec![Span::styled(
+                        format!(
+                            " remove worktree {}?",
+                            self.pending_remove
+                                .as_ref()
+                                .map(|t| t.branch.as_str())
+                                .unwrap_or("")
+                        ),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )];
+                    if let Some(t) = &self.pending_remove {
+                        if t.agent.is_some() {
+                            spans.push(Span::raw(" kills its agent").dim());
+                        }
+                        if t.dirty {
+                            spans.push(Span::styled(
+                                " ⚠ uncommitted changes (force)",
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
                     }
-                    if t.dirty {
-                        spans.push(Span::styled(
-                            " ⚠ uncommitted changes (force)",
-                            Style::default().fg(Color::Yellow),
-                        ));
-                    }
-                }
+                    spans
+                };
                 spans.push(Span::raw("   "));
                 spans.push(Span::raw("y confirm  n cancel").dim());
                 Line::from(spans)
@@ -1259,19 +1379,39 @@ fn header_row(label: &str, count: usize, colors: &TuiColors) -> ListItem<'static
     ListItem::new(line)
 }
 
-/// An idle worktree with no agent: dimmed, with a "start ⏎" affordance.
+/// An idle worktree with no agent: dimmed, with a "start ⏎" affordance and an
+/// ahead/behind badge vs the default branch (`merged` when nothing is unmerged —
+/// the strongest "safe to remove" signal the list can give).
 fn worktree_row(w: &IdleWorktree, colors: &TuiColors) -> ListItem<'static> {
     let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("  ○", Style::default().fg(colors.worktree_row)),
         Span::raw("  —   —      "),
         Span::styled(
             format!("{:<24}", agent::truncate(&branch, 23)),
             Style::default().fg(colors.branch).dim(),
         ),
-        Span::styled("start ⏎", Style::default().fg(colors.worktree_row)),
-    ]);
-    ListItem::new(line)
+    ];
+    match w.ahead_behind {
+        Some((0, _)) => spans.push(Span::styled(
+            "merged  ",
+            Style::default().fg(colors.working).dim(),
+        )),
+        Some((ahead, behind)) => {
+            let badge = if behind > 0 {
+                format!("↑{ahead} ↓{behind}  ")
+            } else {
+                format!("↑{ahead}  ")
+            };
+            spans.push(Span::styled(badge, Style::default().fg(colors.dirty).dim()));
+        }
+        None => {}
+    }
+    spans.push(Span::styled(
+        "start ⏎",
+        Style::default().fg(colors.worktree_row),
+    ));
+    ListItem::new(Line::from(spans))
 }
 
 fn agent_row(
@@ -1392,6 +1532,31 @@ fn sanitize(name: &str) -> String {
     replace_unsafe(name, &[])
 }
 
+/// Split Spawn-mode input into `name` and an optional initial prompt: everything
+/// after the FIRST `:` is the task the new agent starts with (branch names can't
+/// contain `:`, so the split is unambiguous). Both sides are trimmed; an empty
+/// prompt means none.
+fn parse_spawn_input(input: &str) -> (&str, Option<&str>) {
+    match input.split_once(':') {
+        Some((name, prompt)) => {
+            let prompt = prompt.trim();
+            (name.trim(), (!prompt.is_empty()).then_some(prompt))
+        }
+        None => (input.trim(), None),
+    }
+}
+
+/// The command a spawned agent runs: the configured command, plus the initial prompt
+/// as a single-quoted shell argument. tmux hands the command string to a shell, so
+/// the prompt is single-quoted with embedded quotes escaped (`'` → `'\''`) — the one
+/// construct the POSIX shell never interprets further.
+fn agent_command_with_prompt(base: &str, prompt: Option<&str>) -> String {
+    match prompt {
+        Some(p) => format!("{base} '{}'", p.replace('\'', r"'\''")),
+        None => base.to_string(),
+    }
+}
+
 /// Shared core of `sanitize` and `session_name`: replace `/`, whitespace, and any char in
 /// `also` with `-`. `session_name` passes `['.', ':']` (tmux target separators) as `also`;
 /// path-segment `sanitize` passes none.
@@ -1478,6 +1643,7 @@ mod tests {
             branch: Some(branch.into()),
             repo_key: repo_key.into(),
             repo_name: repo_name.into(),
+            ahead_behind: None,
         }
     }
 
@@ -1767,6 +1933,58 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_gates_on_working_and_enters_confirm() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Working,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('I'));
+        assert!(app.mode == Mode::Confirm && app.pending_interrupt.is_some());
+        // Anything but y/Y cancels.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Normal && app.pending_interrupt.is_none());
+    }
+
+    #[test]
+    fn interrupt_refuses_agents_that_are_not_working() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('I'));
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.message.as_deref(), Some("win 4 isn't working"));
+    }
+
+    #[test]
+    fn interrupt_requires_a_fresh_working_state_file() {
+        // The in-memory agent says Working, but no state file backs it up (the agent
+        // already stopped) — confirming must refuse to send the Escape.
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Working,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('I'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.message.as_deref(), Some("win 4 is no longer working"));
+    }
+
+    #[test]
     fn keys_enter_and_leave_the_input_modes() {
         let mut app = app_with(
             vec![agent(
@@ -1823,6 +2041,85 @@ mod tests {
         assert!(text.contains("feat-idle"), "idle worktree rendered");
         assert!(text.contains("start ⏎"), "start affordance rendered");
         assert!(text.contains("⚠ 1"), "title shows the needs-input count");
+    }
+
+    #[test]
+    fn preview_target_follows_the_selection() {
+        use crate::fetcher::PreviewTarget;
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![idle_wt("/a/wt", "feat-x", "/a/.git", "alpha")],
+        );
+        // First selectable row is the agent → a pane capture target.
+        assert_eq!(
+            app.preview_target_for_selection(),
+            Some(PreviewTarget::Pane {
+                socket: "/sock".into(),
+                pane_id: "%1".into(),
+            })
+        );
+        // The idle worktree row → a git-preview target.
+        app.move_by(1);
+        assert_eq!(
+            app.preview_target_for_selection(),
+            Some(PreviewTarget::Worktree {
+                path: "/a/wt".into()
+            })
+        );
+    }
+
+    #[test]
+    fn worktree_preview_renders_from_the_snapshot() {
+        use crate::fetcher::PreviewTarget;
+        let mut app = app_with(vec![], vec![idle_wt("/a/wt", "feat-x", "/a/.git", "alpha")]);
+        app.show_preview = true;
+        app.preview = Some((
+            PreviewTarget::Worktree {
+                path: "/a/wt".into(),
+            },
+            "abc123 fix the api".into(),
+        ));
+        // Drawing does no tmux/git work — the text comes from the snapshot.
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("abc123 fix the api"), "preview text rendered");
+        assert!(text.contains("feat-x"), "worktree preview titled by branch");
+    }
+
+    #[test]
+    fn worktree_rows_show_merged_or_ahead_behind_badges() {
+        let mut merged = idle_wt("/a/wt1", "feat-merged", "/a/.git", "alpha");
+        merged.ahead_behind = Some((0, 3)); // nothing main lacks → safe to remove
+        let mut diverged = idle_wt("/a/wt2", "feat-live", "/a/.git", "alpha");
+        diverged.ahead_behind = Some((2, 1));
+        let mut unknown = idle_wt("/a/wt3", "feat-unknown", "/a/.git", "alpha");
+        unknown.ahead_behind = None; // no badge at all
+        let mut app = app_with(vec![], vec![merged, diverged, unknown]);
+        app.show_preview = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("merged"), "merged badge rendered");
+        assert!(text.contains("↑2 ↓1"), "ahead/behind badge rendered");
     }
 
     #[test]
@@ -1895,6 +2192,26 @@ mod tests {
     }
 
     #[test]
+    fn picks_up_to_9_route_to_respond() {
+        // Claude Code dialogs can offer more than three options; every digit must
+        // reach `respond` (proved here by hitting its state-file gate, not `_ => {}`).
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::NeedsInput,
+                4,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        press(&mut app, KeyCode::Char('9'));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("win 4 is no longer waiting for input")
+        );
+    }
+
+    #[test]
     fn ctrl_w_and_ctrl_u_edit_the_send_buffer() {
         let mut app = app_with(
             vec![agent(
@@ -1929,6 +2246,27 @@ mod tests {
     }
 
     #[test]
+    fn c_resumes_only_a_selected_idle_worktree() {
+        // 'c' on an idle worktree starts it with the resume command.
+        let mut app = app_with(vec![], vec![idle_wt("/a/wt", "feat-x", "/a/.git", "alpha")]);
+        assert_eq!(
+            press(&mut app, KeyCode::Char('c')),
+            Action::Start { resume: true }
+        );
+        // On an agent row there's nothing to resume — 'c' is a no-op.
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/a/.git", "alpha", "f1", "/a1")),
+            )],
+            vec![],
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('c')), Action::None);
+    }
+
+    #[test]
     fn refresh_keys_return_refresh_actions_for_the_worker() {
         let mut app = app_with(
             vec![agent(
@@ -1950,6 +2288,36 @@ mod tests {
             Action::Refresh { invalidate: false }
         );
         assert!(app.all_sessions);
+    }
+
+    #[test]
+    fn parse_spawn_input_splits_name_and_optional_prompt() {
+        assert_eq!(parse_spawn_input("feat-x"), ("feat-x", None));
+        assert_eq!(
+            parse_spawn_input("feat-x: fix the api tests"),
+            ("feat-x", Some("fix the api tests"))
+        );
+        // Only the FIRST colon splits; the prompt may contain more.
+        assert_eq!(
+            parse_spawn_input("feat-x: update README: add usage"),
+            ("feat-x", Some("update README: add usage"))
+        );
+        // Whitespace around both parts is trimmed; an empty prompt is no prompt.
+        assert_eq!(parse_spawn_input("  feat-x :  "), ("feat-x", None));
+    }
+
+    #[test]
+    fn agent_command_with_prompt_quotes_for_the_shell() {
+        assert_eq!(agent_command_with_prompt("claude", None), "claude");
+        assert_eq!(
+            agent_command_with_prompt("claude", Some("fix the api")),
+            "claude 'fix the api'"
+        );
+        // Single quotes inside the prompt must survive shell quoting.
+        assert_eq!(
+            agent_command_with_prompt("claude", Some("don't break")),
+            r#"claude 'don'\''t break'"#
+        );
     }
 
     #[test]

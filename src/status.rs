@@ -19,10 +19,16 @@ pub fn run(socket: &str, session: &str) -> std::io::Result<()> {
         .filter(|s| s.socket == socket)
         .collect();
     let panes = crate::tmux::list_panes(socket);
+    // Socket-wide by default: agents in other sessions (spawn-mode "session" puts
+    // every agent in its own) must still surface in the bar you're looking at.
+    let session_filter = match cfg.status_scope() {
+        crate::config::StatusScope::Socket => None,
+        crate::config::StatusScope::Session => Some(session),
+    };
     let agents = agent::join_and_sort(
         states,
         &panes,
-        Some(session),
+        session_filter,
         now_secs(),
         cfg.timings.stale_after_secs,
     );

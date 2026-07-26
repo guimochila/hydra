@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 /// Lifecycle events we register. Chosen to cover the status machine while recovering
 /// from NEEDS_INPUT once a tool actually runs (PreToolUse → WORKING).
-const HOOK_EVENTS: &[&str] = &[
+pub(crate) const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -23,8 +23,8 @@ const HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
-const TMUX_BEGIN: &str = "# >>> hydra >>>";
-const TMUX_END: &str = "# <<< hydra <<<";
+pub(crate) const TMUX_BEGIN: &str = "# >>> hydra >>>";
+pub(crate) const TMUX_END: &str = "# <<< hydra <<<";
 
 /// A commented starter config written by `install` when none exists. Every value equals
 /// the built-in default, so writing it changes nothing until the user edits it.
@@ -37,11 +37,13 @@ stale_after_secs       = 900   # a WORKING agent silent this long shows as UNKNO
 refresh_ms             = 250   # popup refresh tick
 dirty_ttl_secs         = 3     # throttle for `git status` dirty counts
 worktree_list_ttl_secs = 5     # throttle for `git worktree list`
+ahead_behind_ttl_secs  = 30    # throttle for idle-worktree ahead/behind badges
 
 [agent]
-command       = "claude"       # launched by `n` (spawn) and Enter (start in worktree)
-worktree_root = "~/work/tree"  # where spawned worktrees go (HYDRA_WORKTREE_ROOT wins)
-spawn_mode    = "window"       # "window": one window here; "session": dedicated session (shell + agent)
+command        = "claude"           # launched by `n` (spawn) and Enter (start in worktree)
+resume_command = "claude --continue" # launched by `c` (resume an idle worktree's last conversation)
+worktree_root  = "~/work/tree"      # where spawned worktrees go (HYDRA_WORKTREE_ROOT wins)
+spawn_mode     = "window"           # "window": one window here; "session": dedicated session (shell + agent)
 
 [popup]                        # tmux-side — re-run `hydra install` after changing
 key    = "a"                   # prefix + this key opens the popup
@@ -71,6 +73,9 @@ unknown  = "#b35b79"
 
 [alerts]
 enabled = true                 # macOS needs-input notifications (HYDRA_ALERTS=0 disables)
+
+[status]
+scope = "socket"               # status-line counts: "socket" (all sessions) or "session"
 "##;
 
 /// Write the starter config at `path` only if it does not already exist. Returns whether
@@ -189,7 +194,7 @@ fn uninstall_hooks() -> io::Result<()> {
 }
 
 /// True if a hook matcher-group is one we installed (its command mentions `hydra hook`).
-fn group_is_hydra(group: &Value) -> bool {
+pub(crate) fn group_is_hydra(group: &Value) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
@@ -281,11 +286,11 @@ fn home() -> io::Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| io::Error::other("cannot determine home directory"))
 }
 
-fn settings_path() -> io::Result<PathBuf> {
+pub(crate) fn settings_path() -> io::Result<PathBuf> {
     Ok(home()?.join(".claude").join("settings.json"))
 }
 
-fn tmux_conf_path() -> io::Result<PathBuf> {
+pub(crate) fn tmux_conf_path() -> io::Result<PathBuf> {
     Ok(home()?.join(".tmux.conf"))
 }
 

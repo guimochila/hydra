@@ -195,7 +195,9 @@ pub fn read_one(socket: &str, pane_id: &str) -> Option<AgentState> {
 }
 
 /// Read every parseable state file in the runtime dir. Unreadable/garbage files are
-/// skipped rather than failing the whole read.
+/// skipped rather than failing the whole read. Deduplicated by (socket, pane): two
+/// files can describe the same pane (e.g. leftovers after the file-naming scheme
+/// changed across a rebuild), and a duplicate would render as a ghost second row.
 pub fn read_all() -> Vec<AgentState> {
     let dir = runtime_dir();
     let mut out = Vec::new();
@@ -212,6 +214,26 @@ pub fn read_all() -> Vec<AgentState> {
             if let Ok(state) = serde_json::from_slice::<AgentState>(&bytes) {
                 out.push(state);
             }
+        }
+    }
+    dedupe_states(out)
+}
+
+/// Collapse records describing the same (socket, pane_id) to the newest one
+/// (`updated_at`). Order of first appearance is preserved.
+fn dedupe_states(states: Vec<AgentState>) -> Vec<AgentState> {
+    let mut out: Vec<AgentState> = Vec::with_capacity(states.len());
+    for s in states {
+        match out
+            .iter_mut()
+            .find(|o| o.socket == s.socket && o.pane_id == s.pane_id)
+        {
+            Some(existing) => {
+                if s.updated_at > existing.updated_at {
+                    *existing = s;
+                }
+            }
+            None => out.push(s),
         }
     }
     out
@@ -306,6 +328,36 @@ mod tests {
         assert_eq!(s, back);
         // Status serializes as a screaming-snake string.
         assert!(json.contains("\"NEEDS_INPUT\""));
+    }
+
+    #[test]
+    fn dedupe_states_keeps_only_the_newest_per_socket_and_pane() {
+        let mk = |socket: &str, pane: &str, updated_at: u64| AgentState {
+            socket: socket.into(),
+            session_id: "1".into(),
+            pane_id: pane.into(),
+            cwd: "/repo".into(),
+            status: Status::Idle,
+            event: "Stop".into(),
+            task_summary: None,
+            attention: None,
+            updated_at,
+        };
+        // Two files describing the same (socket, pane) — e.g. leftovers after the
+        // state-file naming scheme changed — must collapse to the newest record.
+        let states = vec![
+            mk("/sock", "%1", 10),
+            mk("/sock", "%1", 20),
+            mk("/other", "%1", 5), // same pane id, different socket: kept
+            mk("/sock", "%2", 1),
+        ];
+        let out = dedupe_states(states);
+        assert_eq!(out.len(), 3);
+        let dup = out
+            .iter()
+            .find(|s| s.socket == "/sock" && s.pane_id == "%1")
+            .unwrap();
+        assert_eq!(dup.updated_at, 20, "newest record wins");
     }
 
     #[test]
