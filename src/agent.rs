@@ -167,6 +167,7 @@ pub fn idle_from(
             branch: branch.clone(),
             repo_key: project.repo_key.clone(),
             repo_name: project.repo_name.clone(),
+            ahead_behind: None, // filled by the caller from its throttled cache
         })
         .collect()
 }
@@ -348,6 +349,7 @@ mod tests {
         let project = ProjectWorktrees {
             repo_key: "/k".into(),
             repo_name: "proj".into(),
+            default_branch: "main".into(),
             entries: vec![
                 ("/repo/main".into(), Some("main".into())),
                 ("/wt/a".into(), Some("a".into())),

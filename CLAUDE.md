@@ -27,16 +27,19 @@ joins against live tmux. See `README.md` "How it works" for the high-level pictu
 Module map (`src/`):
 
 - `main.rs` — CLI dispatch (`hydra`, `ls`, `status`, `hook`, `install`, `uninstall`,
-  `version`) and `current_overview()`, the shared "resolve socket+session → agents +
-  idle worktrees" helper. Resolves every agent's worktree once (serving both occupancy
+  `doctor`, `version`) and `current_overview()`, the shared "resolve socket+session →
+  agents + idle worktrees" helper. Resolves every agent's worktree once (serving both occupancy
   and the display filter), then picks a display `Scope` via `agent::choose_scope`:
   repo-scoped by default (this repo's agents across sessions, keyed on the popup cwd's
   `repo_key`), session-scoped when the popup cwd isn't in a repo, or `all_sessions`
   (whole socket) when the `s` toggle is on. Returns a `scope_label` for the header so
-  the UI does no git/tmux work. Idle worktrees for every repo in view; GC's dead state
-  files as a side effect.
+  the UI does no git/tmux work. Idle worktrees for every repo in view, with throttled
+  ahead/behind counts vs the repo's default branch (the merged/↑↓ badge); GC's dead
+  state files as a side effect.
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
-  (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files.
+  (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files
+  (`read_all` dedupes by (socket, pane) keeping the newest, so leftover files from an
+  old naming scheme can't render ghost rows).
   **The only shared contract between the hook writer and the TUI reader.**
 - `config.rs` — the optional TOML config contract (`~/.config/hydra/config.toml`, or
   `$HYDRA_CONFIG`). `Config` = section structs, each with a `Default` matching a built-in
@@ -54,18 +57,24 @@ Module map (`src/`):
   or git calls here.
 - `fetcher.rs` — the background fetch worker. Owns the `Caches`, re-runs
   `current_overview` on its own `refresh_ms` tick, streams `Overview` snapshots to
-  the TUI over mpsc. Requests coalesce (`wait_for_request`): at most one fetch is
-  ever in flight, so a slow `git status` can't queue work or block input.
+  the TUI over mpsc. Also fetches the preview for the UI's requested `PreviewTarget`
+  (pane capture, or a briefly-memoized git log/status for an idle worktree) — the UI
+  thread never shells out to tmux/git at all. Requests coalesce (`wait_for_request`):
+  at most one fetch is ever in flight, so a slow `git status` can't queue work or
+  block input; the latest scope/preview wins.
 - `tmux.rs` — all `tmux` CLI wrappers, **parameterized by socket path** so nested
   servers work. `list_panes`, `current_socket/session`, `jump_to`, `send_key`,
   `send_text`. Shells out (no libtmux).
 - `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`). Also
   `DirtyCache` (throttled uncommitted-change counts), `WorktreeListCache` +
-  `list_worktrees` (throttled `git worktree list` for idle-worktree discovery), the
+  `list_worktrees` (throttled `git worktree list` for idle-worktree discovery; carries
+  the repo's `default_branch`), `AheadBehindCache` (throttled `git rev-list` counts vs
+  the default branch), `preview` (git log + status for the idle-worktree preview), the
   `Caches` bundle (with `invalidate()` to force a re-read after a mutation), and
-  `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove. Repo identity
-  (`repo_key`) is the canonicalized common git dir (`abs_common_dir`) so main and
-  linked worktrees share one key.
+  `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove.
+  `create_worktree` reuses an existing branch (no `-b`) instead of failing on it. Repo
+  identity (`repo_key`) is the canonicalized common git dir (`abs_common_dir`) so main
+  and linked worktrees share one key.
 - `agent.rs` — the join. `join_and_sort` (pure: state ⋈ live panes, optional session
   filter, staleness, sort). Display scoping is pure and tested: `Scope`
   (Session/Repo/All), `choose_scope` (toggle + popup repo_key → scope) and
@@ -74,20 +83,31 @@ Module map (`src/`):
   `matches_filter`/`worktree_matches_filter`, `format_age`.
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
   unified repo-grouped list of both running agents (age/dirty/attention) and idle
-  worktrees (`Enter` starts `claude`), `a`/`d`/`1`-`3` prompt replies (NEEDS_INPUT
-  gated + state-file re-checked at send time), `x` to remove a worktree (confirm,
+  worktrees (`Enter` starts `claude`, `c` resumes via `resume_command`, merged/↑↓
+  badge), `a`/`d`/`1`-`9` prompt replies (NEEDS_INPUT gated + state-file re-checked at
+  send time), `I` interrupt of a WORKING agent (confirm + same state-file re-check,
+  sends Escape), `n` spawn takes `name[: prompt]` — the prompt is shell-quoted into
+  the agent command as its first task, `x` to remove a worktree (confirm,
   kills every window rooted in the worktree via `agent::windows_under_path` — mode-
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
-  branch), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored `capture-pane -e`
-  preview (memoized per selection+snapshot). The header scope label comes from the
-  snapshot's `scope_label` (no git/tmux on the UI thread). `spawn_mode` (`n`/`Enter`)
+  branch), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
+  (agent screen or idle-worktree git summary). The header scope label AND the preview
+  text come from the snapshot (`scope_label` / `preview`) — the UI thread does no
+  git/tmux work at all; it only tells the worker which `PreviewTarget` is selected.
+  `spawn_mode` (`n`/`Enter`)
   branches between `new_window` and `new_session`+`switch_client`; session mode starts the
   popup in all-sessions view. Data
-  arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms and
-  never does git/tmux fetch work itself. Selection is tracked by a stable key (agent
+  arrives as snapshots from `fetcher.rs`; the UI thread polls input at 50 ms.
+  Selection is tracked by a stable key (agent
   pane id or worktree path). UI behavior is tested via `TestBackend`.
 - `status.rs` — `hydra status <socket> <session>`, the daemon-free status-line
-  indicator (tmux polls it from `status-right`).
+  indicator (tmux polls it from `status-right`). Counts the whole socket by default
+  (`[status] scope`, so session-mode agents in their own sessions still show);
+  `"session"` restores per-session counts.
+- `doctor.rs` — `hydra doctor`: ✓/✗/! install health report (hooks present + their
+  binary exists/executable/matches the running one, tmux block, runtime dir writable,
+  `$TMUX`, config parse). Non-zero exit when a hard check fails. Exists because a
+  moved binary breaks hooks silently.
 - `alert.rs` — best-effort desktop notification on the transition into NEEDS_INPUT
   (fired from `hook.rs`); fire-and-forget, `HYDRA_ALERTS=0` disables. Delivery is
   per-OS. **macOS:** shell out to `osascript` (`display notification`); title/body ride

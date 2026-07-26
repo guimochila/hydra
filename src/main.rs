@@ -6,6 +6,7 @@
 //!   hydra hook <event> Record a lifecycle event (installed into Claude Code hooks).
 //!   hydra install      Install hooks + a tmux popup keybinding.
 //!   hydra uninstall    Remove them.
+//!   hydra doctor       Check install health (hooks, binding, runtime dir).
 //!
 //! Internal (not shown in help): `hydra notify <title> <body>` shows one desktop
 //! notification and exits. The hook spawns it detached so the blocking `notify-rust`
@@ -14,6 +15,7 @@
 mod agent;
 mod alert;
 mod config;
+mod doctor;
 mod fetcher;
 mod hook;
 mod install;
@@ -50,6 +52,7 @@ fn main() -> ExitCode {
         }
         Some("install") => install::install(),
         Some("uninstall") => install::uninstall(),
+        Some("doctor") => doctor::run(),
         Some("help") | Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -83,6 +86,10 @@ pub struct Overview {
     /// name), computed here so the UI thread renders the header without any git/tmux
     /// work of its own.
     pub scope_label: String,
+    /// Preview text for the UI's requested target (agent screen capture or idle
+    /// worktree git summary). Filled by the fetch worker, not `current_overview` —
+    /// like `scope_label`, it exists so the UI thread never shells out itself.
+    pub preview: Option<(fetcher::PreviewTarget, String)>,
 }
 
 /// Resolve the current socket/session, collect agents (session-scoped, or every
@@ -168,13 +175,25 @@ pub fn current_overview(
         if !seen_repos.insert(project.repo_key.clone()) {
             continue;
         }
-        idle.extend(agent::idle_from(&occupied, &project));
+        let mut wts = agent::idle_from(&occupied, &project);
+        // Ahead/behind vs the default branch (throttled), for the merged/↑↓ badge.
+        // The default branch itself gets no badge — it's its own base.
+        for w in &mut wts {
+            if w.branch
+                .as_deref()
+                .is_some_and(|b| b != project.default_branch)
+            {
+                w.ahead_behind = caches.ahead.get(&w.path, &project.default_branch, now);
+            }
+        }
+        idle.extend(wts);
     }
 
     Overview {
         agents,
         idle,
         scope_label,
+        preview: None, // the fetch worker fills this for its requested target
     }
 }
 
@@ -183,6 +202,7 @@ fn list_command() -> std::io::Result<()> {
     let mut caches = worktree::Caches::new(
         cfg.timings.dirty_ttl_secs,
         cfg.timings.worktree_list_ttl_secs,
+        cfg.timings.ahead_behind_ttl_secs,
     );
     let overview = current_overview(&mut caches, cfg.timings.stale_after_secs, false);
     if overview.agents.is_empty() && overview.idle.is_empty() {
@@ -229,6 +249,8 @@ fn print_help() {
          \x20 hydra hook <event>       Record a Claude Code lifecycle event\n\
          \x20 hydra install            Install hooks + tmux popup keybinding\n\
          \x20 hydra uninstall          Remove hooks + keybinding\n\
-         \x20 hydra version            Print the hydra version"
+         \x20 hydra doctor             Check install health (hooks, binding, runtime dir)\n\
+         \x20 hydra version            Print the hydra version\n\n\
+         help/version also answer to -h/--help and -V/--version"
     );
 }

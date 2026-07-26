@@ -18,6 +18,7 @@ pub struct Config {
     pub popup: Popup,
     pub theme: Theme,
     pub alerts: Alerts,
+    pub status: StatusSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -27,6 +28,8 @@ pub struct Timings {
     pub refresh_ms: u64,
     pub dirty_ttl_secs: u64,
     pub worktree_list_ttl_secs: u64,
+    /// Throttle for the idle-worktree ahead/behind counts (`git rev-list`).
+    pub ahead_behind_ttl_secs: u64,
 }
 
 impl Default for Timings {
@@ -36,6 +39,7 @@ impl Default for Timings {
             refresh_ms: 250,
             dirty_ttl_secs: 3,
             worktree_list_ttl_secs: 5,
+            ahead_behind_ttl_secs: 30,
         }
     }
 }
@@ -44,6 +48,9 @@ impl Default for Timings {
 #[serde(default)]
 pub struct Agent {
     pub command: String,
+    /// Command `c` runs in an idle worktree to pick up its previous conversation
+    /// (`claude --continue`), instead of the fresh-start `command`.
+    pub resume_command: String,
     pub worktree_root: String,
     /// How a newly-started agent is laid out: `"window"` (default) or `"session"`.
     /// Interpreted via `Config::spawn_mode()`; unknown values behave as `"window"`.
@@ -54,6 +61,7 @@ impl Default for Agent {
     fn default() -> Self {
         Self {
             command: "claude".to_string(),
+            resume_command: "claude --continue".to_string(),
             worktree_root: "~/work/tree".to_string(),
             spawn_mode: "window".to_string(),
         }
@@ -155,6 +163,23 @@ pub struct Alerts {
     pub enabled: bool,
 }
 
+/// The `[status]` section: what the status-line indicator counts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct StatusSection {
+    /// `"socket"` (default: every session on the server) or `"session"` (only the
+    /// session the status bar belongs to). Interpreted via `Config::status_scope()`.
+    pub scope: String,
+}
+
+impl Default for StatusSection {
+    fn default() -> Self {
+        Self {
+            scope: "socket".to_string(),
+        }
+    }
+}
+
 impl Default for Alerts {
     fn default() -> Self {
         Self { enabled: true }
@@ -167,6 +192,16 @@ impl Default for Alerts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnMode {
     Window,
+    Session,
+}
+
+/// What the status-line indicator counts. `Socket` (default) spans every session on
+/// the tmux server — required for spawn-mode `"session"` agents (each lives in its own
+/// session) and for the popup's repo-scoped view to agree with the bar. `Session`
+/// restores the old per-session counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusScope {
+    Socket,
     Session,
 }
 
@@ -216,6 +251,15 @@ impl Config {
         match self.agent.spawn_mode.trim().to_ascii_lowercase().as_str() {
             "session" => SpawnMode::Session,
             _ => SpawnMode::Window,
+        }
+    }
+
+    /// Interpret the configured status scope. Unrecognized values degrade to the
+    /// default (`Socket`), matching `spawn_mode`'s typo policy.
+    pub fn status_scope(&self) -> StatusScope {
+        match self.status.scope.trim().to_ascii_lowercase().as_str() {
+            "session" => StatusScope::Session,
+            _ => StatusScope::Socket,
         }
     }
 }
@@ -409,6 +453,38 @@ mod tests {
         let unchanged = base.with_env_overrides(Some(""), None);
         assert_eq!(unchanged.agent.worktree_root, "/from/file");
         assert!(unchanged.alerts.enabled);
+    }
+
+    #[test]
+    fn ahead_behind_ttl_defaults_to_30() {
+        assert_eq!(Config::default().timings.ahead_behind_ttl_secs, 30);
+        let cfg = Config::parse("[timings]\nahead_behind_ttl_secs = 7\n");
+        assert_eq!(cfg.timings.ahead_behind_ttl_secs, 7);
+    }
+
+    #[test]
+    fn resume_command_defaults_to_claude_continue() {
+        assert_eq!(Config::default().agent.resume_command, "claude --continue");
+        let cfg = Config::parse("[agent]\nresume_command = \"codex resume\"\n");
+        assert_eq!(cfg.agent.resume_command, "codex resume");
+        assert_eq!(cfg.agent.command, "claude"); // untouched default
+    }
+
+    #[test]
+    fn status_scope_defaults_to_socket_and_parses_session() {
+        // Socket-wide by default: in session spawn mode agents live in their own
+        // sessions, and a session-scoped indicator would never show them.
+        assert_eq!(Config::default().status_scope(), StatusScope::Socket);
+        assert_eq!(Config::parse("").status_scope(), StatusScope::Socket);
+        assert_eq!(
+            Config::parse("[status]\nscope = \"session\"\n").status_scope(),
+            StatusScope::Session
+        );
+        // Unknown value degrades to the default rather than breaking.
+        assert_eq!(
+            Config::parse("[status]\nscope = \"bogus\"\n").status_scope(),
+            StatusScope::Socket
+        );
     }
 
     #[test]
