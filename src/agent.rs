@@ -292,6 +292,33 @@ pub fn windows_under_path(panes: &[Pane], path: &str) -> Vec<(String, u32)> {
     out
 }
 
+/// The full set of windows a worktree removal must tear down, in the order to kill them.
+///
+/// `windows_under_path` plus `own` (a live agent's own window, which must die even if its
+/// pane cwd has diverged from the worktree — we never `git worktree remove` from under a
+/// running agent). Note `own` is the *only* reason to pass anything here: a row without a
+/// live agent still occupies windows (an idle worktree in session mode keeps its shell and
+/// agent windows), and skipping the teardown for those is what orphans a session on a
+/// directory git is about to delete.
+///
+/// Sorted by descending window index: with `renumber-windows on`, killing a low index
+/// renumbers the higher windows down and invalidates the indices we still hold, so we
+/// always take the top window off first.
+pub fn windows_to_kill(
+    panes: &[Pane],
+    path: &str,
+    own: Option<(String, u32)>,
+) -> Vec<(String, u32)> {
+    let mut out = windows_under_path(panes, path);
+    if let Some(own) = own {
+        if !out.contains(&own) {
+            out.push(own);
+        }
+    }
+    out.sort_by_key(|w| std::cmp::Reverse(w.1));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,5 +614,57 @@ mod tests {
     fn windows_under_path_empty_when_nothing_matches() {
         let panes: Vec<Pane> = Vec::new();
         assert!(windows_under_path(&panes, "/root/wt-a").is_empty());
+    }
+
+    fn kill_pane(id: &str, session: &str, win: u32, cwd: &str) -> Pane {
+        Pane {
+            pane_id: id.into(),
+            session_name: session.into(),
+            window_index: win,
+            window_name: "w".into(),
+            cwd: cwd.into(),
+            window_active: false,
+            pane_tty: "/dev/ttys000".into(),
+        }
+    }
+
+    #[test]
+    fn windows_to_kill_tears_down_a_worktree_with_no_live_agent() {
+        // The orphan-session bug: an idle worktree row (no agent state file) still owns a
+        // session-mode session's shell + agent windows. They must all be killed.
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"),
+            kill_pane("%3", "other", 1, "/elsewhere"),
+        ];
+        assert_eq!(
+            windows_to_kill(&panes, "/root/wt-a", None),
+            vec![("repo-feat".to_string(), 2), ("repo-feat".to_string(), 1)],
+            "highest window index first"
+        );
+    }
+
+    #[test]
+    fn windows_to_kill_adds_the_agents_own_window_when_its_cwd_diverged() {
+        let panes = vec![kill_pane("%1", "repo-feat", 1, "/root/wt-a")];
+        // Agent's pane reports a different cwd (symlink divergence), so it isn't matched
+        // by path — it still has to die before git removes the worktree.
+        let got = windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 7)));
+        assert_eq!(
+            got,
+            vec![("repo-feat".to_string(), 7), ("repo-feat".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn windows_to_kill_does_not_duplicate_the_agents_own_window() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 2, "/root/wt-a"),
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a/src"),
+        ];
+        assert_eq!(
+            windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 2))),
+            vec![("repo-feat".to_string(), 2)]
+        );
     }
 }

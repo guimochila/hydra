@@ -121,8 +121,12 @@ struct RemoveTarget {
     branch: String,
     /// A worktree of the same repo to run git from (never `path` itself).
     base_cwd: String,
-    /// If this worktree has a running agent, its (socket, session, window) to kill first.
-    agent: Option<(String, String, u32)>,
+    /// The socket to tear windows down on: the agent's own when there is one, else the
+    /// popup's. `None` only outside tmux, where there is nothing to tear down.
+    socket: Option<String>,
+    /// If this worktree has a running agent, its (session, window) — killed even when its
+    /// pane cwd no longer matches the worktree.
+    agent: Option<(String, u32)>,
     /// Whether the worktree has uncommitted changes (removal needs `--force`).
     dirty: bool,
 }
@@ -952,7 +956,8 @@ impl App {
     /// Build a `RemoveTarget` from the current selection, or an error explaining why the
     /// selection can't be removed (main worktree, Hydra's own cwd, or not a worktree).
     fn remove_target(&self) -> Result<RemoveTarget, String> {
-        let (path, branch, repo_key, agent, dirty) = if let Some(a) = self.selected_agent() {
+        let (path, branch, repo_key, socket, agent, dirty) = if let Some(a) = self.selected_agent()
+        {
             let wt = a
                 .worktree
                 .as_ref()
@@ -963,11 +968,8 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| a.pane.window_name.clone()),
                 wt.repo_key.clone(),
-                Some((
-                    a.state.socket.clone(),
-                    a.pane.session_name.clone(),
-                    a.pane.window_index,
-                )),
+                Some(a.state.socket.clone()),
+                Some((a.pane.session_name.clone(), a.pane.window_index)),
                 a.dirty > 0,
             )
         } else if let Some(w) = self.selected_worktree() {
@@ -975,6 +977,9 @@ impl App {
                 w.path.clone(),
                 w.branch.clone().unwrap_or_else(|| "(detached)".into()),
                 w.repo_key.clone(),
+                // No agent to self-report a socket, so use the popup's: an idle worktree's
+                // leftover windows (session mode's shell + agent) live on this server.
+                tmux::current_socket(),
                 None,
                 crate::worktree::is_dirty(&w.path),
             )
@@ -999,6 +1004,7 @@ impl App {
             path,
             branch,
             base_cwd,
+            socket,
             agent,
             dirty,
         })
@@ -1063,8 +1069,9 @@ impl App {
         Action::None
     }
 
-    /// Perform the confirmed removal: kill the agent's window (if any), then
-    /// `git worktree remove` (forcing when dirty). Branch is kept. On success the
+    /// Perform the confirmed removal: kill every tmux window rooted in the worktree
+    /// (agent or not), then `git worktree remove` (forcing when dirty). Branch is kept.
+    /// On success the
     /// returned Refresh invalidates the worker's caches so the row disappears on
     /// the next snapshot (the UI stays responsive while git re-scans).
     fn do_remove(&mut self) -> Action {
@@ -1072,25 +1079,17 @@ impl App {
         let Some(target) = self.pending_remove.take() else {
             return Action::None;
         };
-        // Kill every window rooted in the worktree, not just the agent's own window.
-        // Session mode: shell + agent windows -> tmux destroys the now-empty session.
-        // Window mode: only the agent window is rooted here, so this matches today.
-        if let Some((socket, session, window)) = &target.agent {
+        // Kill every window rooted in the worktree, not just the agent's own — and do it
+        // whether or not the row has a live agent. An idle worktree still owns its windows
+        // (session mode: shell + agent), and leaving them behind orphans a whole session on
+        // a directory git is about to delete.
+        // Session mode: killing shell + agent empties and so destroys the dedicated
+        // session. Window mode: only the agent window is rooted here, as before.
+        if let Some(socket) = &target.socket {
             let panes = crate::tmux::list_panes(socket);
-            let mut windows = crate::agent::windows_under_path(&panes, &target.path);
-            // Always include the agent's own window: if its pane cwd no longer matches
-            // the worktree path (e.g. symlink divergence), we must still not git-remove
-            // the worktree out from under a live agent.
-            let own = (session.clone(), *window);
-            if !windows.contains(&own) {
-                windows.push(own);
-            }
-            // Kill the highest window index first. With `renumber-windows on`, killing a
-            // lower index renumbers the higher windows down and would invalidate the
-            // indices we still hold; descending order removes the top window each time,
-            // which never shifts the ones still to kill.
-            windows.sort_by_key(|w| std::cmp::Reverse(w.1));
-            for (session, window) in windows {
+            for (session, window) in
+                crate::agent::windows_to_kill(&panes, &target.path, target.agent.clone())
+            {
                 if let Err(e) = crate::tmux::kill_window(socket, &session, window) {
                     self.message = Some(format!("kill window failed: {e}"));
                     return Action::None;
@@ -1287,9 +1286,16 @@ impl App {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     )];
                     if let Some(t) = &self.pending_remove {
-                        if t.agent.is_some() {
-                            spans.push(Span::raw(" kills its agent").dim());
-                        }
+                        // Removal is mode-agnostic: it kills every window rooted in the
+                        // worktree, which in session mode takes the whole session with it.
+                        spans.push(
+                            Span::raw(if t.agent.is_some() {
+                                " kills its agent and every window in it"
+                            } else {
+                                " kills every tmux window in it"
+                            })
+                            .dim(),
+                        );
                         if t.dirty {
                             spans.push(Span::styled(
                                 " ⚠ uncommitted changes (force)",
@@ -1930,6 +1936,50 @@ mod tests {
         // Anything but y/Y cancels.
         press(&mut app, KeyCode::Char('n'));
         assert!(app.mode == Mode::Normal && app.pending_remove.is_none());
+    }
+
+    #[test]
+    fn remove_target_for_an_idle_worktree_still_has_a_socket_to_tear_windows_down_on() {
+        // Regression (orphan session): an idle-worktree row has no agent, and the removal
+        // used to take its socket *from* that agent — so with none, no window was ever
+        // killed and session mode was left with a session rooted in a deleted directory.
+        let app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        let target = app.remove_target().expect("an idle worktree is removable");
+        assert_eq!(target.path, "/wt/feat");
+        assert_eq!(target.base_cwd, "/repo/main");
+        assert!(target.agent.is_none(), "no live agent on an idle worktree");
+        assert_eq!(
+            target.socket,
+            crate::tmux::current_socket(),
+            "falls back to the popup's own socket, where the leftover windows live"
+        );
+    }
+
+    #[test]
+    fn remove_confirm_warns_that_windows_die_even_without_an_agent() {
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.mode == Mode::Confirm && app.pending_remove.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("remove worktree feat?"), "prompt rendered");
+        assert!(
+            text.contains("kills every tmux window in it"),
+            "the teardown is disclosed for an agent-less worktree too: {text}"
+        );
     }
 
     #[test]
