@@ -132,6 +132,23 @@ pub fn state_file_name(socket: &str, pane_id: &str) -> String {
     format!("pane-{socket_hash:x}-{pane}.json")
 }
 
+/// Staging file name for one `write_state` call. Unique per writer — pid plus a
+/// per-process counter — because Claude Code fires hooks for parallel tool calls
+/// concurrently, so several `hydra hook` processes stage the *same* pane's file at
+/// the same instant. A shared temp path makes them race: the first `rename` moves
+/// it away and every other writer fails with ENOENT. Keeps the `.tmp` extension so
+/// `read_all` (which only reads `*.json`) never picks up a half-written file.
+fn temp_file_name(socket: &str, pane_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        ".{}.{}.{seq}.tmp",
+        state_file_name(socket, pane_id),
+        std::process::id()
+    )
+}
+
 /// Create the runtime dir if needed, owner-only (0700). The `/tmp/hydra-<user>`
 /// fallback would otherwise be world-readable, and state files carry prompt text.
 /// A pre-existing dir (e.g. created by an older hydra with default perms) is
@@ -164,17 +181,20 @@ pub fn write_state(state: &AgentState) -> std::io::Result<()> {
     let dir = runtime_dir();
     create_runtime_dir(&dir)?;
     let final_path = dir.join(state_file_name(&state.socket, &state.pane_id));
-    let tmp_path = dir.join(format!(
-        ".{}.tmp",
-        state_file_name(&state.socket, &state.pane_id)
-    ));
+    let tmp_path = dir.join(temp_file_name(&state.socket, &state.pane_id));
     let json = serde_json::to_vec_pretty(state)?;
-    {
+    // On any failure the staging file must not survive — it is unique per writer, so
+    // nothing else would ever clean it up.
+    let staged = (|| {
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(&json)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    let result = staged.and_then(|()| std::fs::rename(&tmp_path, &final_path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
     }
-    std::fs::rename(&tmp_path, &final_path)
+    result
 }
 
 /// Remove a state file (used on `SessionEnd`). Missing file is not an error.
@@ -242,6 +262,70 @@ fn dedupe_states(states: Vec<AgentState>) -> Vec<AgentState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_writes_for_one_pane_all_succeed() {
+        // Claude Code fires hooks for parallel tool calls at the same instant, so
+        // several `hydra hook` processes write the *same* pane's state file at once.
+        // Each writer must stage into its own temp file — a shared temp path means
+        // one writer renames it away and the others fail with ENOENT.
+        let socket = "/tmp/hydra-test-concurrent-writes";
+        let pane = "%424242";
+        let path = runtime_dir().join(state_file_name(socket, pane));
+        let _ = std::fs::remove_file(&path);
+
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    s.spawn(move || {
+                        write_state(&AgentState {
+                            socket: socket.to_string(),
+                            session_id: "1".into(),
+                            pane_id: pane.to_string(),
+                            cwd: "/tmp".into(),
+                            status: Status::Working,
+                            event: "PreToolUse".into(),
+                            task_summary: None,
+                            attention: None,
+                            updated_at: i,
+                        })
+                        .err()
+                        .map(|e| e.to_string())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let leftover_tmps = std::fs::read_dir(runtime_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        let n = e.file_name();
+                        let n = n.to_string_lossy();
+                        n.starts_with(&format!(".{}", state_file_name(socket, pane)))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(errors.is_empty(), "concurrent writes failed: {errors:?}");
+        assert_eq!(leftover_tmps, 0, "temp files left behind");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_per_writer() {
+        let a = temp_file_name("sock", "%1");
+        let b = temp_file_name("sock", "%1");
+        assert_ne!(a, b, "two writers must not share a temp path");
+        // Still not picked up by `read_all`, which only reads `*.json`.
+        assert!(std::path::Path::new(&a).extension().unwrap() == "tmp");
+    }
 
     #[test]
     fn event_mapping_covers_lifecycle() {

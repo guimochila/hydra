@@ -10,7 +10,14 @@ cargo build              # or: cargo build --release
 cargo test               # all logic is unit-tested; keep it green
 cargo clippy --all-targets
 cargo fmt                # run before committing; CI-clean = fmt --check passes
+
+./scripts/install.sh     # build → ~/.local/bin/hydra → `hydra install` → `hydra doctor`
+./scripts/install.sh --uninstall
 ```
+
+Install via `scripts/install.sh`, never `cargo run -- install`: `install.rs` resolves
+the hook/tmux command from `current_exe()`, so registering from `target/` points every
+hook into the build dir and a `cargo clean` breaks them silently.
 
 The data/logic layers are pure and unit-tested; the UI is thin rendering over them.
 The TUI itself is tested with `ratatui::backend::TestBackend` (see `ui.rs` tests):
@@ -133,6 +140,13 @@ Module map (`src/`):
   Claude session). `approve`/`deny` are additionally gated on `Status::NeedsInput`.
 - **Keep `hook.rs` cheap.** It runs on every Claude Code event. No tmux/git subprocess
   calls, no blocking work.
+- **State writes race.** Claude Code fires hooks for *parallel tool calls*
+  concurrently, so several `hydra hook` processes write the **same** pane's state file
+  at the same instant. `write_state` must stage into a per-writer temp name
+  (`state::temp_file_name` — pid + counter): with a shared temp path the first
+  `rename(2)` moves it away and every other writer dies with ENOENT, which surfaces to
+  the user as `PreToolUse hook error: hydra: No such file or directory (os error 2)`.
+  Covered by `state::tests::concurrent_writes_for_one_pane_all_succeed`.
 - **Keep logic pure and out of `ui.rs`.** New behavior goes in `agent.rs`/`state.rs`
   with a unit test; `ui.rs` should stay thin rendering + input.
 - **`install`/`uninstall` stay non-destructive.** Hooks merge alongside existing ones

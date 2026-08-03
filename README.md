@@ -58,15 +58,35 @@ leaving the popup.
 ```sh
 git clone https://github.com/guimochila/hydra.git
 cd hydra
+./scripts/install.sh          # build → ~/.local/bin/hydra → register hooks → doctor
+tmux source-file ~/.tmux.conf
+```
+
+`scripts/install.sh` does the whole dance and then runs `hydra doctor` to prove it
+worked:
+
+```sh
+./scripts/install.sh --prefix /usr/local   # install somewhere else
+./scripts/install.sh --no-build            # register an already-built binary
+./scripts/install.sh --uninstall           # remove hooks, tmux block, and binary
+./scripts/install.sh --uninstall --purge   # also delete config + runtime state
+```
+
+> `install` bakes the binary's **absolute path** into the hooks and tmux binding, so
+> run it from a stable location (not a `target/` build dir that moves on rebuild).
+> If you move the binary later, just re-run `hydra install` from the new path.
+
+<details>
+<summary>Manual equivalent</summary>
+
+```sh
 cargo build --release
 cp target/release/hydra ~/.local/bin/   # or anywhere stable on your PATH
 ~/.local/bin/hydra install              # adds Claude Code hooks + a tmux popup binding
 tmux source-file ~/.tmux.conf
 ```
 
-> `install` bakes the binary's **absolute path** into the hooks and tmux binding, so
-> run it from a stable location (not a `target/` build dir that moves on rebuild).
-> If you move the binary later, just re-run `hydra install` from the new path.
+</details>
 
 ### Prebuilt binaries
 
@@ -81,7 +101,8 @@ Grab a binary for your platform from the [latest release](https://github.com/gui
   marker-delimited block, using `set -ga status-right` so your existing status line is
   preserved.
 
-Undo everything with `hydra uninstall`.
+Undo everything with `hydra uninstall` (or `./scripts/install.sh --uninstall`, which
+also removes the installed binary).
 
 ## Quick start
 
