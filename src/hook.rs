@@ -36,7 +36,8 @@ pub fn run(event: &str) -> std::io::Result<()> {
         None => return Ok(()),
     };
 
-    match state::outcome_for_event(&event) {
+    let message = payload.get("message").and_then(|v| v.as_str());
+    match state::outcome_for_event(&event, message) {
         EventOutcome::Ignore => Ok(()),
         EventOutcome::Remove => state::remove_state(&env.socket, &env.pane_id),
         EventOutcome::Set(status) => {
@@ -66,7 +67,7 @@ pub fn run(event: &str) -> std::io::Result<()> {
             // moment it goes back to Working/Idle.
             let attention = attention_for(
                 status,
-                payload.get("message").and_then(|v| v.as_str()),
+                message,
                 prev.as_ref().and_then(|p| p.attention.clone()),
             );
 

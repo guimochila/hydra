@@ -162,6 +162,9 @@ Module map (`src/`):
 
 `UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`SessionStart` → `WORKING`;
 `Notification` → `NEEDS_INPUT`; `Stop` → `IDLE`; `SessionEnd` → removed.
+Exception: the idle-timeout Notification (message exactly "Claude is waiting for
+your input", fired ~60s *after* `Stop`) maps to `IDLE` — it's not a real input
+request, and NEEDS_INPUT would stick forever and un-gate the `a`/`d`/`1-9` keys.
 `SubagentStop` also maps to `WORKING` (the *parent* agent is still processing — never
 `IDLE`, which would flicker). Staleness downgrades only `WORKING` (not
 idle/needs-input, which can legitimately sit) to `UNKNOWN`. Leftover files from

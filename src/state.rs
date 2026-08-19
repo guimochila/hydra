@@ -47,13 +47,24 @@ pub enum EventOutcome {
     Ignore,
 }
 
+/// Claude Code's idle-timeout Notification message, fired ~60s after Stop while the
+/// agent sits at an empty prompt. Not a real input request — mapping it to
+/// NEEDS_INPUT would stick forever (nothing follows it) and un-gate the reply keys.
+/// Exact match on purpose: a reworded message degrades to a false NEEDS_INPUT,
+/// never a missed real prompt.
+const IDLE_NOTIFICATION: &str = "Claude is waiting for your input";
+
 /// Map a Claude Code hook event name to the effect it has on agent state.
-pub fn outcome_for_event(event: &str) -> EventOutcome {
+/// `message` is the Notification payload's message, when present.
+pub fn outcome_for_event(event: &str, message: Option<&str>) -> EventOutcome {
     match event {
         // SubagentStop means a *subagent* finished — the parent agent is still
         // processing its result, so it stays WORKING (Idle here would flicker).
         "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStop" => {
             EventOutcome::Set(Status::Working)
+        }
+        "Notification" if message.map(str::trim) == Some(IDLE_NOTIFICATION) => {
+            EventOutcome::Set(Status::Idle)
         }
         "Notification" => EventOutcome::Set(Status::NeedsInput),
         "Stop" => EventOutcome::Set(Status::Idle),
@@ -330,29 +341,60 @@ mod tests {
     #[test]
     fn event_mapping_covers_lifecycle() {
         assert_eq!(
-            outcome_for_event("UserPromptSubmit"),
+            outcome_for_event("UserPromptSubmit", None),
             EventOutcome::Set(Status::Working)
         );
         assert_eq!(
-            outcome_for_event("PreToolUse"),
+            outcome_for_event("PreToolUse", None),
             EventOutcome::Set(Status::Working)
         );
         assert_eq!(
-            outcome_for_event("PostToolUse"),
+            outcome_for_event("PostToolUse", None),
             EventOutcome::Set(Status::Working)
         );
         assert_eq!(
-            outcome_for_event("Notification"),
+            outcome_for_event("Notification", None),
             EventOutcome::Set(Status::NeedsInput)
         );
-        assert_eq!(outcome_for_event("Stop"), EventOutcome::Set(Status::Idle));
+        assert_eq!(
+            outcome_for_event("Stop", None),
+            EventOutcome::Set(Status::Idle)
+        );
         // A subagent stopping must NOT idle the parent agent — it's still working.
         assert_eq!(
-            outcome_for_event("SubagentStop"),
+            outcome_for_event("SubagentStop", None),
             EventOutcome::Set(Status::Working)
         );
-        assert_eq!(outcome_for_event("SessionEnd"), EventOutcome::Remove);
-        assert_eq!(outcome_for_event("SomethingElse"), EventOutcome::Ignore);
+        assert_eq!(outcome_for_event("SessionEnd", None), EventOutcome::Remove);
+        assert_eq!(
+            outcome_for_event("SomethingElse", None),
+            EventOutcome::Ignore
+        );
+    }
+
+    #[test]
+    fn idle_timeout_notification_maps_to_idle() {
+        // Claude Code fires Notification("Claude is waiting for your input") ~60s
+        // after Stop, while the agent sits at an empty prompt. That's not a real
+        // input request — it must not overwrite IDLE with NEEDS_INPUT (which sticks
+        // forever and un-gates the a/d/1-9 reply keys).
+        assert_eq!(
+            outcome_for_event("Notification", Some("Claude is waiting for your input")),
+            EventOutcome::Set(Status::Idle)
+        );
+        // A real permission prompt still needs input…
+        assert_eq!(
+            outcome_for_event(
+                "Notification",
+                Some("Claude needs your permission to use Bash")
+            ),
+            EventOutcome::Set(Status::NeedsInput)
+        );
+        // …and so does a Notification with no message at all.
+        assert_eq!(
+            outcome_for_event("Notification", None),
+            EventOutcome::Set(Status::NeedsInput)
+        );
     }
 
     #[test]
@@ -360,11 +402,14 @@ mod tests {
         // A permission prompt (Notification) followed by approval (PreToolUse)
         // should leave the agent WORKING, not stuck on NEEDS_INPUT.
         assert_eq!(
-            outcome_for_event("Notification"),
+            outcome_for_event(
+                "Notification",
+                Some("Claude needs your permission to use Bash")
+            ),
             EventOutcome::Set(Status::NeedsInput)
         );
         assert_eq!(
-            outcome_for_event("PreToolUse"),
+            outcome_for_event("PreToolUse", None),
             EventOutcome::Set(Status::Working)
         );
     }
