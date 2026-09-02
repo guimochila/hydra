@@ -110,10 +110,19 @@ pub fn idle_anchors(agents: &[Agent], popup_cwd: Option<&str>) -> Vec<String> {
 pub fn detail_text(a: &Agent) -> Option<String> {
     if a.effective_status == Status::NeedsInput {
         if let Some(attention) = &a.state.attention {
-            return Some(attention.clone());
+            return Some(one_line(attention));
         }
     }
-    a.state.task_summary.clone()
+    a.state.task_summary.as_deref().map(one_line)
+}
+
+/// Flatten to a single display line: newlines and runs of whitespace collapse to one
+/// space each. Summaries can be multi-line (a tool-result blob, a notification payload
+/// with embedded markup), and every consumer of this column renders one line — a
+/// ratatui `Span` can't show a newline, and in `hydra ls` it would break the columns
+/// of every row after it.
+pub fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncate to at most `max` chars (char-boundary safe), adding an ellipsis. Shared
@@ -167,9 +176,30 @@ pub fn idle_from(
             branch: branch.clone(),
             repo_key: project.repo_key.clone(),
             repo_name: project.repo_name.clone(),
-            ahead_behind: None, // filled by the caller from its throttled cache
+            state: None, // filled by the caller from its throttled cache
         })
         .collect()
+}
+
+/// The name to show for an idle worktree. Normally its branch; a detached worktree has
+/// no branch, so fall back to its directory basename — the only identity it has, and the
+/// thing that tells several detached PR checkouts of one repo apart (a bare "(detached)"
+/// renders every one of them as the same unidentifiable row).
+pub fn worktree_label(wt: &IdleWorktree) -> String {
+    if let Some(branch) = &wt.branch {
+        return branch.clone();
+    }
+    match basename(&wt.path) {
+        Some(name) => format!("{name} (detached)"),
+        None => "(detached)".to_string(),
+    }
+}
+
+/// Last non-empty path segment, or `None` for a path with none (`"/"`, `""`).
+fn basename(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
 }
 
 /// Filter predicate for an idle worktree (branch / repo / path).
@@ -367,6 +397,70 @@ mod tests {
             }),
             dirty: 0,
         }
+    }
+
+    fn idle_wt(path: &str, branch: Option<&str>) -> IdleWorktree {
+        IdleWorktree {
+            path: path.into(),
+            branch: branch.map(str::to_string),
+            repo_key: "/k".into(),
+            repo_name: "proj".into(),
+            state: None,
+        }
+    }
+
+    #[test]
+    fn one_line_collapses_newlines_and_whitespace_runs() {
+        assert_eq!(
+            one_line("<task-notification>\n<task-id>abc</task-id>\n<tool-use>"),
+            "<task-notification> <task-id>abc</task-id> <tool-use>"
+        );
+        assert_eq!(one_line("  padded   text \t x "), "padded text x");
+        assert_eq!(one_line(""), "");
+    }
+
+    #[test]
+    fn detail_text_is_always_a_single_line() {
+        // A multi-line task summary would otherwise wrap and shear the columns of
+        // every row printed after it.
+        let mut a = agent_with("%1", Status::Idle, 0, None);
+        a.state.task_summary = Some("first line\nsecond line".into());
+        assert_eq!(detail_text(&a).as_deref(), Some("first line second line"));
+
+        let mut b = agent_with("%2", Status::NeedsInput, 0, None);
+        b.state.attention = Some("needs permission\nto run Bash".into());
+        assert_eq!(
+            detail_text(&b).as_deref(),
+            Some("needs permission to run Bash")
+        );
+    }
+
+    #[test]
+    fn worktree_label_uses_the_branch_when_there_is_one() {
+        assert_eq!(
+            worktree_label(&idle_wt("/wt/feat-x", Some("feat/x"))),
+            "feat/x"
+        );
+    }
+
+    #[test]
+    fn worktree_label_names_a_detached_worktree_by_its_directory() {
+        // Several detached PR checkouts of one repo must not all collapse to the same
+        // row — the basename is what tells them apart (and `x` remove confirms on it).
+        assert_eq!(
+            worktree_label(&idle_wt("/work/tree/pr-1462", None)),
+            "pr-1462 (detached)"
+        );
+        assert_eq!(
+            worktree_label(&idle_wt("/work/tree/pr-1543/", None)),
+            "pr-1543 (detached)"
+        );
+    }
+
+    #[test]
+    fn worktree_label_falls_back_when_there_is_no_basename() {
+        assert_eq!(worktree_label(&idle_wt("/", None)), "(detached)");
+        assert_eq!(worktree_label(&idle_wt("", None)), "(detached)");
     }
 
     #[test]

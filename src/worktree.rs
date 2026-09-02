@@ -28,10 +28,33 @@ pub struct IdleWorktree {
     pub branch: Option<String>,
     pub repo_key: String,
     pub repo_name: String,
-    /// (ahead, behind) of this worktree's branch vs the repo's default branch, for
-    /// the cleanup badge (ahead == 0 renders as `merged`). `None` when unknown or
-    /// when the worktree IS the default branch.
-    pub ahead_behind: Option<(usize, usize)>,
+    /// How this worktree's HEAD relates to the repo's default branch, for the cleanup
+    /// badge. `None` when unknown or when the worktree IS the default branch.
+    pub state: Option<BranchState>,
+}
+
+/// How an idle worktree's HEAD relates to the repo's default branch — what the cleanup
+/// badge reports.
+///
+/// The distinction that matters: `ahead == 0` (no commits the default branch lacks) is
+/// true both for a branch whose work *landed* and for one that never had a commit, and
+/// those mean opposite things for cleanup. Reporting `merged` for both is worse than
+/// useless — `create_worktree` branches off the default branch, so EVERY worktree hydra
+/// spawns starts at `ahead == 0` and would be badged "safe to delete" the moment it's
+/// created. Worse, under a squash-merge workflow a genuinely merged branch keeps its
+/// original commits off the default branch forever and so stays `ahead > 0`, making
+/// `ahead == 0` a signal that can *only* fire on an empty branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchState {
+    /// No commits of its own, and HEAD sits on the default branch's first-parent chain:
+    /// the branch never diverged, it's just an older point of the default branch itself.
+    /// A freshly spawned (or abandoned-before-any-commit) worktree.
+    NoCommits,
+    /// No commits of its own, and HEAD is off the first-parent chain — it got into the
+    /// default branch as the second parent of a merge commit. Genuinely merged.
+    Merged,
+    /// Has `ahead` commits the default branch lacks; `behind` is the reverse count.
+    Diverged { ahead: usize, behind: usize },
 }
 
 /// All worktrees of one repo, as listed by `git worktree list`.
@@ -105,17 +128,17 @@ impl DirtyCache {
     }
 }
 
-/// Re-check a worktree's ahead/behind counts at most every `AHEAD_BEHIND_TTL_SECS`.
-/// They only change on commits, so this can be much lazier than the dirty count.
+/// Re-check a worktree's branch state at most every `AHEAD_BEHIND_TTL_SECS`.
+/// It only changes on commits, so this can be much lazier than the dirty count.
 const AHEAD_BEHIND_TTL_SECS: u64 = 30;
 
-/// path → (checked_at, counts) throttled cache of ahead/behind vs the default branch.
-pub struct AheadBehindCache {
-    map: HashMap<String, (u64, Option<(usize, usize)>)>,
+/// path → (checked_at, state) throttled cache of branch state vs the default branch.
+pub struct BranchStateCache {
+    map: HashMap<String, (u64, Option<BranchState>)>,
     ttl: u64,
 }
 
-impl Default for AheadBehindCache {
+impl Default for BranchStateCache {
     fn default() -> Self {
         Self {
             map: HashMap::new(),
@@ -124,7 +147,7 @@ impl Default for AheadBehindCache {
     }
 }
 
-impl AheadBehindCache {
+impl BranchStateCache {
     /// Construct with an explicit TTL (from config).
     pub fn with_ttl(ttl: u64) -> Self {
         Self {
@@ -133,16 +156,16 @@ impl AheadBehindCache {
         }
     }
 
-    /// Ahead/behind of `cwd` vs `base`, recomputed only when older than the TTL.
-    pub fn get(&mut self, cwd: &str, base: &str, now: u64) -> Option<(usize, usize)> {
-        if let Some((checked_at, counts)) = self.map.get(cwd) {
+    /// Branch state of `cwd` vs `base`, recomputed only when older than the TTL.
+    pub fn get(&mut self, cwd: &str, base: &str, now: u64) -> Option<BranchState> {
+        if let Some((checked_at, state)) = self.map.get(cwd) {
             if now.saturating_sub(*checked_at) < self.ttl {
-                return *counts;
+                return *state;
             }
         }
-        let counts = ahead_behind(cwd, base);
-        self.map.insert(cwd.to_string(), (now, counts));
-        counts
+        let state = branch_state(cwd, base);
+        self.map.insert(cwd.to_string(), (now, state));
+        state
     }
 }
 
@@ -153,17 +176,17 @@ pub struct Caches {
     pub worktree: WorktreeCache,
     pub dirty: DirtyCache,
     pub wt_list: WorktreeListCache,
-    pub ahead: AheadBehindCache,
+    pub branch: BranchStateCache,
 }
 
 impl Caches {
     /// Build caches with config-derived TTLs.
-    pub fn new(dirty_ttl: u64, wt_list_ttl: u64, ahead_ttl: u64) -> Self {
+    pub fn new(dirty_ttl: u64, wt_list_ttl: u64, branch_ttl: u64) -> Self {
         Self {
             worktree: WorktreeCache::default(),
             dirty: DirtyCache::with_ttl(dirty_ttl),
             wt_list: WorktreeListCache::with_ttl(wt_list_ttl),
-            ahead: AheadBehindCache::with_ttl(ahead_ttl),
+            branch: BranchStateCache::with_ttl(branch_ttl),
         }
     }
 
@@ -171,9 +194,9 @@ impl Caches {
     /// PRESERVING the configured TTLs (a bare `Default` would reset them to the built-in
     /// constants). Called after a mutation (spawn/remove) so the change shows immediately.
     pub fn invalidate(&mut self) {
-        let (dirty_ttl, wt_list_ttl, ahead_ttl) =
-            (self.dirty.ttl, self.wt_list.ttl, self.ahead.ttl);
-        *self = Caches::new(dirty_ttl, wt_list_ttl, ahead_ttl);
+        let (dirty_ttl, wt_list_ttl, branch_ttl) =
+            (self.dirty.ttl, self.wt_list.ttl, self.branch.ttl);
+        *self = Caches::new(dirty_ttl, wt_list_ttl, branch_ttl);
     }
 }
 
@@ -361,6 +384,39 @@ pub fn ahead_behind(cwd: &str, base: &str) -> Option<(usize, usize)> {
         ],
     )?;
     parse_ahead_behind(&out)
+}
+
+/// Classify `cwd`'s HEAD against `base` (the repo's default branch) for the cleanup
+/// badge. See `BranchState` for why `ahead == 0` alone isn't enough. `None` when git
+/// fails (e.g. `base` doesn't exist).
+pub fn branch_state(cwd: &str, base: &str) -> Option<BranchState> {
+    let (ahead, behind) = ahead_behind(cwd, base)?;
+    if ahead > 0 {
+        return Some(BranchState::Diverged { ahead, behind });
+    }
+    if head_on_first_parent_chain(cwd, base, behind) {
+        Some(BranchState::NoCommits)
+    } else {
+        Some(BranchState::Merged)
+    }
+}
+
+/// Whether `cwd`'s HEAD sits on `base`'s first-parent chain — the branch never diverged,
+/// it's just an older point of `base` itself.
+///
+/// Only meaningful when HEAD is already an ancestor of `base` (i.e. `ahead == 0`), which
+/// is also what bounds the walk: every first-parent commit between `base` and HEAD is
+/// unreachable from HEAD and so counted in `behind`, so HEAD is at most `behind` steps
+/// down the chain. That cap keeps this cheap on repos with long histories.
+fn head_on_first_parent_chain(cwd: &str, base: &str, behind: usize) -> bool {
+    let Some(head) = git(cwd, &["rev-parse", "HEAD"]) else {
+        return false;
+    };
+    let limit = format!("--max-count={}", behind.saturating_add(1));
+    match git(cwd, &["rev-list", "--first-parent", &limit, base]) {
+        Some(chain) => chain.lines().any(|sha| sha == head),
+        None => false,
+    }
 }
 
 /// Parse `git rev-list --left-right --count` output (`"<ahead>\t<behind>"`).
@@ -567,30 +623,150 @@ mod tests {
         let wt = repo.join("wt-feat");
         let wt_s = wt.display().to_string();
         create_worktree(&repo_s, &wt_s, "feat", "main").unwrap();
-        // Distinct messages: two empty commits with identical message, author AND
-        // timestamp (same second) would hash to the same sha — and the branches
-        // would silently point at one shared commit, making ahead/behind (0, 0).
-        let commit = |cwd: &str, msg: &str| {
-            let out = Command::new("git")
-                .args([
-                    "-C",
-                    cwd,
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "user.name=t",
-                    "commit",
-                    "--allow-empty",
-                    "-m",
-                    msg,
-                ])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-        };
         commit(&wt_s, "on-feat"); // one commit only on feat…
         commit(&repo_s, "on-main"); // …and one only on main
         assert_eq!(ahead_behind(&wt_s, "main"), Some((1, 1)));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Commit with an explicit distinct message so two empty commits never collide on
+    /// the same sha (identical message + author + timestamp would).
+    fn commit(cwd: &str, msg: &str) {
+        let out = Command::new("git")
+            .args([
+                "-C",
+                cwd,
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                msg,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn branch_state_reports_no_commits_for_a_fresh_branch() {
+        // The regression this guards: a worktree spawned off main, with nothing committed
+        // on it yet, has ahead == 0 and used to render as `merged` — the list's strongest
+        // "safe to delete" signal, on the branch you just started work on.
+        let repo = temp_repo("fresh-state");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-fresh");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "fresh", "main").unwrap();
+        commit(&repo_s, "on-main-after"); // main moves on; the branch has no commits
+
+        assert_eq!(ahead_behind(&wt_s, "main"), Some((0, 1)), "ahead is 0…");
+        assert_eq!(
+            branch_state(&wt_s, "main"),
+            Some(BranchState::NoCommits),
+            "…but it was never merged — it simply has no commits"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_state_reports_no_commits_when_identical_to_the_base() {
+        let repo = temp_repo("same-state");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-same");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "same", "main").unwrap();
+        assert_eq!(ahead_behind(&wt_s, "main"), Some((0, 0)));
+        assert_eq!(branch_state(&wt_s, "main"), Some(BranchState::NoCommits));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_state_reports_merged_after_a_merge_commit() {
+        let repo = temp_repo("merged-state");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-done");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "done", "main").unwrap();
+        commit(&wt_s, "real-work"); // a commit that actually lands…
+        let out = Command::new("git")
+            .args([
+                "-C",
+                &repo_s,
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge done",
+                "done",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // ahead == 0 here too — but HEAD arrived as the merge's second parent, so it is
+        // NOT on main's first-parent chain. That's what separates this from the case above.
+        assert_eq!(ahead_behind(&wt_s, "main"), Some((0, 1)));
+        assert_eq!(branch_state(&wt_s, "main"), Some(BranchState::Merged));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_state_reports_divergence_when_the_branch_has_its_own_commits() {
+        let repo = temp_repo("div-state");
+        let repo_s = repo.display().to_string();
+        let wt = repo.join("wt-div");
+        let wt_s = wt.display().to_string();
+        create_worktree(&repo_s, &wt_s, "div", "main").unwrap();
+        commit(&wt_s, "on-div");
+        commit(&repo_s, "on-main");
+        assert_eq!(
+            branch_state(&wt_s, "main"),
+            Some(BranchState::Diverged {
+                ahead: 1,
+                behind: 1
+            })
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_state_of_a_detached_worktree_is_still_computed() {
+        // Detached PR-review checkouts (`git worktree add --detach`) are the case that
+        // used to get no badge at all: the caller skipped them for having no branch,
+        // even though they can hold real unmerged commits.
+        let repo = temp_repo("det-state");
+        let repo_s = repo.display().to_string();
+        commit(&repo_s, "base-for-detach");
+        let wt = repo.join("wt-detached");
+        let wt_s = wt.display().to_string();
+        let out = Command::new("git")
+            .args(["-C", &repo_s, "worktree", "add", "--detach", &wt_s, "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        commit(&wt_s, "work-on-detached-head");
+
+        assert_eq!(
+            branch_state(&wt_s, "main"),
+            Some(BranchState::Diverged {
+                ahead: 1,
+                behind: 0
+            })
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -662,16 +838,22 @@ mod tests {
         let mut caches = Caches::new(11, 22, 33);
         caches.dirty.map.insert("x".into(), (0, 5));
         caches.wt_list.map.insert("y".into(), (0, None));
-        caches.ahead.map.insert("z".into(), (0, Some((1, 2))));
+        caches
+            .branch
+            .map
+            .insert("z".into(), (0, Some(BranchState::NoCommits)));
         caches.invalidate();
         assert_eq!(caches.dirty.ttl, 11, "dirty TTL must survive invalidate");
         assert_eq!(
             caches.wt_list.ttl, 22,
             "wt_list TTL must survive invalidate"
         );
-        assert_eq!(caches.ahead.ttl, 33, "ahead TTL must survive invalidate");
+        assert_eq!(
+            caches.branch.ttl, 33,
+            "branch-state TTL must survive invalidate"
+        );
         assert!(caches.dirty.map.is_empty(), "cached data must be cleared");
         assert!(caches.wt_list.map.is_empty(), "cached data must be cleared");
-        assert!(caches.ahead.map.is_empty(), "cached data must be cleared");
+        assert!(caches.branch.map.is_empty(), "cached data must be cleared");
     }
 }

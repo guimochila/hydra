@@ -176,14 +176,13 @@ pub fn current_overview(
             continue;
         }
         let mut wts = agent::idle_from(&occupied, &project);
-        // Ahead/behind vs the default branch (throttled), for the merged/↑↓ badge.
-        // The default branch itself gets no badge — it's its own base.
+        // Branch state vs the default branch (throttled), for the badge. Only the default
+        // branch itself is skipped — it's its own base. A *detached* worktree (branch
+        // `None`) must still be classified: PR checkouts live there and can hold real
+        // unmerged commits, so `!= Some(default)` rather than a `Some`-gated compare.
         for w in &mut wts {
-            if w.branch
-                .as_deref()
-                .is_some_and(|b| b != project.default_branch)
-            {
-                w.ahead_behind = caches.ahead.get(&w.path, &project.default_branch, now);
+            if w.branch.as_deref() != Some(project.default_branch.as_str()) {
+                w.state = caches.branch.get(&w.path, &project.default_branch, now);
             }
         }
         idle.extend(wts);
@@ -197,6 +196,20 @@ pub fn current_overview(
     }
 }
 
+/// `hydra ls` column widths, mirroring the popup's row layout so the two agree.
+/// The place and branch cells shrink from max toward min on a narrow terminal.
+const LS_PLACE_MAX: usize = 18;
+const LS_PLACE_MIN: usize = 10;
+const LS_BRANCH_MAX: usize = 24;
+const LS_BRANCH_MIN: usize = 16;
+/// Wide enough for the longest badge (`no commits`) plus its gutter.
+const LS_BADGE: usize = 11;
+/// The free-text cell is the point of the row, so it gets a floor the other cells
+/// yield to before it does.
+const LS_DETAIL_MIN: usize = 24;
+/// Row overhead: glyph, its gutter, the age cell, three column gutters, the badge.
+const LS_OVERHEAD: usize = 1 + 1 + 3 + 2 + 2 + 2 + LS_BADGE;
+
 fn list_command() -> std::io::Result<()> {
     let cfg = config::load();
     let mut caches = worktree::Caches::new(
@@ -209,27 +222,115 @@ fn list_command() -> std::io::Result<()> {
         println!("(no agents or worktrees in this session)");
         return Ok(());
     }
+    let now = now_secs();
+    let width = term_width();
     for a in &overview.agents {
+        // Branch, falling back to the tmux window name for an agent outside a worktree —
+        // same fallback the popup's rows use.
         let branch = a
             .worktree
             .as_ref()
             .and_then(|w| w.branch.clone())
-            .unwrap_or_else(|| "-".into());
-        let summary = agent::detail_text(a).unwrap_or_default();
+            .unwrap_or_else(|| a.pane.window_name.clone());
+        let dirty = if a.dirty > 0 {
+            format!("Δ{}", a.dirty)
+        } else {
+            String::new()
+        };
         println!(
-            "{} win {:>2}  {:<20} {:<28} {}",
-            a.effective_status.glyph(),
-            a.pane.window_index,
-            branch,
-            a.pane.window_name,
-            summary
+            "{}",
+            ls_row(
+                a.effective_status.glyph(),
+                &agent::format_age(now.saturating_sub(a.state.updated_at)),
+                &format!("{}:{}", a.pane.session_name, a.pane.window_index),
+                &branch,
+                &dirty,
+                &agent::detail_text(a).unwrap_or_default(),
+                width,
+            )
         );
     }
     for w in &overview.idle {
-        let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
-        println!("○ idle    {:<20} {}  start", branch, w.path);
+        // No agent, so no age or tmux location — the path is the useful free-text cell.
+        println!(
+            "{}",
+            ls_row(
+                "○",
+                "—",
+                "—",
+                &agent::worktree_label(w),
+                &ls_badge(w.state),
+                &w.path,
+                width,
+            )
+        );
     }
     Ok(())
+}
+
+/// The cleanup badge as plain text, matching the popup's wording.
+fn ls_badge(state: Option<worktree::BranchState>) -> String {
+    match state {
+        Some(worktree::BranchState::Merged) => "merged".into(),
+        Some(worktree::BranchState::NoCommits) => "no commits".into(),
+        Some(worktree::BranchState::Diverged { ahead, behind }) if behind > 0 => {
+            format!("↑{ahead} ↓{behind}")
+        }
+        Some(worktree::BranchState::Diverged { ahead, .. }) => format!("↑{ahead}"),
+        None => String::new(),
+    }
+}
+
+/// (place, branch, detail) cell widths for a terminal of `width`. Session-per-worktree
+/// names and long branches would eat the whole row on a narrow terminal, so they give
+/// up space down to their minimums before the free-text cell drops below its floor.
+fn ls_widths(width: usize) -> (usize, usize, usize) {
+    let avail = width.saturating_sub(LS_OVERHEAD);
+    let mut place = LS_PLACE_MAX;
+    let mut branch = LS_BRANCH_MAX;
+    let shortfall = LS_DETAIL_MIN.saturating_sub(avail.saturating_sub(place + branch));
+    if shortfall > 0 {
+        let from_place = (place - LS_PLACE_MIN).min(shortfall);
+        place -= from_place;
+        branch -= (branch - LS_BRANCH_MIN).min(shortfall - from_place);
+    }
+    let detail = avail.saturating_sub(place + branch);
+    (place, branch, detail)
+}
+
+/// Format one `hydra ls` row into aligned columns. Every variable cell is truncated to
+/// its column — an over-long branch or a summary wider than the terminal would
+/// otherwise push the following cells out of alignment, or wrap and shear the table.
+/// Pure so the layout is testable without a tmux server.
+fn ls_row(
+    glyph: &str,
+    age: &str,
+    place: &str,
+    branch: &str,
+    badge: &str,
+    detail: &str,
+    width: usize,
+) -> String {
+    let (pw, bw, dw) = ls_widths(width);
+    let place = agent::truncate(place, pw);
+    let branch = agent::truncate(branch, bw);
+    let detail = agent::truncate(detail, dw);
+    format!(
+        "{glyph} {age:>3}  {place:<pw$}  {branch:<bw$}  {badge:<gw$}{detail}",
+        gw = LS_BADGE
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// Terminal width for `ls` column fitting. `size()` queries the terminal itself, so it
+/// still reports the real width with stdout piped; the fallback covers having no
+/// terminal at all (CI, a cron job) or an implausibly narrow one.
+fn term_width() -> usize {
+    match ratatui::crossterm::terminal::size() {
+        Ok((cols, _)) if cols >= 40 => cols as usize,
+        _ => 120,
+    }
 }
 
 fn now_secs() -> u64 {
@@ -253,4 +354,115 @@ fn print_help() {
          \x20 hydra version            Print the hydra version\n\n\
          help/version also answer to -h/--help and -V/--version"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ls_row_keeps_columns_aligned_when_cells_overflow() {
+        // A long branch and a long summary must not push the later cells right — they
+        // get truncated into their own column instead.
+        let short = ls_row("○", "3h", "cet-services:2", "main", "Δ8", "Post it.", 120);
+        let long = ls_row(
+            "●",
+            "5s",
+            "cet-services:2",
+            "feat/b2b-provisioning-automate-jira-po",
+            "Δ3",
+            "Can you check this PR and why the CI is failing",
+            120,
+        );
+        let (pw, bw, _) = ls_widths(120);
+        let badge_col = 1 + 1 + 3 + 2 + pw + 2 + bw + 2;
+        assert_eq!(
+            short.chars().take(badge_col).count(),
+            long.chars().take(badge_col).count()
+        );
+        // Same column start for the badge in both rows.
+        assert_eq!(
+            short.chars().skip(badge_col).take(2).collect::<String>(),
+            "Δ8"
+        );
+        assert_eq!(
+            long.chars().skip(badge_col).take(2).collect::<String>(),
+            "Δ3"
+        );
+        assert!(
+            long.contains("feat/b2b-provisioning-a…"),
+            "over-long branch is truncated into its cell: {long}"
+        );
+    }
+
+    #[test]
+    fn ls_widths_protect_the_free_text_cell_on_a_narrow_terminal() {
+        // Wide: both cells at max, everything left goes to the free text.
+        let (place, branch, detail) = ls_widths(120);
+        assert_eq!((place, branch), (LS_PLACE_MAX, LS_BRANCH_MAX));
+        assert_eq!(place + branch + detail + LS_OVERHEAD, 120);
+
+        // 80 cols: the place cell (long session-per-worktree names) yields first, and
+        // the free text keeps its floor rather than being elided down to nothing.
+        let (place, branch, detail) = ls_widths(80);
+        assert_eq!(branch, LS_BRANCH_MAX, "branch is not touched first");
+        assert!((LS_PLACE_MIN..LS_PLACE_MAX).contains(&place));
+        assert!(detail >= LS_DETAIL_MIN, "detail floor held: {detail}");
+
+        // Very narrow: both cells bottom out, but never below their minimums.
+        let (place, branch, _) = ls_widths(50);
+        assert_eq!((place, branch), (LS_PLACE_MIN, LS_BRANCH_MIN));
+    }
+
+    #[test]
+    fn ls_row_never_exceeds_the_terminal_width() {
+        // Wrapping is what shears the table: a row wider than the terminal wraps onto a
+        // second line and every column below it looks misaligned.
+        let row = ls_row(
+            "○",
+            "1h",
+            "cet-services:4",
+            "feat/b2b-provisioning-automate-jira-po",
+            "Δ3",
+            &"I want you to check this branch and tell me when ".repeat(4),
+            100,
+        );
+        assert!(
+            row.chars().count() <= 100,
+            "row width {}",
+            row.chars().count()
+        );
+    }
+
+    #[test]
+    fn ls_row_trims_a_row_with_no_free_text() {
+        // An idle worktree with no badge must not leave trailing padding behind.
+        let row = ls_row("○", "—", "—", "pr-1462 (detached)", "", "", 120);
+        assert_eq!(row, row.trim_end(), "no trailing whitespace");
+        assert!(row.ends_with("pr-1462 (detached)"));
+    }
+
+    #[test]
+    fn ls_badge_wording_matches_the_popup() {
+        assert_eq!(ls_badge(Some(worktree::BranchState::Merged)), "merged");
+        assert_eq!(
+            ls_badge(Some(worktree::BranchState::NoCommits)),
+            "no commits"
+        );
+        assert_eq!(
+            ls_badge(Some(worktree::BranchState::Diverged {
+                ahead: 12,
+                behind: 76
+            })),
+            "↑12 ↓76"
+        );
+        assert_eq!(
+            ls_badge(Some(worktree::BranchState::Diverged {
+                ahead: 32,
+                behind: 0
+            })),
+            "↑32"
+        );
+        assert_eq!(ls_badge(None), "");
+    }
 }

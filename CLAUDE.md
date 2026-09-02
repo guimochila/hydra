@@ -40,9 +40,13 @@ Module map (`src/`):
   repo-scoped by default (this repo's agents across sessions, keyed on the popup cwd's
   `repo_key`), session-scoped when the popup cwd isn't in a repo, or `all_sessions`
   (whole socket) when the `s` toggle is on. Returns a `scope_label` for the header so
-  the UI does no git/tmux work. Idle worktrees for every repo in view, with throttled
-  ahead/behind counts vs the repo's default branch (the merged/↑↓ badge); GC's dead
-  state files as a side effect.
+  the UI does no git/tmux work. Idle worktrees for every repo in view, with a throttled
+  branch state vs the repo's default branch (the merged/no-commits/↑↓ badge — see
+  "Branch state badge" below); GC's dead state files as a side effect.
+  `hydra ls` prints the same columns as the popup's rows (glyph, age, `session:window`,
+  branch/label, badge, free text) via the pure `ls_row`/`ls_widths`: every cell is
+  truncated to its column, and the place/branch cells shrink toward their minimums on a
+  narrow terminal so the trailing free-text cell keeps a floor.
 - `state.rs` — the on-disk contract: `Status`, the event→status state machine
   (`outcome_for_event`), `$TMUX` parsing, and atomic read/write/GC of state files
   (`read_all` dedupes by (socket, pane) keeping the newest, so leftover files from an
@@ -75,8 +79,9 @@ Module map (`src/`):
 - `worktree.rs` — cwd → branch/repo via `git`, cached by cwd (`WorktreeCache`). Also
   `DirtyCache` (throttled uncommitted-change counts), `WorktreeListCache` +
   `list_worktrees` (throttled `git worktree list` for idle-worktree discovery; carries
-  the repo's `default_branch`), `AheadBehindCache` (throttled `git rev-list` counts vs
-  the default branch), `preview` (git log + status for the idle-worktree preview), the
+  the repo's `default_branch`), `BranchStateCache` + `branch_state`/`BranchState`
+  (throttled classification vs the default branch — see "Branch state badge" below),
+  `preview` (git log + status for the idle-worktree preview), the
   `Caches` bundle (with `invalidate()` to force a re-read after a mutation), and
   `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove.
   `create_worktree` reuses an existing branch (no `-b`) instead of failing on it. Repo
@@ -87,11 +92,14 @@ Module map (`src/`):
   (Session/Repo/All), `choose_scope` (toggle + popup repo_key → scope) and
   `matches_scope` (per-agent predicate; a worktree-less agent never matches `Repo`).
   Also `idle_from` (project worktrees − occupied),
-  `matches_filter`/`worktree_matches_filter`, `format_age`.
+  `matches_filter`/`worktree_matches_filter`, `worktree_label` (branch name, or the
+  directory basename for a detached worktree), `format_age`, and `one_line` (which
+  `detail_text` applies — summaries can be multi-line, and every consumer of that column
+  renders a single line).
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
   unified repo-grouped list of both running agents (age/dirty/attention) and idle
-  worktrees (`Enter` starts `claude`, `c` resumes via `resume_command`, merged/↑↓
-  badge), `a`/`d`/`1`-`9` prompt replies (NEEDS_INPUT gated + state-file re-checked at
+  worktrees (`Enter` starts `claude`, `c` resumes via `resume_command`,
+  merged/no-commits/↑↓ badge), `a`/`d`/`1`-`9` prompt replies (NEEDS_INPUT gated + state-file re-checked at
   send time), `I` interrupt of a WORKING agent (confirm + same state-file re-check,
   sends Escape), `n` spawn takes `name[: prompt]` — the prompt is shell-quoted into
   the agent command as its first task, `x` to remove a worktree (confirm,
@@ -170,6 +178,25 @@ request, and NEEDS_INPUT would stick forever and un-gate the `a`/`d`/`1-9` keys.
 idle/needs-input, which can legitimately sit) to `UNKNOWN`. Leftover files from
 crashed agents (no `SessionEnd`) are GC'd by `current_overview` via
 `agent::dead_states`: pane gone from `list_panes` AND older than `GC_GRACE_SECS`.
+
+## Branch state badge
+
+The idle-worktree badge comes from `worktree::BranchState`, not raw ahead/behind counts.
+`ahead == 0` is **not** "merged": it's equally true of a branch that never had a commit,
+and `create_worktree` branches off the default branch — so treating `ahead == 0` as
+merged badges every worktree hydra spawns as "safe to delete" the instant it's created.
+Under a squash-merge workflow it's worse: a genuinely merged branch keeps its original
+commits off the default branch forever and stays `ahead > 0`, so `ahead == 0` can *only*
+ever fire on an empty branch. `branch_state` splits them with a first-parent test — HEAD
+on the default branch's first-parent chain means the branch never diverged
+(`NoCommits`); off it means the commits arrived via a merge commit (`Merged`). The walk
+is bounded by `behind + 1` (HEAD can't sit further down the chain than that), so it
+stays cheap on long histories.
+
+Detached worktrees (PR checkouts) are first-class here: they have no branch, so
+`worktree_label` names them by directory basename, and `current_overview` gates the badge
+on `!= Some(default_branch)` — a `Some`-gated compare would skip `None` and leave real
+unmerged commits unbadged.
 
 ## Roadmap notes
 

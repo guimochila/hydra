@@ -37,7 +37,7 @@ stale_after_secs       = 900   # a WORKING agent silent this long shows as UNKNO
 refresh_ms             = 250   # popup refresh tick
 dirty_ttl_secs         = 3     # throttle for `git status` dirty counts
 worktree_list_ttl_secs = 5     # throttle for `git worktree list`
-ahead_behind_ttl_secs  = 30    # throttle for idle-worktree ahead/behind badges
+ahead_behind_ttl_secs  = 30    # throttle for idle-worktree merge-state badges
 
 [agent]
 command        = "claude"           # launched by `n` (spawn) and Enter (start in worktree)
