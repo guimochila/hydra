@@ -13,7 +13,7 @@ use crate::agent::{self, Agent};
 use crate::fetcher::PreviewTarget;
 use crate::state::Status;
 use crate::tmux;
-use crate::worktree::{Caches, IdleWorktree};
+use crate::worktree::{BranchState, Caches, IdleWorktree};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ansi_to_tui::IntoText;
@@ -975,7 +975,7 @@ impl App {
         } else if let Some(w) = self.selected_worktree() {
             (
                 w.path.clone(),
-                w.branch.clone().unwrap_or_else(|| "(detached)".into()),
+                agent::worktree_label(w),
                 w.repo_key.clone(),
                 // No agent to self-report a socket, so use the popup's: an idle worktree's
                 // leftover windows (session mode's shell + agent) live on this server.
@@ -1385,34 +1385,40 @@ fn header_row(label: &str, count: usize, colors: &TuiColors) -> ListItem<'static
     ListItem::new(line)
 }
 
-/// An idle worktree with no agent: dimmed, with a "start ⏎" affordance and an
-/// ahead/behind badge vs the default branch (`merged` when nothing is unmerged —
-/// the strongest "safe to remove" signal the list can give).
+/// An idle worktree with no agent: dimmed, with a "start ⏎" affordance and a badge for
+/// how its HEAD stands against the default branch. `merged` is the strongest "safe to
+/// remove" signal the list can give, so it's reserved for an actual merge — a branch with
+/// no commits yet reads `no commits` instead (see `worktree::BranchState`).
 fn worktree_row(w: &IdleWorktree, colors: &TuiColors) -> ListItem<'static> {
-    let branch = w.branch.clone().unwrap_or_else(|| "(detached)".into());
+    let label = agent::worktree_label(w);
     let mut spans = vec![
         Span::styled("  ○", Style::default().fg(colors.worktree_row)),
         Span::raw("  —   —      "),
         Span::styled(
-            format!("{:<24}", agent::truncate(&branch, 23)),
+            format!("{:<24}", agent::truncate(&label, 23)),
             Style::default().fg(colors.branch).dim(),
         ),
     ];
-    match w.ahead_behind {
-        Some((0, _)) => spans.push(Span::styled(
-            "merged  ",
-            Style::default().fg(colors.working).dim(),
-        )),
-        Some((ahead, behind)) => {
-            let badge = if behind > 0 {
-                format!("↑{ahead} ↓{behind}  ")
+    let badge = match w.state {
+        Some(BranchState::Merged) => Some(("merged".to_string(), colors.working)),
+        Some(BranchState::NoCommits) => Some(("no commits".to_string(), colors.unknown)),
+        Some(BranchState::Diverged { ahead, behind }) => {
+            let text = if behind > 0 {
+                format!("↑{ahead} ↓{behind}")
             } else {
-                format!("↑{ahead}  ")
+                format!("↑{ahead}")
             };
-            spans.push(Span::styled(badge, Style::default().fg(colors.dirty).dim()));
+            Some((text, colors.dirty))
         }
-        None => {}
-    }
+        None => None,
+    };
+    // Pad every badge to one width so the "start ⏎" column stays aligned across rows.
+    spans.push(match badge {
+        Some((text, color)) => {
+            Span::styled(format!("{text:<12}"), Style::default().fg(color).dim())
+        }
+        None => Span::raw(" ".repeat(12)),
+    });
     spans.push(Span::styled(
         "start ⏎",
         Style::default().fg(colors.worktree_row),
@@ -1649,7 +1655,7 @@ mod tests {
             branch: Some(branch.into()),
             repo_key: repo_key.into(),
             repo_name: repo_name.into(),
-            ahead_behind: None,
+            state: None,
         }
     }
 
@@ -2151,11 +2157,14 @@ mod tests {
     #[test]
     fn worktree_rows_show_merged_or_ahead_behind_badges() {
         let mut merged = idle_wt("/a/wt1", "feat-merged", "/a/.git", "alpha");
-        merged.ahead_behind = Some((0, 3)); // nothing main lacks → safe to remove
+        merged.state = Some(BranchState::Merged); // its commits landed → safe to remove
         let mut diverged = idle_wt("/a/wt2", "feat-live", "/a/.git", "alpha");
-        diverged.ahead_behind = Some((2, 1));
+        diverged.state = Some(BranchState::Diverged {
+            ahead: 2,
+            behind: 1,
+        });
         let mut unknown = idle_wt("/a/wt3", "feat-unknown", "/a/.git", "alpha");
-        unknown.ahead_behind = None; // no badge at all
+        unknown.state = None; // no badge at all
         let mut app = app_with(vec![], vec![merged, diverged, unknown]);
         app.show_preview = false;
 
@@ -2170,6 +2179,73 @@ mod tests {
             .collect();
         assert!(text.contains("merged"), "merged badge rendered");
         assert!(text.contains("↑2 ↓1"), "ahead/behind badge rendered");
+    }
+
+    #[test]
+    fn a_branch_with_no_commits_is_not_badged_as_merged() {
+        // The dangerous regression: a just-spawned worktree has no commits of its own,
+        // and used to render `merged` — telling you the branch you're about to work on
+        // had already landed.
+        let mut fresh = idle_wt("/a/wt1", "feat-fresh", "/a/.git", "alpha");
+        fresh.state = Some(BranchState::NoCommits);
+        let mut app = app_with(vec![], vec![fresh]);
+        app.show_preview = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("no commits"), "honest badge rendered");
+        assert!(!text.contains("merged"), "must NOT claim the branch merged");
+    }
+
+    #[test]
+    fn detached_worktree_rows_are_named_by_their_directory() {
+        // Several detached PR checkouts of one repo used to render as identical
+        // "(detached)" rows — no way to tell which is which, including in the `x`
+        // remove confirmation.
+        let mut a = idle_wt("/work/tree/pr-1462", "x", "/a/.git", "alpha");
+        a.branch = None;
+        a.state = Some(BranchState::Diverged {
+            ahead: 12,
+            behind: 76,
+        });
+        let mut b = idle_wt("/work/tree/pr-1543", "x", "/a/.git", "alpha");
+        b.branch = None;
+        b.state = Some(BranchState::Diverged {
+            ahead: 3,
+            behind: 32,
+        });
+        let mut app = app_with(vec![], vec![a, b]);
+        app.show_preview = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("pr-1462 (detached)"),
+            "first row identifiable"
+        );
+        assert!(
+            text.contains("pr-1543 (detached)"),
+            "second row identifiable"
+        );
+        assert!(
+            text.contains("↑12 ↓76"),
+            "detached worktrees get a badge too"
+        );
+        assert!(text.contains("↑3 ↓32"));
     }
 
     #[test]
