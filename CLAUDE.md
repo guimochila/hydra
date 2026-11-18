@@ -59,9 +59,12 @@ Module map (`src/`):
   pure core — no globals. Env vars (`HYDRA_WORKTREE_ROOT`, `HYDRA_ALERTS`) are folded into
   `Config` at load, so use sites never re-check env. `agent.spawn_mode` (`"window"` |
   `"session"`) is runtime-read like everything outside `[popup]`: `"session"` spawns each
-  worktree into its own two-window session (shell + agent) instead of a window in the
+  worktree into its own session (shell + agent) instead of a window in the
   current session, and starts the popup in all-sessions view so those sessions are
-  visible.
+  visible. `agent.extra_windows` (`ExtraWindow`, session mode only) inserts windows
+  between shell and agent; `ExtraWindow::script` (pure, tested) expands `{base}` to the
+  shell-quoted default branch and wraps the command in a `while :` restart loop, exec'd
+  as `/bin/sh -c` (never the user's shell — it may be fish).
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
   (including `attention`, the Notification's "why input is needed" message). No tmux
@@ -209,7 +212,7 @@ new-window), status, and the cross-session jump (`switch-client`, incl. from ins
 popup) are verified against live tmux.
 
 `spawn_mode` (window|session, default `"window"`) is done: `"session"` gives each
-worktree a dedicated two-window session (shell + agent), `Enter` reuses an existing
+worktree a dedicated session (shell + any `extra_windows` + agent), `Enter` reuses an existing
 session and lands on the agent window, and removal stays mode-agnostic by killing
 every window rooted in the worktree (`agent::windows_under_path`) rather than
 special-casing sessions.
