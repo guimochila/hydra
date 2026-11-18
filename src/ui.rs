@@ -724,6 +724,7 @@ impl App {
                         &path_str,
                         &sanitize(name),
                         &command,
+                        &self.config.agent.extra_scripts(&base),
                     ) {
                         Ok(agent_win) => {
                             // Make the Claude window (window 2) the session's current
@@ -919,7 +920,16 @@ impl App {
                         }
                     }
                 } else {
-                    match crate::tmux::new_session(&socket, &sess, &path, &name, &command) {
+                    // `{base}` in an extra window needs the default branch; skip the
+                    // git call when there are none.
+                    let extras = if self.config.agent.extra_windows.is_empty() {
+                        Vec::new()
+                    } else {
+                        let base = crate::worktree::default_branch(&path);
+                        self.config.agent.extra_scripts(&base)
+                    };
+                    match crate::tmux::new_session(&socket, &sess, &path, &name, &command, &extras)
+                    {
                         Ok(agent_win) => {
                             // Land on the Claude window (window 2), then attach.
                             let _ = tmux::select_window_id(&socket, &agent_win);

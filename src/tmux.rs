@@ -153,6 +153,19 @@ pub fn new_window(
     cwd: &str,
     command: &str,
 ) -> std::io::Result<String> {
+    new_window_argv(socket, session, name, cwd, &[command])
+}
+
+/// `new_window` with an explicit argv. tmux's rule: a single element runs through the
+/// user's `default-shell`; several are exec'd directly. Extra session windows use
+/// `["/bin/sh", "-c", script]` so their loop is POSIX even when the user's shell is fish.
+fn new_window_argv(
+    socket: &str,
+    session: &str,
+    name: &str,
+    cwd: &str,
+    argv: &[&str],
+) -> std::io::Result<String> {
     let target = format!("{session}:{{end}}");
     let out = Command::new("tmux")
         .arg("-S")
@@ -170,8 +183,8 @@ pub fn new_window(
             "-P",
             "-F",
             "#{window_id}",
-            command,
         ])
+        .args(argv)
         .output()?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -182,16 +195,18 @@ pub fn new_window(
     }
 }
 
-/// Create a **detached** two-window session for a worktree: window 1 is a plain shell
-/// rooted in `cwd`, window 2 runs `command` (the agent) named `agent_window_name`.
-/// Returns the agent window's id so the caller can focus it. Used by session spawn mode.
-/// Errors carry stderr. Socket-parameterized like every other call here.
+/// Create a **detached** session for a worktree: window 1 is a plain shell rooted in
+/// `cwd`, then one window per `extras` entry (`(name, sh script)`, e.g. a diff viewer —
+/// see `config::ExtraWindow::script`), and last the agent running `command`, named
+/// `agent_window_name`. Returns the agent window's id so the caller can focus it. Used by
+/// session spawn mode. Errors carry stderr. Socket-parameterized like every other call here.
 pub fn new_session(
     socket: &str,
     session_name: &str,
     cwd: &str,
     agent_window_name: &str,
     command: &str,
+    extras: &[(String, String)],
 ) -> std::io::Result<String> {
     let out = Command::new("tmux")
         .arg("-S")
@@ -212,16 +227,20 @@ pub fn new_session(
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
         ));
     }
-    // Append the agent window; `new_window` inserts after the last window and returns
-    // its id, exactly as in window spawn mode. If it fails, roll back the just-created
-    // (shell-only) session so a partial spawn never leaves an orphan session behind.
-    match new_window(socket, session_name, agent_window_name, cwd, command) {
-        Ok(window_id) => Ok(window_id),
-        Err(e) => {
-            let _ = kill_session(socket, session_name);
-            Err(e)
-        }
+    // Append the extra windows, then the agent window; `new_window` inserts after the
+    // last window and returns its id, exactly as in window spawn mode. If any step
+    // fails, roll back the just-created session so a partial spawn never leaves an
+    // orphan session behind.
+    let result = extras
+        .iter()
+        .try_for_each(|(name, script)| {
+            new_window_argv(socket, session_name, name, cwd, &["/bin/sh", "-c", script]).map(|_| ())
+        })
+        .and_then(|()| new_window(socket, session_name, agent_window_name, cwd, command));
+    if result.is_err() {
+        let _ = kill_session(socket, session_name);
     }
+    result
 }
 
 /// Kill the session named `name` on `socket` (via `kill-session`). `=name` forces an exact

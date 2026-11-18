@@ -55,6 +55,56 @@ pub struct Agent {
     /// How a newly-started agent is laid out: `"window"` (default) or `"session"`.
     /// Interpreted via `Config::spawn_mode()`; unknown values behave as `"window"`.
     pub spawn_mode: String,
+    /// Session mode only: extra windows created between the shell (window 1) and the
+    /// agent (last), e.g. a `revdiff` diff viewer. Empty (default) = shell + agent.
+    pub extra_windows: Vec<ExtraWindow>,
+}
+
+/// One `[[agent.extra_windows]]` entry. Every field defaults, so a malformed entry
+/// degrades (an empty `command` is skipped) instead of throwing away the whole config.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default)]
+pub struct ExtraWindow {
+    pub name: String,
+    /// POSIX `sh` command line. `{base}` expands to the repo's default branch (shell-quoted).
+    pub command: String,
+}
+
+impl Agent {
+    /// The `(window name, sh script)` pairs `tmux::new_session` creates between the shell
+    /// and the agent, in config order; entries with an empty command are dropped.
+    pub fn extra_scripts(&self, base: &str) -> Vec<(String, String)> {
+        self.extra_windows
+            .iter()
+            .filter_map(|w| Some((w.window_name().to_string(), w.script(base)?)))
+            .collect()
+    }
+}
+
+impl ExtraWindow {
+    /// The window name, falling back to `"extra"` when unset.
+    pub fn window_name(&self) -> &str {
+        match self.name.trim() {
+            "" => "extra",
+            n => n,
+        }
+    }
+
+    /// The `sh -c` script this window runs, or `None` when `command` is empty. `{base}`
+    /// expands to the single-quoted `base`, and the command runs in a restart loop:
+    /// quitting the tool (e.g. `q` in revdiff) relaunches it with fresh state instead of
+    /// closing the window. The `sleep` keeps a command that fails at once (not
+    /// installed, bad flag) from spinning a hot loop. It always runs under `/bin/sh`
+    /// (exec'd directly, not the user's shell), so the loop syntax works under fish too.
+    pub fn script(&self, base: &str) -> Option<String> {
+        let cmd = self.command.trim();
+        if cmd.is_empty() {
+            return None;
+        }
+        let quoted = format!("'{}'", base.replace('\'', r"'\''"));
+        let cmd = cmd.replace("{base}", &quoted);
+        Some(format!("while :; do {cmd}; sleep 1; done"))
+    }
 }
 
 impl Default for Agent {
@@ -64,6 +114,7 @@ impl Default for Agent {
             resume_command: "claude --continue".to_string(),
             worktree_root: "~/work/tree".to_string(),
             spawn_mode: "window".to_string(),
+            extra_windows: Vec::new(),
         }
     }
 }
@@ -511,5 +562,56 @@ mod tests {
         let cfg = Config::parse("[agent]\nspawn_mode = \"bogus\"\ncommand = \"codex\"\n");
         assert_eq!(cfg.spawn_mode(), SpawnMode::Window);
         assert_eq!(cfg.agent.command, "codex");
+    }
+
+    #[test]
+    fn extra_windows_default_to_none() {
+        assert!(Config::default().agent.extra_windows.is_empty());
+        assert!(Config::parse("[agent]\ncommand = \"claude\"\n")
+            .agent
+            .extra_windows
+            .is_empty());
+    }
+
+    #[test]
+    fn extra_windows_parse_in_order() {
+        let cfg = Config::parse(
+            "[[agent.extra_windows]]\nname = \"diff\"\ncommand = \"revdiff {base}\"\n\
+             [[agent.extra_windows]]\nname = \"logs\"\ncommand = \"tail -f log\"\n",
+        );
+        let names: Vec<_> = cfg
+            .agent
+            .extra_windows
+            .iter()
+            .map(|w| w.window_name())
+            .collect();
+        assert_eq!(names, ["diff", "logs"]);
+    }
+
+    #[test]
+    fn extra_window_missing_fields_degrade_without_breaking_config() {
+        let cfg = Config::parse("[agent]\ncommand = \"codex\"\n[[agent.extra_windows]]\n");
+        assert_eq!(cfg.agent.command, "codex");
+        let w = &cfg.agent.extra_windows[0];
+        assert_eq!(w.window_name(), "extra");
+        assert_eq!(w.script("main"), None, "empty command is skipped");
+        assert!(cfg.agent.extra_scripts("main").is_empty());
+    }
+
+    #[test]
+    fn extra_window_script_loops_and_quotes_base() {
+        let w = ExtraWindow {
+            name: "diff".into(),
+            command: "revdiff --no-confirm-reload {base}".into(),
+        };
+        assert_eq!(
+            w.script("main").unwrap(),
+            "while :; do revdiff --no-confirm-reload 'main'; sleep 1; done"
+        );
+        // A quote in the branch can't break out of the single-quoted argument.
+        assert_eq!(
+            w.script("a'b").unwrap(),
+            r"while :; do revdiff --no-confirm-reload 'a'\''b'; sleep 1; done"
+        );
     }
 }

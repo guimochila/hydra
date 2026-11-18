@@ -262,6 +262,24 @@ Controls how `n` (spawn) and `Enter` (start an idle worktree) open a new agent:
   now-empty session). In this mode the popup opens in all-sessions view (`s` still
   toggles it) so the new sessions are visible.
 
+#### Extra session windows
+
+In session mode you can add windows between the shell and the agent, e.g. a live diff
+of the worktree with [revdiff](https://github.com/umputun/revdiff):
+
+```toml
+[[agent.extra_windows]]
+name    = "diff"
+command = "revdiff --no-confirm-reload {base}"
+```
+
+That gives each worktree session three windows: shell (1), diff (2), agent (3). `{base}`
+expands to the repo's default branch, so the diff covers everything the branch changed,
+committed or not. Each command runs under `/bin/sh` (not your login shell) in a restart
+loop: quitting the tool relaunches it with fresh state instead of closing the window,
+and `Ctrl-C` exits the loop. Entries are created in order; one with an empty `command`
+is skipped.
+
 ## How it works
 
 Hydra never scrapes terminal output. Instead:
