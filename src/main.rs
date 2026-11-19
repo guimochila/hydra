@@ -19,6 +19,7 @@ mod doctor;
 mod fetcher;
 mod hook;
 mod install;
+mod pr;
 mod state;
 mod status;
 mod tmux;

@@ -302,6 +302,82 @@ pub fn remove_worktree(base_cwd: &str, path: &str, force: bool) -> std::io::Resu
     }
 }
 
+/// Fetch a pull request's head into a local branch, run from `base_cwd` (any worktree
+/// of the repo). Returns the branch name, which the caller then spawns a worktree on
+/// exactly as it would any other existing branch.
+///
+/// The remote is the one that actually points at the PR's `owner/repo`, not blindly
+/// `origin`: in a fork checkout the PR usually belongs to `upstream`, and fetching
+/// `refs/pull/N/head` from the wrong remote would quietly produce someone else's PR N.
+/// The `#N` form names no repo and so means `origin` by definition. Errors carry git's
+/// stderr.
+pub fn fetch_pr(base_cwd: &str, pr: &crate::pr::PrRef) -> std::io::Result<String> {
+    let remote = match &pr.repo {
+        None => "origin".to_string(),
+        Some((owner, repo)) => remote_for_repo(base_cwd, owner, repo)
+            .ok_or_else(|| std::io::Error::other(format!("no remote points at {owner}/{repo}")))?,
+    };
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base_cwd)
+        .args(["fetch", &remote, &pr.refspec()])
+        .output()?;
+    if out.status.success() {
+        Ok(pr.branch())
+    } else {
+        Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// The remote whose URL points at `owner/repo`, preferring `origin` when several do.
+fn remote_for_repo(cwd: &str, owner: &str, repo: &str) -> Option<String> {
+    pick_remote(&git(cwd, &["remote", "-v"])?, owner, repo)
+}
+
+/// Pure half of `remote_for_repo`: pick a remote out of `git remote -v` output.
+///
+/// Matches both URL forms git writes (`https://host/owner/repo.git` and the scp-like
+/// `git@host:owner/repo.git`) by comparing the last two path segments, and compares
+/// case-insensitively because GitHub owner/repo names are.
+fn pick_remote(remotes: &str, owner: &str, repo: &str) -> Option<String> {
+    let want = format!("{owner}/{repo}").to_lowercase();
+    let mut first = None;
+    for line in remotes.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(url)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if repo_path_of(url) != want {
+            continue;
+        }
+        if name == "origin" {
+            return Some(name.to_string());
+        }
+        first.get_or_insert_with(|| name.to_string());
+    }
+    first
+}
+
+/// The `owner/repo` a remote URL ends in, lowercased — `""` when it has no such shape.
+fn repo_path_of(url: &str) -> String {
+    let trimmed = url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    // The scp-like form has no `//`, so splitting on both separators normalizes
+    // `git@host:owner/repo` and `https://host/owner/repo` to the same segments.
+    let segs: Vec<&str> = trimmed
+        .split(['/', ':'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    match segs.as_slice() {
+        [.., owner, repo] => format!("{owner}/{repo}").to_lowercase(),
+        _ => String::new(),
+    }
+}
+
 /// One-shot, uncached cwd → worktree resolution, for user-initiated actions that
 /// happen outside the cached fetch pipeline (e.g. anchoring a spawn on the popup's
 /// own cwd). Prefer `WorktreeCache::resolve` on any recurring path.
@@ -606,6 +682,55 @@ mod tests {
             Some("fresh")
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn picks_the_remote_that_owns_the_pr_not_just_origin() {
+        // The fork case the whole lookup exists for: `origin` is your fork, the PR
+        // lives on `upstream`. Fetching refs/pull/N from origin would hand you a
+        // different PR (or none), so the owner/repo must decide the remote.
+        let remotes = "\
+origin\thttps://github.com/hassaanakram/hydra.git (fetch)
+origin\thttps://github.com/hassaanakram/hydra.git (push)
+upstream\tgit@github.com:guimochila/hydra.git (fetch)
+upstream\tgit@github.com:guimochila/hydra.git (push)";
+        assert_eq!(
+            pick_remote(remotes, "guimochila", "hydra").as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(
+            pick_remote(remotes, "hassaanakram", "hydra").as_deref(),
+            Some("origin")
+        );
+        assert_eq!(pick_remote(remotes, "someone", "else"), None);
+    }
+
+    #[test]
+    fn remote_matching_spans_url_forms_and_case() {
+        for url in [
+            "https://github.com/guimochila/hydra.git",
+            "https://github.com/guimochila/hydra",
+            "git@github.com:guimochila/hydra.git",
+            "ssh://git@github.com/guimochila/hydra.git",
+            "https://github.com/GuiMochila/Hydra.git",
+        ] {
+            assert_eq!(
+                pick_remote(&format!("origin\t{url} (fetch)"), "guimochila", "hydra").as_deref(),
+                Some("origin"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_wins_when_several_remotes_match() {
+        let remotes = "\
+mirror\thttps://github.com/guimochila/hydra.git (fetch)
+origin\thttps://github.com/guimochila/hydra.git (fetch)";
+        assert_eq!(
+            pick_remote(remotes, "guimochila", "hydra").as_deref(),
+            Some("origin")
+        );
     }
 
     #[test]

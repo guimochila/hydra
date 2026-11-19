@@ -66,6 +66,13 @@ Module map (`src/`):
   shell-quoted default branch and runs the command once (`exec`'d when simple, so the
   window closes when the tool quits), or in a `while :` restart loop when the entry sets
   `restart = true`; always via `/bin/sh -c` (never the user's shell — it may be fish).
+- `pr.rs` — pure parsing of a GitHub PR reference out of `n`'s input (`PrRef`,
+  `parse_pr_ref`), plus the branch name and refspec it implies. Host-agnostic (the
+  `…/<owner>/<repo>/pull/<n>` path shape is the test, so Enterprise URLs work) and
+  shells out to nothing. The refspec is deliberately **unforced** — a force-pushed PR
+  must fail loudly rather than rewrite a local branch — and the branch is `pr-<n>`
+  because `refs/pull/<n>/head` doesn't carry the head branch's name and looking it up
+  would mean a GitHub API call (and a `gh` dependency) just for a label.
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
   (including `attention`, the Notification's "why input is needed" message). No tmux
@@ -85,7 +92,10 @@ Module map (`src/`):
   `list_worktrees` (throttled `git worktree list` for idle-worktree discovery; carries
   the repo's `default_branch`), `BranchStateCache` + `branch_state`/`BranchState`
   (throttled classification vs the default branch — see "Branch state badge" below),
-  `preview` (git log + status for the idle-worktree preview), the
+  `fetch_pr` (PR head → local branch; the remote comes from the URL's `owner/repo` via
+  the pure `pick_remote`, never a blind `origin` — in a fork checkout the PR lives on
+  `upstream`, and fetching `refs/pull/N/head` from the wrong remote would silently
+  yield a different PR), `preview` (git log + status for the idle-worktree preview), the
   `Caches` bundle (with `invalidate()` to force a re-read after a mutation), and
   `default_branch`/`create_worktree`/`remove_worktree`/`is_dirty` for spawn+remove.
   `create_worktree` reuses an existing branch (no `-b`) instead of failing on it. Repo
@@ -106,7 +116,10 @@ Module map (`src/`):
   merged/no-commits/↑↓ badge), `a`/`d`/`1`-`9` prompt replies (NEEDS_INPUT gated + state-file re-checked at
   send time), `I` interrupt of a WORKING agent (confirm + same state-file re-check,
   sends Escape), `n` spawn takes `name[: prompt]` — the prompt is shell-quoted into
-  the agent command as its first task, `x` to remove a worktree (confirm,
+  the agent command as its first task — or a PR reference (`parse_spawn_input` tries
+  `pr::parse_pr_ref` BEFORE the `:` split, since a pasted URL carries a `:` of its own
+  and splitting first would spawn a branch called `https`); a PR is fetched to a local
+  branch and then spawns through the ordinary existing-branch path, `x` to remove a worktree (confirm,
   kills every window rooted in the worktree via `agent::windows_under_path` — mode-
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
   branch), `X` to close a worktree's windows/session but keep the worktree (confirm;
