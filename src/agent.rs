@@ -512,6 +512,40 @@ pub fn windows_to_kill(
     out
 }
 
+/// Why closing a worktree's windows (`X`, close without removing) was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseRefusal {
+    /// No tmux window is rooted in the worktree — there is nothing to close.
+    NothingOpen,
+    /// One of the windows hosts Hydra's own pane; closing it would kill Hydra itself.
+    HostsSelf,
+}
+
+/// The windows a close (`X`) tears down: the same set as a removal (`windows_to_kill`,
+/// so session mode loses the whole dedicated session), but the worktree itself is kept.
+///
+/// `self_pane` is Hydra's own pane id (`$TMUX_PANE`, when Hydra runs in a pane rather
+/// than a popup): if any window to close contains it, the close is refused rather than
+/// killing Hydra out from under itself. An empty set is `NothingOpen`, so the UI can say
+/// so instead of asking to confirm a no-op.
+pub fn windows_to_close(
+    panes: &[Pane],
+    path: &str,
+    own: Option<(String, u32)>,
+    self_pane: Option<&str>,
+) -> Result<Vec<(String, u32)>, CloseRefusal> {
+    let wins = windows_to_kill(panes, path, own);
+    if wins.is_empty() {
+        return Err(CloseRefusal::NothingOpen);
+    }
+    if let Some(me) = self_pane.and_then(|id| panes.iter().find(|p| p.pane_id == id)) {
+        if wins.contains(&(me.session_name.clone(), me.window_index)) {
+            return Err(CloseRefusal::HostsSelf);
+        }
+    }
+    Ok(wins)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,5 +1072,58 @@ mod tests {
             windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 2))),
             vec![("repo-feat".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn windows_to_close_returns_every_rooted_window_top_first() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"), // shell
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"), // extra window (diff)
+            kill_pane("%3", "repo-feat", 3, "/root/wt-a"), // agent
+            kill_pane("%4", "other", 1, "/elsewhere"),
+        ];
+        assert_eq!(
+            windows_to_close(&panes, "/root/wt-a", None, None),
+            Ok(vec![
+                ("repo-feat".to_string(), 3),
+                ("repo-feat".to_string(), 2),
+                ("repo-feat".to_string(), 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn windows_to_close_reports_nothing_open() {
+        let panes = vec![kill_pane("%1", "other", 1, "/elsewhere")];
+        assert_eq!(
+            windows_to_close(&panes, "/root/wt-a", None, None),
+            Err(CloseRefusal::NothingOpen)
+        );
+    }
+
+    #[test]
+    fn windows_to_close_includes_a_live_agents_own_window() {
+        let got = windows_to_close(&[], "/root/wt-a", Some(("repo-feat".into(), 4)), None);
+        assert_eq!(got, Ok(vec![("repo-feat".to_string(), 4)]));
+    }
+
+    #[test]
+    fn windows_to_close_refuses_to_kill_hydras_own_window() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            // Hydra itself runs in a pane of window 2 (cwd elsewhere, same window).
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"),
+            kill_pane("%9", "repo-feat", 2, "/tmp"),
+        ];
+        assert_eq!(
+            windows_to_close(&panes, "/root/wt-a", None, Some("%9")),
+            Err(CloseRefusal::HostsSelf)
+        );
+        // Hydra's pane in an unrelated window doesn't block the close.
+        let panes2 = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            kill_pane("%9", "home", 1, "/tmp"),
+        ];
+        assert!(windows_to_close(&panes2, "/root/wt-a", None, Some("%9")).is_ok());
     }
 }

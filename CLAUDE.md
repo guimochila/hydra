@@ -109,7 +109,10 @@ Module map (`src/`):
   the agent command as its first task, `x` to remove a worktree (confirm,
   kills every window rooted in the worktree via `agent::windows_under_path` — mode-
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
-  branch), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
+  branch), `X` to close a worktree's windows/session but keep the worktree (confirm;
+  same window set via the shared `kill_windows` + `agent::windows_to_close`, which
+  refuses an empty set or one containing Hydra's own `$TMUX_PANE`; also refuses Hydra's
+  own cwd, but allows the main worktree), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
   (agent screen or idle-worktree git summary). The header scope label AND the preview
   text come from the snapshot (`scope_label` / `preview`) — the UI thread does no
   git/tmux work at all; it only tells the worker which `PreviewTarget` is selected.

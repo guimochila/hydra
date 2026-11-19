@@ -108,8 +108,39 @@ enum Mode {
     Send,
     /// Editing the name/branch for a new agent to spawn.
     Spawn,
-    /// Awaiting y/N confirmation of a worktree removal.
+    /// Awaiting y/N confirmation of a worktree removal, a close, or an interrupt.
     Confirm,
+}
+
+/// The selected row resolved to the worktree it lives in — the part a removal (`x`) and
+/// a close (`X`) share: which directory, and which tmux windows are rooted in it.
+#[derive(Debug)]
+struct SelectedWorktree {
+    /// Worktree root path.
+    path: String,
+    /// Branch label (directory basename for a detached worktree), for prompts.
+    label: String,
+    /// The repo's main worktree dir (`repo_key` minus `/.git`).
+    base_cwd: String,
+    /// The socket its windows live on: the agent's own when there is one, else the
+    /// popup's. `None` only outside tmux, where there is nothing to tear down.
+    socket: Option<String>,
+    /// A running agent's own (session, window) — killed even when its pane cwd no longer
+    /// matches the worktree.
+    agent: Option<(String, u32)>,
+}
+
+/// A pending close (`X`): kill every window rooted in the worktree, keep the worktree.
+#[derive(Debug)]
+struct CloseTarget {
+    /// Worktree path whose windows are closed (and which stays on disk).
+    path: String,
+    /// Branch label, for the prompt.
+    label: String,
+    socket: String,
+    agent: Option<(String, u32)>,
+    /// How many windows the close would kill when it was confirmed-for, for the prompt.
+    windows: usize,
 }
 
 /// A pending worktree removal, awaiting confirmation.
@@ -200,6 +231,7 @@ const KEYBAR: &[(&str, &str)] = &[
     ("i", "send"),
     ("n", "new"),
     ("x", "remove"),
+    ("X", "close"),
     ("I", "interrupt"),
     ("⇥", "next⚠"),
     ("/", "filter"),
@@ -274,6 +306,10 @@ struct App {
     selected_key: Option<String>,
     /// A worktree removal awaiting y/N confirmation.
     pending_remove: Option<RemoveTarget>,
+    /// A close (kill the worktree's windows, keep the worktree) awaiting confirmation.
+    pending_close: Option<CloseTarget>,
+    /// Test seam for the pane listing a close plans against; `None` = `tmux::list_panes`.
+    list_panes_fn: Option<fn(&str) -> Vec<tmux::Pane>>,
     /// An interrupt of a working agent awaiting y/N confirmation:
     /// (socket, pane_id, window_index).
     pending_interrupt: Option<(String, String, u32)>,
@@ -572,6 +608,7 @@ impl App {
             }
             KeyCode::Tab => self.select_next_needs_input(),
             KeyCode::Char('x') => self.begin_remove(),
+            KeyCode::Char('X') => self.begin_close(),
             KeyCode::Char('I') => self.begin_interrupt(),
             // Interaction (Phase 3): approve/deny a pending prompt, or compose a message.
             KeyCode::Char('a') => self.respond(Response::Approve),
@@ -963,11 +1000,10 @@ impl App {
         }
     }
 
-    /// Build a `RemoveTarget` from the current selection, or an error explaining why the
-    /// selection can't be removed (main worktree, Hydra's own cwd, or not a worktree).
-    fn remove_target(&self) -> Result<RemoveTarget, String> {
-        let (path, branch, repo_key, socket, agent, dirty) = if let Some(a) = self.selected_agent()
-        {
+    /// Resolve the selected row (agent or idle worktree) to its worktree and the tmux
+    /// windows it can own. Shared by removal and close.
+    fn selected_worktree_ref(&self) -> Result<SelectedWorktree, String> {
+        let (path, label, repo_key, socket, agent) = if let Some(a) = self.selected_agent() {
             let wt = a
                 .worktree
                 .as_ref()
@@ -980,7 +1016,6 @@ impl App {
                 wt.repo_key.clone(),
                 Some(a.state.socket.clone()),
                 Some((a.pane.session_name.clone(), a.pane.window_index)),
-                a.dirty > 0,
             )
         } else if let Some(w) = self.selected_worktree() {
             (
@@ -991,33 +1026,133 @@ impl App {
                 // leftover windows (session mode's shell + agent) live on this server.
                 tmux::current_socket(),
                 None,
-                crate::worktree::is_dirty(&w.path),
             )
         } else {
             return Err("nothing selected".into());
         };
-
         let base_cwd = repo_key
             .strip_suffix("/.git")
             .unwrap_or(&repo_key)
             .to_string();
-        let canon_path = canon(&path);
-        if canon_path == canon(&base_cwd) {
-            return Err("can't remove the main worktree".into());
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            if canon_path == canon(&cwd.to_string_lossy()) {
-                return Err("can't remove the worktree Hydra is running in".into());
-            }
-        }
-        Ok(RemoveTarget {
+        Ok(SelectedWorktree {
             path,
-            branch,
+            label,
             base_cwd,
             socket,
             agent,
+        })
+    }
+
+    /// Build a `RemoveTarget` from the current selection, or an error explaining why the
+    /// selection can't be removed (main worktree, Hydra's own cwd, or not a worktree).
+    fn remove_target(&self) -> Result<RemoveTarget, String> {
+        let sel = self.selected_worktree_ref()?;
+        let canon_path = canon(&sel.path);
+        if canon_path == canon(&sel.base_cwd) {
+            return Err("can't remove the main worktree".into());
+        }
+        if is_hydras_cwd(&sel.path) {
+            return Err("can't remove the worktree Hydra is running in".into());
+        }
+        let dirty = match self.selected_agent() {
+            Some(a) => a.dirty > 0,
+            None => crate::worktree::is_dirty(&sel.path),
+        };
+        Ok(RemoveTarget {
+            path: sel.path,
+            branch: sel.label,
+            base_cwd: sel.base_cwd,
+            socket: sel.socket,
+            agent: sel.agent,
             dirty,
         })
+    }
+
+    /// Panes on `socket`, through the test seam when one is set.
+    fn panes_on(&self, socket: &str) -> Vec<tmux::Pane> {
+        match self.list_panes_fn {
+            Some(f) => f(socket),
+            None => tmux::list_panes(socket),
+        }
+    }
+
+    /// Plan a close of the selection's windows against the live panes, or explain why
+    /// it can't happen (Hydra's own cwd/pane, nothing open). The main worktree is fine:
+    /// removal refuses it only because git can't remove it, and close keeps it anyway.
+    fn close_target(&self) -> Result<CloseTarget, String> {
+        let sel = self.selected_worktree_ref()?;
+        if is_hydras_cwd(&sel.path) {
+            return Err("can't close the worktree Hydra is running in".into());
+        }
+        let nothing_open = || format!("no open windows for {}", sel.label);
+        let Some(socket) = sel.socket.clone() else {
+            return Err(nothing_open());
+        };
+        let panes = self.panes_on(&socket);
+        let self_pane = std::env::var("TMUX_PANE").ok();
+        let wins =
+            agent::windows_to_close(&panes, &sel.path, sel.agent.clone(), self_pane.as_deref())
+                .map_err(|r| match r {
+                    agent::CloseRefusal::NothingOpen => nothing_open(),
+                    agent::CloseRefusal::HostsSelf => {
+                        "can't close the window Hydra is running in".to_string()
+                    }
+                })?;
+        Ok(CloseTarget {
+            path: sel.path,
+            label: sel.label,
+            socket,
+            agent: sel.agent,
+            windows: wins.len(),
+        })
+    }
+
+    /// Begin closing the selected worktree's windows/session (worktree kept): enter
+    /// confirm mode, or show why there's nothing to close.
+    fn begin_close(&mut self) {
+        match self.close_target() {
+            Ok(target) => {
+                self.pending_close = Some(target);
+                self.mode = Mode::Confirm;
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// Perform the confirmed close: re-plan against the panes as they are *now* (indices
+    /// may have shifted since the prompt), kill them top-down, and keep the worktree. The
+    /// row comes back as an idle worktree on the next (invalidated) snapshot; selection
+    /// follows it there by path.
+    fn do_close(&mut self) -> Action {
+        self.mode = Mode::Normal;
+        let Some(t) = self.pending_close.take() else {
+            return Action::None;
+        };
+        let panes = self.panes_on(&t.socket);
+        let self_pane = std::env::var("TMUX_PANE").ok();
+        let wins = match agent::windows_to_close(&panes, &t.path, t.agent, self_pane.as_deref()) {
+            Ok(w) => w,
+            Err(agent::CloseRefusal::NothingOpen) => {
+                self.message = Some(format!("no open windows for {}", t.label));
+                return Action::Refresh { invalidate: true };
+            }
+            Err(agent::CloseRefusal::HostsSelf) => {
+                self.message = Some("can't close the window Hydra is running in".into());
+                return Action::None;
+            }
+        };
+        if let Err(e) = kill_windows(&t.socket, &wins) {
+            self.message = Some(e);
+            return Action::Refresh { invalidate: true };
+        }
+        self.message = Some(format!(
+            "✓ closed {} ({} window{}) · worktree kept",
+            t.label,
+            wins.len(),
+            if wins.len() == 1 { "" } else { "s" }
+        ));
+        self.selected_key = Some(t.path);
+        Action::Refresh { invalidate: true }
     }
 
     fn handle_confirm_key(&mut self, code: KeyCode) -> Action {
@@ -1025,12 +1160,15 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if self.pending_interrupt.is_some() {
                     self.do_interrupt()
+                } else if self.pending_close.is_some() {
+                    self.do_close()
                 } else {
                     self.do_remove()
                 }
             }
             _ => {
                 self.pending_remove = None;
+                self.pending_close = None;
                 self.pending_interrupt = None;
                 self.mode = Mode::Normal;
                 Action::None
@@ -1097,13 +1235,10 @@ impl App {
         // session. Window mode: only the agent window is rooted here, as before.
         if let Some(socket) = &target.socket {
             let panes = crate::tmux::list_panes(socket);
-            for (session, window) in
-                crate::agent::windows_to_kill(&panes, &target.path, target.agent.clone())
-            {
-                if let Err(e) = crate::tmux::kill_window(socket, &session, window) {
-                    self.message = Some(format!("kill window failed: {e}"));
-                    return Action::None;
-                }
+            let wins = crate::agent::windows_to_kill(&panes, &target.path, target.agent.clone());
+            if let Err(e) = kill_windows(socket, &wins) {
+                self.message = Some(e);
+                return Action::None;
             }
         }
         match crate::worktree::remove_worktree(&target.base_cwd, &target.path, target.dirty) {
@@ -1325,6 +1460,24 @@ impl App {
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(" sends Esc, stopping its current turn").dim(),
+                    ]
+                } else if let Some(t) = &self.pending_close {
+                    vec![
+                        Span::styled(
+                            format!(" close {}'s windows/session?", t.label),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            " kills {} window{}{} · worktree is kept",
+                            t.windows,
+                            if t.windows == 1 { "" } else { "s" },
+                            if t.agent.is_some() {
+                                " incl. its agent"
+                            } else {
+                                ""
+                            },
+                        ))
+                        .dim(),
                     ]
                 } else {
                     let mut spans = vec![Span::styled(
@@ -1606,6 +1759,23 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
         return dirs::home_dir().unwrap_or_default().join(rest);
     }
     std::path::PathBuf::from(path)
+}
+
+/// Kill `windows` on `socket` in the given order (callers pass `agent::windows_to_kill`
+/// order: highest index first, so `renumber-windows` can't shift the ones still to go).
+/// Shared by remove (`x`) and close (`X`).
+fn kill_windows(socket: &str, windows: &[(String, u32)]) -> Result<(), String> {
+    for (session, window) in windows {
+        tmux::kill_window(socket, session, *window)
+            .map_err(|e| format!("kill window failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Whether `path` is the worktree Hydra itself is running in (its cwd) — tearing that
+/// down would pull the directory (or the windows) out from under the popup.
+fn is_hydras_cwd(path: &str) -> bool {
+    std::env::current_dir().is_ok_and(|cwd| canon(path) == canon(&cwd.to_string_lossy()))
 }
 
 /// Canonicalize a path for comparison (resolves `..`/symlinks); input on failure.
@@ -2073,6 +2243,138 @@ mod tests {
             text.contains("kills every tmux window in it"),
             "the teardown is disclosed for an agent-less worktree too: {text}"
         );
+    }
+
+    /// Render `app` into a test buffer and return the flattened text.
+    fn rendered(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// A session-mode session for `/wt/feat`: shell, diff extra window, agent.
+    fn session_panes(_socket: &str) -> Vec<Pane> {
+        let mk = |id: &str, win: u32| Pane {
+            pane_id: id.into(),
+            session_name: "repo-feat".into(),
+            window_index: win,
+            window_name: "w".into(),
+            cwd: "/wt/feat".into(),
+            window_active: false,
+            pane_tty: "/dev/ttys000".into(),
+        };
+        vec![mk("%10", 1), mk("%11", 2), mk("%12", 3)]
+    }
+
+    fn no_panes(_socket: &str) -> Vec<Pane> {
+        Vec::new()
+    }
+
+    #[test]
+    fn close_on_an_agent_row_enters_confirm_with_the_close_prompt_and_n_cancels() {
+        let mut app = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                3,
+                Some(("/repo/main/.git", "main-repo", "feat", "/wt/feat")),
+            )],
+            vec![],
+        );
+        app.list_panes_fn = Some(no_panes);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode == Mode::Confirm && app.pending_close.is_some());
+        assert!(app.pending_remove.is_none(), "close is not a removal");
+        let text = rendered(&mut app, 100, 24);
+        assert!(
+            text.contains("close feat's windows/session?"),
+            "close prompt rendered: {text}"
+        );
+        assert!(text.contains("worktree is kept"), "{text}");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Normal && app.pending_close.is_none());
+    }
+
+    #[test]
+    fn close_on_an_idle_worktree_counts_its_session_windows() {
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        app.list_panes_fn = Some(session_panes);
+        let Ok(t) = app.close_target() else {
+            // Outside tmux there's no popup socket to look windows up on.
+            assert!(crate::tmux::current_socket().is_none());
+            return;
+        };
+        assert_eq!(t.windows, 3);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode == Mode::Confirm && app.pending_close.is_some());
+        let text = rendered(&mut app, 100, 24);
+        assert!(
+            text.contains("kills 3 windows · worktree is kept"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn close_with_nothing_open_shows_a_message_instead_of_confirming() {
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        app.list_panes_fn = Some(no_panes);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode == Mode::Normal && app.pending_close.is_none());
+        assert_eq!(app.message.as_deref(), Some("no open windows for feat"));
+    }
+
+    #[test]
+    fn close_allows_the_main_worktree_but_not_hydras_own_cwd() {
+        let main = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/repo/main/.git", "main-repo", "main", "/repo/main")),
+            )],
+            vec![],
+        );
+        let mut main = main;
+        main.list_panes_fn = Some(no_panes);
+        assert!(
+            main.close_target().is_ok(),
+            "closing main's windows is fine"
+        );
+
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let mut own = app_with(
+            vec![agent(
+                "%1",
+                Status::Idle,
+                1,
+                Some(("/elsewhere/.git", "other", "b", cwd.as_str())),
+            )],
+            vec![],
+        );
+        own.list_panes_fn = Some(no_panes);
+        assert_eq!(
+            own.close_target().unwrap_err(),
+            "can't close the worktree Hydra is running in"
+        );
+    }
+
+    #[test]
+    fn footer_shows_the_close_key() {
+        let mut app = app_with(vec![], vec![]);
+        let text = rendered(&mut app, 200, 10);
+        assert!(text.contains("X close"), "{text}");
     }
 
     #[test]

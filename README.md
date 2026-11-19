@@ -136,6 +136,7 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `n` | spawn a new agent: worktree + tmux window running `claude` (`name: prompt` gives it its first task) |
 | `c` | resume the selected idle worktree's last conversation (`claude --continue`) |
 | `x` | remove the selected worktree (confirm with `y`) |
+| `X` | close the selected worktree's tmux windows/session but keep the worktree (confirm with `y`) |
 | `p` | toggle the preview pane |
 | `s` | toggle scope: this repo (across all sessions) ⟷ every session on this tmux server |
 | `/` | filter (branch / repo / summary / window) |
@@ -176,6 +177,16 @@ Linux/BSD). Set `HYDRA_ALERTS=0` to disable.
 worktree has a running agent, its tmux window is killed first. Uncommitted changes are
 surfaced in the prompt and require confirming a forced removal. The **branch is kept**
 (`git worktree remove` only) and the main/current worktree can't be removed.
+
+### Closing without removing
+
+`X` closes the selected row's tmux windows — every window rooted in the worktree, so in
+`spawn_mode = "session"` the whole dedicated session (shell, extra windows, agent) goes —
+after a `y/N` confirm, and **keeps the worktree and branch on disk**. The row then shows
+up as an idle worktree, ready for `Enter`/`c` later. It works on agent and idle-worktree
+rows alike (including the main worktree); if nothing is open for that worktree Hydra
+says so instead of asking. It refuses to close the worktree Hydra is running in or the
+window hosting Hydra's own pane.
 
 ### Spawning agents
 
