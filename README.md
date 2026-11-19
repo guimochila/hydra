@@ -275,10 +275,10 @@ command = "revdiff --no-confirm-reload {base}"
 
 That gives each worktree session three windows: shell (1), diff (2), agent (3). `{base}`
 expands to the repo's default branch, so the diff covers everything the branch changed,
-committed or not. Each command runs under `/bin/sh` (not your login shell) in a restart
-loop: quitting the tool relaunches it with fresh state instead of closing the window,
-and `Ctrl-C` exits the loop. Entries are created in order; one with an empty `command`
-is skipped.
+committed or not. Each command runs once under `/bin/sh` (not your login shell):
+quitting the tool closes its window. Set `restart = true` on an entry to relaunch the
+tool with fresh state whenever it exits instead (a restart loop; `Ctrl-C` exits it).
+Entries are created in order; one with an empty `command` is skipped.
 
 ## How it works
 

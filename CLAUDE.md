@@ -63,8 +63,9 @@ Module map (`src/`):
   current session, and starts the popup in all-sessions view so those sessions are
   visible. `agent.extra_windows` (`ExtraWindow`, session mode only) inserts windows
   between shell and agent; `ExtraWindow::script` (pure, tested) expands `{base}` to the
-  shell-quoted default branch and wraps the command in a `while :` restart loop, exec'd
-  as `/bin/sh -c` (never the user's shell — it may be fish).
+  shell-quoted default branch and runs the command once (`exec`'d when simple, so the
+  window closes when the tool quits), or in a `while :` restart loop when the entry sets
+  `restart = true`; always via `/bin/sh -c` (never the user's shell — it may be fish).
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
   (including `attention`, the Notification's "why input is needed" message). No tmux

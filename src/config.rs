@@ -68,6 +68,9 @@ pub struct ExtraWindow {
     pub name: String,
     /// POSIX `sh` command line. `{base}` expands to the repo's default branch (shell-quoted).
     pub command: String,
+    /// Relaunch the command whenever it exits (quit = fresh restart) instead of closing
+    /// the window. Default `false`: quitting the tool closes its window.
+    pub restart: bool,
 }
 
 impl Agent {
@@ -91,11 +94,17 @@ impl ExtraWindow {
     }
 
     /// The `sh -c` script this window runs, or `None` when `command` is empty. `{base}`
-    /// expands to the single-quoted `base`, and the command runs in a restart loop:
-    /// quitting the tool (e.g. `q` in revdiff) relaunches it with fresh state instead of
-    /// closing the window. The `sleep` keeps a command that fails at once (not
-    /// installed, bad flag) from spinning a hot loop. It always runs under `/bin/sh`
-    /// (exec'd directly, not the user's shell), so the loop syntax works under fish too.
+    /// expands to the single-quoted `base`. It always runs under `/bin/sh` (exec'd
+    /// directly, not the user's shell — which may be fish), so POSIX syntax works.
+    ///
+    /// By default the command runs once: quitting the tool (e.g. `q` in revdiff) ends
+    /// the window's only process, so tmux closes the window. A simple command is
+    /// `exec`'d so no stray `sh` lingers; a compound one (`;`, `&&`, pipes, ...) runs
+    /// as-is, since `exec` would cut it short after its first part.
+    ///
+    /// With `restart = true` it runs in a restart loop instead: quitting relaunches it
+    /// with fresh state. The `sleep` keeps a command that fails at once (not installed,
+    /// bad flag) from spinning a hot loop.
     pub fn script(&self, base: &str) -> Option<String> {
         let cmd = self.command.trim();
         if cmd.is_empty() {
@@ -103,8 +112,29 @@ impl ExtraWindow {
         }
         let quoted = format!("'{}'", base.replace('\'', r"'\''"));
         let cmd = cmd.replace("{base}", &quoted);
-        Some(format!("while :; do {cmd}; sleep 1; done"))
+        Some(if self.restart {
+            format!("while :; do {cmd}; sleep 1; done")
+        } else if is_compound(&cmd) {
+            cmd
+        } else {
+            format!("exec {cmd}")
+        })
     }
+}
+
+/// Whether `cmd` uses shell control syntax (lists, pipes, subshells, keywords, env
+/// assignments) such that prefixing `exec` would change its meaning.
+/// Conservative: anything that merely *might* be compound counts as compound, which
+/// only costs a lingering `sh` — never a wrong result.
+fn is_compound(cmd: &str) -> bool {
+    const KEYWORDS: [&str; 9] = [
+        "if", "for", "while", "until", "case", "exec", "{", "!", "time",
+    ];
+    cmd.contains([';', '&', '|', '\n', '(', ')', '`'])
+        || cmd
+            .split_whitespace()
+            .next()
+            .is_some_and(|first| KEYWORDS.contains(&first) || first.contains('='))
 }
 
 impl Default for Agent {
@@ -599,10 +629,69 @@ mod tests {
     }
 
     #[test]
-    fn extra_window_script_loops_and_quotes_base() {
+    fn extra_window_script_runs_once_by_default_and_quotes_base() {
         let w = ExtraWindow {
             name: "diff".into(),
             command: "revdiff --no-confirm-reload {base}".into(),
+            restart: false,
+        };
+        // Quitting the tool ends the window's only process, so tmux closes the window.
+        assert_eq!(
+            w.script("main").unwrap(),
+            "exec revdiff --no-confirm-reload 'main'"
+        );
+        // A quote in the branch can't break out of the single-quoted argument.
+        assert_eq!(
+            w.script("a'b").unwrap(),
+            r"exec revdiff --no-confirm-reload 'a'\''b'"
+        );
+    }
+
+    #[test]
+    fn extra_window_compound_command_is_not_execd() {
+        for cmd in [
+            "cd sub && revdiff",
+            "make; sleep 5",
+            "git log | less",
+            "FOO=1 revdiff",
+            "if true; then revdiff; fi",
+            "exec revdiff",
+        ] {
+            let w = ExtraWindow {
+                command: cmd.into(),
+                ..Default::default()
+            };
+            assert_eq!(w.script("main").unwrap(), cmd, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn extra_window_restart_parses_and_defaults_off() {
+        let cfg = Config::parse(
+            "[[agent.extra_windows]]\nname = \"diff\"\ncommand = \"revdiff {base}\"\n\
+             [[agent.extra_windows]]\nname = \"logs\"\ncommand = \"tail -f log\"\nrestart = true\n",
+        );
+        let w = &cfg.agent.extra_windows;
+        assert!(!w[0].restart, "old configs without `restart` keep parsing");
+        assert!(w[1].restart);
+        assert_eq!(
+            cfg.agent.extra_scripts("main"),
+            [
+                ("diff".to_string(), "exec revdiff 'main'".to_string()),
+                (
+                    "logs".to_string(),
+                    "while :; do tail -f log; sleep 1; done".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_window_script_restart_loops_and_quotes_base() {
+        let w = ExtraWindow {
+            name: "diff".into(),
+            command: "revdiff --no-confirm-reload {base}".into(),
+            restart: true,
         };
         assert_eq!(
             w.script("main").unwrap(),
