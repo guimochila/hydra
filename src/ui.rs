@@ -9,7 +9,7 @@
 //! Rows are either a repo header or an agent; navigation skips headers, and selection
 //! is tracked by pane id so it sticks to the same agent as the list reorders.
 
-use crate::agent::{self, Agent};
+use crate::agent::{self, session_name, Agent};
 use crate::fetcher::PreviewTarget;
 use crate::state::Status;
 use crate::tmux;
@@ -111,6 +111,9 @@ enum Mode {
     /// Awaiting y/N confirmation of a worktree removal, a close, or an interrupt.
     Confirm,
 }
+
+/// `tmux::kill_window`'s shape (socket, session, window index), for the test seam.
+type KillWindowFn = fn(&str, &str, u32) -> std::io::Result<()>;
 
 /// The selected row resolved to the worktree it lives in — the part a removal (`x`) and
 /// a close (`X`) share: which directory, and which tmux windows are rooted in it.
@@ -310,6 +313,14 @@ struct App {
     pending_close: Option<CloseTarget>,
     /// Test seam for the pane listing a close plans against; `None` = `tmux::list_panes`.
     list_panes_fn: Option<fn(&str) -> Vec<tmux::Pane>>,
+    /// Test seam for the popup's socket; `None` = `tmux::current_socket`.
+    current_socket_fn: Option<fn() -> Option<String>>,
+    /// Test seam for the session the popup's client is attached to on a socket;
+    /// `None` = `tmux::current_session`.
+    client_session_fn: Option<fn(&str) -> Option<String>>,
+    /// Test seam for killing one window (socket, session, index); `None` =
+    /// `tmux::kill_window`.
+    kill_window_fn: Option<KillWindowFn>,
     /// An interrupt of a working agent awaiting y/N confirmation:
     /// (socket, pane_id, window_index).
     pending_interrupt: Option<(String, String, u32)>,
@@ -1024,7 +1035,7 @@ impl App {
                 w.repo_key.clone(),
                 // No agent to self-report a socket, so use the popup's: an idle worktree's
                 // leftover windows (session mode's shell + agent) live on this server.
-                tmux::current_socket(),
+                self.popup_socket(),
                 None,
             )
         } else {
@@ -1076,28 +1087,81 @@ impl App {
         }
     }
 
+    /// The popup's own tmux socket, through the test seam when one is set.
+    fn popup_socket(&self) -> Option<String> {
+        match self.current_socket_fn {
+            Some(f) => f(),
+            None => tmux::current_socket(),
+        }
+    }
+
+    /// Kill `windows` on `socket` in the given order (callers pass `agent::windows_to_kill`
+    /// order: highest index first, so `renumber-windows` can't shift the ones still to
+    /// go). Shared by remove (`x`) and close (`X`).
+    fn kill_windows(&self, socket: &str, windows: &[(String, u32)]) -> Result<(), String> {
+        for (session, window) in windows {
+            match self.kill_window_fn {
+                Some(f) => f(socket, session, *window),
+                None => tmux::kill_window(socket, session, *window),
+            }
+            .map_err(|e| format!("kill window failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Plan a close of `path`'s windows on `socket` against the live panes (see
+    /// `agent::windows_to_close`). The guard is tmux membership, not cwd: the session the
+    /// popup's client is attached to (only knowable on the popup's own socket) must not
+    /// lose every window, and worktrees nested inside `path` keep theirs.
+    fn plan_close(
+        &self,
+        socket: &str,
+        path: &str,
+        own: Option<(String, u32)>,
+    ) -> Result<Vec<(String, u32)>, agent::CloseRefusal> {
+        let panes = self.panes_on(socket);
+        let self_pane = std::env::var("TMUX_PANE").ok();
+        let client_session = if self.popup_socket().as_deref() == Some(socket) {
+            match self.client_session_fn {
+                Some(f) => f(socket),
+                None => tmux::current_session(socket),
+            }
+        } else {
+            None
+        };
+        let other_roots: Vec<String> = self
+            .agents
+            .iter()
+            .filter_map(|a| a.worktree.as_ref().map(|w| w.root.clone()))
+            .chain(self.idle.iter().map(|w| w.path.clone()))
+            .collect();
+        agent::windows_to_close(
+            &panes,
+            path,
+            own,
+            agent::CloseGuard {
+                other_roots: &other_roots,
+                self_pane: self_pane.as_deref(),
+                client_session: client_session.as_deref(),
+            },
+        )
+    }
+
     /// Plan a close of the selection's windows against the live panes, or explain why
-    /// it can't happen (Hydra's own cwd/pane, nothing open). The main worktree is fine:
-    /// removal refuses it only because git can't remove it, and close keeps it anyway.
+    /// it can't happen (Hydra's own cwd/pane/session, nothing open). The main worktree is
+    /// fine: removal refuses it only because git can't remove it, and close keeps it
+    /// anyway (`plan_close` spares the worktrees nested inside it).
     fn close_target(&self) -> Result<CloseTarget, String> {
         let sel = self.selected_worktree_ref()?;
         if is_hydras_cwd(&sel.path) {
             return Err("can't close the worktree Hydra is running in".into());
         }
-        let nothing_open = || format!("no open windows for {}", sel.label);
         let Some(socket) = sel.socket.clone() else {
-            return Err(nothing_open());
+            return Err(agent::CloseRefusal::NothingOpen.message(&sel.label));
         };
-        let panes = self.panes_on(&socket);
-        let self_pane = std::env::var("TMUX_PANE").ok();
-        let wins =
-            agent::windows_to_close(&panes, &sel.path, sel.agent.clone(), self_pane.as_deref())
-                .map_err(|r| match r {
-                    agent::CloseRefusal::NothingOpen => nothing_open(),
-                    agent::CloseRefusal::HostsSelf => {
-                        "can't close the window Hydra is running in".to_string()
-                    }
-                })?;
+        let wins = self
+            .plan_close(&socket, &sel.path, sel.agent.clone())
+            .map_err(|r| r.message(&sel.label))?;
         Ok(CloseTarget {
             path: sel.path,
             label: sel.label,
@@ -1128,20 +1192,14 @@ impl App {
         let Some(t) = self.pending_close.take() else {
             return Action::None;
         };
-        let panes = self.panes_on(&t.socket);
-        let self_pane = std::env::var("TMUX_PANE").ok();
-        let wins = match agent::windows_to_close(&panes, &t.path, t.agent, self_pane.as_deref()) {
+        let wins = match self.plan_close(&t.socket, &t.path, t.agent) {
             Ok(w) => w,
-            Err(agent::CloseRefusal::NothingOpen) => {
-                self.message = Some(format!("no open windows for {}", t.label));
+            Err(r) => {
+                self.message = Some(r.message(&t.label));
                 return Action::Refresh { invalidate: true };
             }
-            Err(agent::CloseRefusal::HostsSelf) => {
-                self.message = Some("can't close the window Hydra is running in".into());
-                return Action::None;
-            }
         };
-        if let Err(e) = kill_windows(&t.socket, &wins) {
+        if let Err(e) = self.kill_windows(&t.socket, &wins) {
             self.message = Some(e);
             return Action::Refresh { invalidate: true };
         }
@@ -1236,7 +1294,7 @@ impl App {
         if let Some(socket) = &target.socket {
             let panes = crate::tmux::list_panes(socket);
             let wins = crate::agent::windows_to_kill(&panes, &target.path, target.agent.clone());
-            if let Err(e) = kill_windows(socket, &wins) {
+            if let Err(e) = self.kill_windows(socket, &wins) {
                 self.message = Some(e);
                 return Action::None;
             }
@@ -1334,30 +1392,25 @@ impl App {
         // The title carries the selection's full name (branch + differing folder), so a
         // name the list row had to truncate is always readable somewhere. Only the
         // preview pane's own width limits it.
-        let (prefix, name) = if let Some(a) = self.selected_agent() {
-            (
-                format!("preview · win {} · ", a.pane.window_index),
-                Some(agent::agent_name(a)),
-            )
-        } else if let Some(w) = self.selected_worktree() {
-            ("preview · ".to_string(), Some(agent::worktree_name(w)))
+        // A folder hint that doesn't fit beside the name moves to the bottom border.
+        let name = if let Some(a) = self.selected_agent() {
+            Some((Some(a.pane.window_index), agent::agent_name(a)))
         } else {
-            ("preview".to_string(), None)
+            self.selected_worktree()
+                .map(|w| (None, agent::worktree_name(w)))
         };
-        let room = (area.width as usize)
-            .saturating_sub(4) // borders + the title's padding spaces
-            .saturating_sub(prefix.chars().count());
-        let title = match name {
-            Some((label, hint)) => {
-                let (label, hint) = agent::fit_name(&label, hint.as_deref(), room);
-                format!(" {prefix}{label}{hint} ")
-            }
-            None => format!(" {prefix} "),
+        let room = (area.width as usize).saturating_sub(4); // borders + title padding
+        let (top, bottom) = match name {
+            Some((win, (label, hint))) => agent::preview_titles(win, &label, hint.as_deref(), room),
+            None => ("preview".to_string(), None),
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
-            .title(title)
+            .title(format!(" {top} "))
             .title_style(Style::default().add_modifier(Modifier::DIM));
+        if let Some(bottom) = bottom {
+            block = block.title_bottom(format!(" {bottom} "));
+        }
         // The text is fetched by the worker (`Overview::preview`); the UI never
         // shells out. While the snapshot's target lags the selection (just moved),
         // show a placeholder — the requested snapshot arrives within a tick.
@@ -1660,17 +1713,37 @@ fn worktree_row(
         }
         None => None,
     };
-    // Pad every badge to one width so the "start ⏎" column stays aligned across rows.
-    spans.push(match badge {
-        Some((text, color)) => {
-            Span::styled(format!("{text:<12}"), Style::default().fg(color).dim())
+    const START: &str = "start ⏎";
+    const BADGE_W: usize = 12;
+    let start_w = START.chars().count();
+    let start = |s: &'static str| Span::styled(s, Style::default().fg(colors.worktree_row));
+    if widths.detail >= BADGE_W + start_w {
+        // Pad every badge to one width so the "start ⏎" column stays aligned across rows.
+        spans.push(match badge {
+            Some((text, color)) => Span::styled(
+                format!("{text:<BADGE_W$}"),
+                Style::default().fg(color).dim(),
+            ),
+            None => Span::raw(" ".repeat(BADGE_W)),
+        });
+        spans.push(start(START));
+    } else {
+        // The name took the room (see `agent::row_widths`): keep the start affordance,
+        // and the badge only when both still fit.
+        if let Some((text, color)) = badge {
+            if text.chars().count() + 1 + start_w <= widths.detail {
+                spans.push(Span::styled(
+                    format!("{text} "),
+                    Style::default().fg(color).dim(),
+                ));
+            }
         }
-        None => Span::raw(" ".repeat(12)),
-    });
-    spans.push(Span::styled(
-        "start ⏎",
-        Style::default().fg(colors.worktree_row),
-    ));
+        spans.push(start(if widths.detail >= start_w {
+            START
+        } else {
+            "⏎"
+        }));
+    }
     ListItem::new(Line::from(spans))
 }
 
@@ -1761,17 +1834,6 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Kill `windows` on `socket` in the given order (callers pass `agent::windows_to_kill`
-/// order: highest index first, so `renumber-windows` can't shift the ones still to go).
-/// Shared by remove (`x`) and close (`X`).
-fn kill_windows(socket: &str, windows: &[(String, u32)]) -> Result<(), String> {
-    for (session, window) in windows {
-        tmux::kill_window(socket, session, *window)
-            .map_err(|e| format!("kill window failed: {e}"))?;
-    }
-    Ok(())
-}
-
 /// Whether `path` is the worktree Hydra itself is running in (its cwd) — tearing that
 /// down would pull the directory (or the windows) out from under the popup.
 fn is_hydras_cwd(path: &str) -> bool {
@@ -1798,7 +1860,7 @@ fn delete_last_word(s: &mut String) {
 /// Make a name safe as a single path segment (slashes/whitespace → `-`). The branch
 /// keeps the original name; only the worktree directory leaf is sanitized.
 fn sanitize(name: &str) -> String {
-    replace_unsafe(name, &[])
+    agent::path_safe(name)
 }
 
 /// Split Spawn-mode input into `name` and an optional initial prompt: everything
@@ -1824,37 +1886,6 @@ fn agent_command_with_prompt(base: &str, prompt: Option<&str>) -> String {
         Some(p) => format!("{base} '{}'", p.replace('\'', r"'\''")),
         None => base.to_string(),
     }
-}
-
-/// Shared core of `sanitize` and `session_name`: replace `/`, whitespace, and any char in
-/// `also` with `-`. `session_name` passes `['.', ':']` (tmux target separators) as `also`;
-/// path-segment `sanitize` passes none.
-fn replace_unsafe(name: &str, also: &[char]) -> String {
-    name.chars()
-        .map(|c| {
-            if c == '/' || c.is_whitespace() || also.contains(&c) {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-/// A tmux-safe, **repo-scoped** session name for a worktree: `<repo>-<leaf>`, where `leaf`
-/// is the branch if present, else the path's final segment. The `<repo>` prefix (the repo
-/// directory name) disambiguates worktrees that share a branch name across different repos,
-/// so `Enter`/`n` can't collide on (or switch to) the wrong repo's session. `/`, whitespace,
-/// `.` and `:` all become `-` — tmux treats `.`/`:` as target separators (`session:window.pane`),
-/// so they must not appear in a name we later target.
-fn session_name(repo: &str, branch: Option<&str>, path: &str) -> String {
-    let leaf = branch.map(str::to_string).unwrap_or_else(|| {
-        std::path::Path::new(path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string())
-    });
-    replace_unsafe(&format!("{repo}-{leaf}"), &['.', ':'])
 }
 
 #[cfg(test)]
@@ -1922,10 +1953,35 @@ mod tests {
         let mut app = App {
             agents,
             idle,
+            // Hermetic tmux: a fixed popup socket on which the client is attached to no
+            // known session, no panes, and kills that are only recorded.
+            current_socket_fn: Some(test_socket),
+            client_session_fn: Some(|_| None),
+            list_panes_fn: Some(no_panes),
+            kill_window_fn: Some(record_kill),
             ..App::default()
         };
         app.rebuild_rows();
         app
+    }
+
+    fn test_socket() -> Option<String> {
+        Some("/sock".into())
+    }
+
+    thread_local! {
+        /// Windows `record_kill` was asked to kill, in order: (socket, session, index).
+        static KILLED: std::cell::RefCell<Vec<(String, String, u32)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_kill(socket: &str, session: &str, window: u32) -> std::io::Result<()> {
+        KILLED.with(|k| k.borrow_mut().push((socket.into(), session.into(), window)));
+        Ok(())
+    }
+
+    fn take_killed() -> Vec<(String, String, u32)> {
+        KILLED.with(|k| std::mem::take(&mut *k.borrow_mut()))
     }
 
     /// Press a plain (unmodified) key, as the run loop would deliver it.
@@ -2215,8 +2271,8 @@ mod tests {
         assert_eq!(target.base_cwd, "/repo/main");
         assert!(target.agent.is_none(), "no live agent on an idle worktree");
         assert_eq!(
-            target.socket,
-            crate::tmux::current_socket(),
+            target.socket.as_deref(),
+            Some("/sock"), // `app_with`'s popup-socket seam
             "falls back to the popup's own socket, where the leftover windows live"
         );
     }
@@ -2308,18 +2364,110 @@ mod tests {
             vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
         );
         app.list_panes_fn = Some(session_panes);
-        let Ok(t) = app.close_target() else {
-            // Outside tmux there's no popup socket to look windows up on.
-            assert!(crate::tmux::current_socket().is_none());
-            return;
-        };
+        let t = app
+            .close_target()
+            .expect("idle worktree's session windows are closable");
         assert_eq!(t.windows, 3);
+        assert_eq!(t.socket, "/sock", "the popup's socket");
         press(&mut app, KeyCode::Char('X'));
         assert!(app.mode == Mode::Confirm && app.pending_close.is_some());
         let text = rendered(&mut app, 100, 24);
         assert!(
             text.contains("kills 3 windows · worktree is kept"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn confirming_a_close_kills_the_windows_top_down_and_keeps_the_worktree() {
+        take_killed();
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        app.list_panes_fn = Some(session_panes);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode == Mode::Confirm);
+        let action = press(&mut app, KeyCode::Char('y'));
+        assert_eq!(action, Action::Refresh { invalidate: true });
+        assert_eq!(
+            take_killed(),
+            vec![
+                ("/sock".to_string(), "repo-feat".to_string(), 3),
+                ("/sock".to_string(), "repo-feat".to_string(), 2),
+                ("/sock".to_string(), "repo-feat".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("✓ closed feat (3 windows) · worktree kept")
+        );
+        assert_eq!(app.selected_key.as_deref(), Some("/wt/feat"));
+        assert!(app.mode == Mode::Normal && app.pending_close.is_none());
+    }
+
+    #[test]
+    fn close_refuses_the_session_the_popup_is_attached_to() {
+        take_killed();
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        app.list_panes_fn = Some(session_panes);
+        app.client_session_fn = Some(|_| Some("repo-feat".into()));
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode == Mode::Normal && app.pending_close.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("attached")),
+            "{:?}",
+            app.message
+        );
+        assert!(take_killed().is_empty());
+    }
+
+    /// The main checkout plus a Claude Code `--worktree` nested inside it, each with a
+    /// window in its own session.
+    fn nested_panes(_socket: &str) -> Vec<Pane> {
+        let mk = |id: &str, session: &str, cwd: &str| Pane {
+            pane_id: id.into(),
+            session_name: session.into(),
+            window_index: 1,
+            window_name: "w".into(),
+            cwd: cwd.into(),
+            window_active: false,
+            pane_tty: "/dev/ttys000".into(),
+        };
+        vec![
+            mk("%1", "main-repo", "/repo/main"),
+            mk("%2", "main-repo-x", "/repo/main/.claude/worktrees/x"),
+        ]
+    }
+
+    #[test]
+    fn closing_the_main_checkout_spares_a_worktree_nested_in_it() {
+        take_killed();
+        let mut app = app_with(
+            vec![],
+            vec![
+                idle_wt("/repo/main", "main", "/repo/main/.git", "main-repo"),
+                idle_wt(
+                    "/repo/main/.claude/worktrees/x",
+                    "x",
+                    "/repo/main/.git",
+                    "main-repo",
+                ),
+            ],
+        );
+        app.list_panes_fn = Some(nested_panes);
+        let t = app.close_target().expect("main has a window");
+        assert_eq!(t.windows, 1, "only main's own window");
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            take_killed(),
+            vec![("/sock".to_string(), "main-repo".to_string(), 1)]
         );
     }
 
@@ -2632,6 +2780,25 @@ mod tests {
         // The branch survives (possibly truncated) and "start ⏎" still fits.
         assert!(text.contains("CET-3200/feat/"), "{text}");
         assert!(text.contains("start ⏎"), "{text}");
+    }
+
+    #[test]
+    fn full_names_are_readable_at_the_users_popup_size() {
+        // 159-col client, 70% popup ≈ 111 cols, preview on: the list is ~53 cols wide, so
+        // the row can't hold the 38-char branch plus its folder. The preview title must.
+        let mut app = long_name_app();
+        app.show_preview = true; // the agent row is selected (its preview is "…")
+        let text = render_lines(&mut app, 111, 40).join("\n");
+        assert!(
+            text.contains("CET-3200/feat/cet-3723-partner-service"),
+            "full branch somewhere:\n{text}"
+        );
+        assert!(
+            text.contains("CET-3200-feat-cet-3723-partner-identity"),
+            "full folder somewhere:\n{text}"
+        );
+        // And the row itself keeps more of the name than the old fixed 23 columns.
+        assert!(text.contains("CET-3200/feat/cet-3723-p"), "{text}");
     }
 
     #[test]

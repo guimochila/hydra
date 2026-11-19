@@ -196,19 +196,21 @@ pub fn current_overview(
     }
 }
 
-/// `hydra ls` column widths, mirroring the popup's row layout so the two agree.
-/// The place and branch cells shrink from max toward min on a narrow terminal.
-const LS_PLACE_MAX: usize = 18;
-const LS_PLACE_MIN: usize = 10;
-const LS_BRANCH_MAX: usize = 24;
-const LS_BRANCH_MIN: usize = 16;
-/// Wide enough for the longest badge (`no commits`) plus its gutter.
+/// `hydra ls` badge column: wide enough for the longest badge (`no commits`) plus its
+/// gutter.
 const LS_BADGE: usize = 11;
-/// The free-text cell is the point of the row, so it gets a floor the other cells
-/// yield to before it does.
-const LS_DETAIL_MIN: usize = 24;
 /// Row overhead: glyph, its gutter, the age cell, three column gutters, the badge.
 const LS_OVERHEAD: usize = 1 + 1 + 3 + 2 + 2 + 2 + LS_BADGE;
+
+/// One `hydra ls` row's cells, before column fitting.
+struct LsCells {
+    glyph: &'static str,
+    age: String,
+    place: String,
+    name: String,
+    badge: String,
+    detail: String,
+}
 
 fn list_command() -> std::io::Result<()> {
     let cfg = config::load();
@@ -223,53 +225,46 @@ fn list_command() -> std::io::Result<()> {
         return Ok(());
     }
     let now = now_secs();
-    let width = term_width();
+    let mut rows: Vec<LsCells> = Vec::new();
     for a in &overview.agents {
         // Branch (the tmux window name outside a worktree) plus a differing worktree
         // folder — the same name cell the popup's rows use.
         let (label, hint) = agent::agent_name(a);
-        let branch = ls_name(&label, hint.as_deref());
-        let dirty = if a.dirty > 0 {
-            format!("Δ{}", a.dirty)
-        } else {
-            String::new()
-        };
-        println!(
-            "{}",
-            ls_row(
-                a.effective_status.glyph(),
-                &agent::format_age(now.saturating_sub(a.state.updated_at)),
-                &format!("{}:{}", a.pane.session_name, a.pane.window_index),
-                &branch,
-                &dirty,
-                &agent::detail_text(a).unwrap_or_default(),
-                width,
-            )
-        );
+        rows.push(LsCells {
+            glyph: a.effective_status.glyph(),
+            age: agent::format_age(now.saturating_sub(a.state.updated_at)),
+            place: format!("{}:{}", a.pane.session_name, a.pane.window_index),
+            name: ls_name(&label, hint.as_deref()),
+            badge: if a.dirty > 0 {
+                format!("Δ{}", a.dirty)
+            } else {
+                String::new()
+            },
+            detail: agent::detail_text(a).unwrap_or_default(),
+        });
     }
     for w in &overview.idle {
         // No agent, so no age or tmux location — the path is the useful free-text cell.
-        println!(
-            "{}",
-            ls_row(
-                "○",
-                "—",
-                "—",
-                &{
-                    let (label, hint) = agent::worktree_name(w);
-                    ls_name(&label, hint.as_deref())
-                },
-                &ls_badge(w.state),
-                &w.path,
-                width,
-            )
-        );
+        let (label, hint) = agent::worktree_name(w);
+        rows.push(LsCells {
+            glyph: "○",
+            age: "—".into(),
+            place: "—".into(),
+            name: ls_name(&label, hint.as_deref()),
+            badge: ls_badge(w.state),
+            detail: w.path.clone(),
+        });
+    }
+    let widths = ls_widths(term_width(), &rows);
+    for r in &rows {
+        println!("{}", ls_row(r, widths));
     }
     Ok(())
 }
 
-/// The name cell as plain text: `label · folder` when the folder differs. The label
-/// comes first, so the cell's truncation eats the folder before the branch.
+/// The name cell as plain text: `label · folder` when the folder differs. The column is
+/// sized to the widest name (`ls_widths`), so both halves show whenever the terminal
+/// has the room; when it doesn't, truncation eats the folder before the branch.
 fn ls_name(label: &str, hint: Option<&str>) -> String {
     match hint {
         Some(h) => format!("{label} · {h}"),
@@ -290,42 +285,34 @@ fn ls_badge(state: Option<worktree::BranchState>) -> String {
     }
 }
 
-/// (place, branch, detail) cell widths for a terminal of `width`. Session-per-worktree
-/// names and long branches would eat the whole row on a narrow terminal, so they give
-/// up space down to their minimums before the free-text cell drops below its floor.
-fn ls_widths(width: usize) -> (usize, usize, usize) {
-    let avail = width.saturating_sub(LS_OVERHEAD);
-    let mut place = LS_PLACE_MAX;
-    let mut branch = LS_BRANCH_MAX;
-    let shortfall = LS_DETAIL_MIN.saturating_sub(avail.saturating_sub(place + branch));
-    if shortfall > 0 {
-        let from_place = (place - LS_PLACE_MIN).min(shortfall);
-        place -= from_place;
-        branch -= (branch - LS_BRANCH_MIN).min(shortfall - from_place);
-    }
-    let detail = avail.saturating_sub(place + branch);
-    (place, branch, detail)
+/// Cell widths for `rows` on a terminal of `width`: the popup's own split
+/// (`agent::row_widths`), so the place and name columns are sized to their widest value
+/// and give way (place first, then the free text down to a floor, then the name) only
+/// when the terminal is too narrow.
+fn ls_widths(width: usize, rows: &[LsCells]) -> agent::RowWidths {
+    let want = |f: fn(&LsCells) -> &str| rows.iter().map(|r| f(r).chars().count()).max();
+    agent::row_widths(
+        width.saturating_sub(LS_OVERHEAD),
+        want(|r| &r.place).unwrap_or(0),
+        want(|r| &r.name).unwrap_or(0),
+    )
 }
 
 /// Format one `hydra ls` row into aligned columns. Every variable cell is truncated to
 /// its column — an over-long branch or a summary wider than the terminal would
 /// otherwise push the following cells out of alignment, or wrap and shear the table.
 /// Pure so the layout is testable without a tmux server.
-fn ls_row(
-    glyph: &str,
-    age: &str,
-    place: &str,
-    branch: &str,
-    badge: &str,
-    detail: &str,
-    width: usize,
-) -> String {
-    let (pw, bw, dw) = ls_widths(width);
-    let place = agent::truncate(place, pw);
-    let branch = agent::truncate(branch, bw);
-    let detail = agent::truncate(detail, dw);
+fn ls_row(r: &LsCells, w: agent::RowWidths) -> String {
+    let place = agent::truncate(&r.place, w.place);
+    let name = agent::truncate(&r.name, w.name);
+    let detail = agent::truncate(&r.detail, w.detail);
     format!(
-        "{glyph} {age:>3}  {place:<pw$}  {branch:<bw$}  {badge:<gw$}{detail}",
+        "{glyph} {age:>3}  {place:<pw$}  {name:<nw$}  {badge:<gw$}{detail}",
+        glyph = r.glyph,
+        age = r.age,
+        badge = r.badge,
+        pw = w.place,
+        nw = w.name,
         gw = LS_BADGE
     )
     .trim_end()
@@ -369,27 +356,34 @@ fn print_help() {
 mod tests {
     use super::*;
 
+    fn cells(place: &str, name: &str, badge: &str, detail: &str) -> LsCells {
+        LsCells {
+            glyph: "●",
+            age: "5s".into(),
+            place: place.into(),
+            name: name.into(),
+            badge: badge.into(),
+            detail: detail.into(),
+        }
+    }
+
     #[test]
     fn ls_row_keeps_columns_aligned_when_cells_overflow() {
         // A long branch and a long summary must not push the later cells right — they
         // get truncated into their own column instead.
-        let short = ls_row("○", "3h", "cet-services:2", "main", "Δ8", "Post it.", 120);
-        let long = ls_row(
-            "●",
-            "5s",
-            "cet-services:2",
-            "feat/b2b-provisioning-automate-jira-po",
-            "Δ3",
-            "Can you check this PR and why the CI is failing",
-            120,
-        );
-        let (pw, bw, _) = ls_widths(120);
-        let badge_col = 1 + 1 + 3 + 2 + pw + 2 + bw + 2;
-        assert_eq!(
-            short.chars().take(badge_col).count(),
-            long.chars().take(badge_col).count()
-        );
-        // Same column start for the badge in both rows.
+        let rows = [
+            cells("cet-services:2", "main", "Δ8", "Post it."),
+            cells(
+                "cet-services:2",
+                "feat/b2b-provisioning-automate-jira-po",
+                "Δ3",
+                &"Can you check this PR and why the CI is failing ".repeat(4),
+            ),
+        ];
+        let w = ls_widths(120, &rows);
+        let short = ls_row(&rows[0], w);
+        let long = ls_row(&rows[1], w);
+        let badge_col = 1 + 1 + 3 + 2 + w.place + 2 + w.name + 2;
         assert_eq!(
             short.chars().skip(badge_col).take(2).collect::<String>(),
             "Δ8"
@@ -398,55 +392,60 @@ mod tests {
             long.chars().skip(badge_col).take(2).collect::<String>(),
             "Δ3"
         );
-        assert!(
-            long.contains("feat/b2b-provisioning-a…"),
-            "over-long branch is truncated into its cell: {long}"
-        );
+        assert!(long.chars().count() <= 120, "{long}");
     }
 
     #[test]
-    fn ls_widths_protect_the_free_text_cell_on_a_narrow_terminal() {
-        // Wide: both cells at max, everything left goes to the free text.
-        let (place, branch, detail) = ls_widths(120);
-        assert_eq!((place, branch), (LS_PLACE_MAX, LS_BRANCH_MAX));
-        assert_eq!(place + branch + detail + LS_OVERHEAD, 120);
-
-        // 80 cols: the place cell (long session-per-worktree names) yields first, and
-        // the free text keeps its floor rather than being elided down to nothing.
-        let (place, branch, detail) = ls_widths(80);
-        assert_eq!(branch, LS_BRANCH_MAX, "branch is not touched first");
-        assert!((LS_PLACE_MIN..LS_PLACE_MAX).contains(&place));
-        assert!(detail >= LS_DETAIL_MIN, "detail floor held: {detail}");
-
-        // Very narrow: both cells bottom out, but never below their minimums.
-        let (place, branch, _) = ls_widths(50);
-        assert_eq!((place, branch), (LS_PLACE_MIN, LS_BRANCH_MIN));
+    fn ls_shows_long_branches_and_their_folder_in_full_when_there_is_room() {
+        // The user's worktree: a 38-char branch in a folder named for another branch.
+        let name = ls_name(
+            "CET-3200/feat/cet-3723-partner-service",
+            Some("CET-3200-feat-cet-3723-partner-identity"),
+        );
+        let rows = [cells(
+            "cet-services-CET-3200-feat-cet-3723-partner-service:3",
+            &name,
+            "",
+            "working on it",
+        )];
+        let row = ls_row(&rows[0], ls_widths(200, &rows));
+        assert!(row.contains(&name), "{row}");
+        assert!(row.ends_with("working on it"), "{row}");
+        // Narrower: the place gives way before the branch does.
+        let w = ls_widths(120, &rows);
+        let row = ls_row(&rows[0], w);
+        assert!(
+            row.contains("CET-3200/feat/cet-3723-partner-service"),
+            "{row}"
+        );
+        assert!(row.chars().count() <= 120);
     }
 
     #[test]
     fn ls_row_never_exceeds_the_terminal_width() {
         // Wrapping is what shears the table: a row wider than the terminal wraps onto a
         // second line and every column below it looks misaligned.
-        let row = ls_row(
-            "○",
-            "1h",
+        let rows = [cells(
             "cet-services:4",
             "feat/b2b-provisioning-automate-jira-po",
             "Δ3",
             &"I want you to check this branch and tell me when ".repeat(4),
-            100,
-        );
-        assert!(
-            row.chars().count() <= 100,
-            "row width {}",
-            row.chars().count()
-        );
+        )];
+        for width in [60, 80, 100] {
+            let row = ls_row(&rows[0], ls_widths(width, &rows));
+            assert!(
+                row.chars().count() <= width,
+                "row width {}",
+                row.chars().count()
+            );
+        }
     }
 
     #[test]
     fn ls_row_trims_a_row_with_no_free_text() {
         // An idle worktree with no badge must not leave trailing padding behind.
-        let row = ls_row("○", "—", "—", "pr-1462 (detached)", "", "", 120);
+        let rows = [cells("—", "pr-1462 (detached)", "", "")];
+        let row = ls_row(&rows[0], ls_widths(120, &rows));
         assert_eq!(row, row.trim_end(), "no trailing whitespace");
         assert!(row.ends_with("pr-1462 (detached)"));
     }
