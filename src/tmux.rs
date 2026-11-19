@@ -282,10 +282,18 @@ pub fn select_window_id(socket: &str, window_id: &str) -> std::io::Result<()> {
 }
 
 /// Kill a window by session + index (used to stop an agent before removing its
-/// worktree, since the running process holds the directory).
+/// worktree, since the running process holds the directory, and by close). The session
+/// is matched exactly (`=name`): a bare name falls back to prefix matching, so if
+/// `svc-feat` vanished between the pane listing and the kill, `svc-feat:2` would hit
+/// `svc-feat-2`'s window 2 instead.
 pub fn kill_window(socket: &str, session: &str, window_index: u32) -> std::io::Result<()> {
-    let target = format!("{session}:{window_index}");
+    let target = window_target(session, window_index);
     run(socket, &["kill-window", "-t", &target])
+}
+
+/// An exact-session window target: `=session:index`.
+fn window_target(session: &str, window_index: u32) -> String {
+    format!("={session}:{window_index}")
 }
 
 /// Capture the visible contents of `pane_id` including SGR escape sequences (`-e`),
@@ -351,6 +359,12 @@ fn parse_pane_line(line: &str) -> Option<Pane> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_targets_match_the_session_exactly() {
+        // A bare `svc-feat:2` would prefix-match `svc-feat-2` once `svc-feat` is gone.
+        assert_eq!(window_target("svc-feat", 2), "=svc-feat:2");
+    }
 
     #[test]
     fn parses_a_well_formed_pane_line() {

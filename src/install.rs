@@ -45,11 +45,13 @@ resume_command = "claude --continue" # launched by `c` (resume an idle worktree'
 worktree_root  = "~/work/tree"      # where spawned worktrees go (HYDRA_WORKTREE_ROOT wins)
 spawn_mode     = "window"           # "window": one window here; "session": dedicated session (shell + agent)
 
-# Session mode only: extra windows between the shell and the agent. Runs under /bin/sh in
-# a restart loop (quit the tool to relaunch it fresh); {base} = the repo's default branch.
+# Session mode only: extra windows between the shell and the agent. Runs under /bin/sh;
+# quitting the tool closes its window (restart = true relaunches it fresh instead).
+# {base} = the repo's default branch.
 # [[agent.extra_windows]]
 # name    = "diff"
 # command = "revdiff --no-confirm-reload {base}"
+# restart = false
 
 [popup]                        # tmux-side — re-run `hydra install` after changing
 key    = "a"                   # prefix + this key opens the popup

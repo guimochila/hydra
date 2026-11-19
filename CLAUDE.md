@@ -63,8 +63,9 @@ Module map (`src/`):
   current session, and starts the popup in all-sessions view so those sessions are
   visible. `agent.extra_windows` (`ExtraWindow`, session mode only) inserts windows
   between shell and agent; `ExtraWindow::script` (pure, tested) expands `{base}` to the
-  shell-quoted default branch and wraps the command in a `while :` restart loop, exec'd
-  as `/bin/sh -c` (never the user's shell — it may be fish).
+  shell-quoted default branch and runs the command once (`exec`'d when simple, so the
+  window closes when the tool quits), or in a `while :` restart loop when the entry sets
+  `restart = true`; always via `/bin/sh -c` (never the user's shell — it may be fish).
 - `hook.rs` — `hydra hook <event>`. Deliberately dumb and fast (runs on every event):
   reads hook JSON from stdin + `$TMUX`/`$TMUX_PANE`, writes/removes one state file
   (including `attention`, the Notification's "why input is needed" message). No tmux
@@ -96,7 +97,7 @@ Module map (`src/`):
   `matches_scope` (per-agent predicate; a worktree-less agent never matches `Repo`).
   Also `idle_from` (project worktrees − occupied),
   `matches_filter`/`worktree_matches_filter`, `worktree_label` (branch name, or the
-  directory basename for a detached worktree), `format_age`, and `one_line` (which
+  directory basename for a detached worktree), the list-row name/layout helpers (`folder_hint` — the folder when it isn't the sanitized branch; `display_session` — drops the `<repo>-` prefix for display only; `row_widths`/`fit_place`/`fit_name` — cells sized from the widest value in view, place shrinking before the name), `format_age`, and `one_line` (which
   `detail_text` applies — summaries can be multi-line, and every consumer of that column
   renders a single line).
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a
@@ -108,7 +109,13 @@ Module map (`src/`):
   the agent command as its first task, `x` to remove a worktree (confirm,
   kills every window rooted in the worktree via `agent::windows_under_path` — mode-
   agnostic, so it destroys the whole session in session mode — forces on dirty, keeps
-  branch), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
+  branch), `X` to close a worktree's windows/session but keep the worktree (confirm;
+  same window set via the shared `kill_windows` + `agent::windows_to_close`, which
+  refuses an empty set or one containing Hydra's own `$TMUX_PANE`; also refuses Hydra's
+  own cwd, but allows the main worktree — there `CloseScope::Owned` limits it to the
+  agent's window + the dedicated session, sparing the user's own windows in the repo;
+  the agent's window is always re-resolved from its pane id at confirm time via
+  `agent::own_window`, never a stale window index), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
   (agent screen or idle-worktree git summary). The header scope label AND the preview
   text come from the snapshot (`scope_label` / `preview`) — the UI thread does no
   git/tmux work at all; it only tells the worker which `PreviewTarget` is selected.

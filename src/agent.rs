@@ -195,14 +195,236 @@ pub fn worktree_label(wt: &IdleWorktree) -> String {
     }
 }
 
+/// The worktree directory's name when it tells the user something the branch doesn't:
+/// a folder whose name isn't just the branch with `/`/whitespace turned into `-` (the
+/// way hydra names the folders it creates). A worktree checked out into a folder named
+/// for a *different* branch is otherwise unrecognizable — the folder the user sees on
+/// disk appears nowhere in the row. `None` for a detached worktree (its label already
+/// is the folder) and for the repo's main checkout (the folder is the repo name, which
+/// the group header already shows).
+pub fn folder_hint(branch: Option<&str>, path: &str, repo_name: &str) -> Option<String> {
+    let branch = branch?;
+    let folder = basename(path)?;
+    if folder == repo_name || folder == path_safe(branch) {
+        return None;
+    }
+    Some(folder.to_string())
+}
+
+/// Replace `/`, whitespace, and any char in `also` with `-`. The single source of the
+/// name-sanitizing rules: `ui::sanitize` (worktree folder leaf, `also = []`) and
+/// `session_name` (`also = ['.', ':']`, tmux target separators) both use it, and so do
+/// `folder_hint`/`display_session`, which must recognize the names those produce.
+pub fn replace_unsafe(name: &str, also: &[char]) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '/' || c.is_whitespace() || also.contains(&c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Branch → folder-name form, exactly how a spawned worktree's directory is named.
+pub fn path_safe(name: &str) -> String {
+    replace_unsafe(name, &[])
+}
+
+/// Chars a tmux session name can't carry (target separators), on top of `/`/whitespace.
+const SESSION_UNSAFE: [char; 2] = ['.', ':'];
+
+/// The `<repo>-` prefix of a session-per-worktree name (see `session_name`).
+fn session_prefix(repo: &str) -> String {
+    replace_unsafe(&format!("{repo}-"), &SESSION_UNSAFE)
+}
+
+/// A tmux-safe, **repo-scoped** session name for a worktree: `<repo>-<leaf>`, where `leaf`
+/// is the branch if present, else the path's final segment. The `<repo>` prefix (the repo
+/// directory name) disambiguates worktrees that share a branch name across different repos,
+/// so `Enter`/`n` can't collide on (or switch to) the wrong repo's session. `/`, whitespace,
+/// `.` and `:` all become `-` — tmux treats `.`/`:` as target separators (`session:window.pane`),
+/// so they must not appear in a name we later target.
+pub fn session_name(repo: &str, branch: Option<&str>, path: &str) -> String {
+    let leaf = branch.map(str::to_string).unwrap_or_else(|| {
+        std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    });
+    format!(
+        "{}{}",
+        session_prefix(repo),
+        replace_unsafe(&leaf, &SESSION_UNSAFE)
+    )
+}
+
+/// The session name as shown under its repo header: a session-per-worktree name is
+/// `<repo>-<branch>` (see `session_name`), and the `<repo>-` half only repeats the
+/// group header while eating the row. Display only — tmux targets keep the real name.
+/// Returned unchanged when the prefix doesn't match or would leave nothing.
+pub fn display_session<'a>(session: &'a str, repo_name: Option<&str>) -> &'a str {
+    let Some(repo) = repo_name else {
+        return session;
+    };
+    match session.strip_prefix(&session_prefix(repo)) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => session,
+    }
+}
+
+/// Minimum widths the list row's cells shrink to before the trailing text gives way.
+pub const ROW_PLACE_MIN: usize = 8;
+pub const ROW_NAME_MIN: usize = 16;
+/// Width the trailing cell (task summary / badge + "start ⏎") keeps while the place cell
+/// shrinks toward `ROW_PLACE_MIN`.
+pub const ROW_DETAIL_MIN: usize = 20;
+/// Hard floor for the trailing cell: below `ROW_DETAIL_MIN` it yields to the name (how
+/// the user recognizes a worktree) until it reaches this, and only then does the name
+/// shrink toward `ROW_NAME_MIN`.
+pub const ROW_DETAIL_FLOOR: usize = 8;
+
+/// Widths of a list row's three variable cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowWidths {
+    pub place: usize,
+    pub name: usize,
+    pub detail: usize,
+}
+
+/// Split `avail` columns between the place, name and trailing cells. Place and name get
+/// what they want (the widest value in the column) when it fits alongside a
+/// `ROW_DETAIL_MIN` trailing cell. Otherwise, in order: place shrinks (toward
+/// `ROW_PLACE_MIN`), then the trailing cell (toward `ROW_DETAIL_FLOOR`) — the name is how
+/// the user recognizes a worktree, so it gives way last — then the name (toward
+/// `ROW_NAME_MIN`). On a terminal too narrow even for that, the trailing cell goes first
+/// and place/name are clamped into what's left. Always `place + name + detail == avail`.
+pub fn row_widths(avail: usize, place_want: usize, name_want: usize) -> RowWidths {
+    let mut place = place_want;
+    let mut name = name_want;
+    let mut over = (place + name + ROW_DETAIL_MIN).saturating_sub(avail);
+    let cut = over.min(place.saturating_sub(ROW_PLACE_MIN));
+    place -= cut;
+    over -= cut;
+    over = over.saturating_sub(ROW_DETAIL_MIN - ROW_DETAIL_FLOOR);
+    let cut = over.min(name.saturating_sub(ROW_NAME_MIN));
+    name -= cut;
+    place = place.min(avail);
+    name = name.min(avail - place);
+    RowWidths {
+        place,
+        name,
+        detail: avail - place - name,
+    }
+}
+
+/// Fit a `session:window` place into `width`, truncating the session but never the
+/// `:window` suffix (the part that tells two windows of one session apart).
+pub fn fit_place(session: &str, suffix: &str, width: usize) -> String {
+    let full = format!("{session}{suffix}");
+    if full.chars().count() <= width {
+        return full;
+    }
+    let room = width.saturating_sub(suffix.chars().count());
+    if room < 2 {
+        return truncate(&full, width);
+    }
+    format!("{}{suffix}", truncate(session, room))
+}
+
+/// Fit a name cell (`label`, plus an optional folder `hint` rendered as ` · hint`) into
+/// `width`. The label has priority: the hint is truncated (or dropped when there's no
+/// useful room for it) before the label loses a character. Returns `(label, hint_part)`
+/// where `hint_part` already carries its ` · ` separator, so the caller can style the
+/// halves apart and their combined length is `<= width`.
+pub fn fit_name(label: &str, hint: Option<&str>, width: usize) -> (String, String) {
+    let label_len = label.chars().count();
+    if label_len >= width {
+        return (truncate(label, width), String::new());
+    }
+    let Some(hint) = hint else {
+        return (label.to_string(), String::new());
+    };
+    let room = width - label_len;
+    // " · " plus at least a few chars of the hint, or it's just noise.
+    if room < 3 + 4 {
+        return (label.to_string(), String::new());
+    }
+    (
+        label.to_string(),
+        format!(" · {}", truncate(hint, room - 3)),
+    )
+}
+
+/// The preview pane's titles for a selection named `label` (+ folder `hint`), fitted to
+/// `room` columns: `(top, bottom)`. The top title is `prefix + name`; `win` (an agent's
+/// window index) adds a `win N · ` to the prefix only while the full name still fits
+/// beside it. When label + hint don't fit on one line, the hint moves to a bottom title
+/// (`folder <hint>`) instead of being cut, so the selection's full branch AND folder are
+/// readable even when the list row had to truncate them.
+pub fn preview_titles(
+    win: Option<u32>,
+    label: &str,
+    hint: Option<&str>,
+    room: usize,
+) -> (String, Option<String>) {
+    let short = "preview · ".to_string();
+    let long = win.map_or_else(|| short.clone(), |w| format!("preview · win {w} · "));
+    let len = |s: &str| s.chars().count();
+    let hint_len = hint.map_or(0, |h| 3 + len(h));
+    for prefix in [&long, &short] {
+        if len(prefix) + len(label) + hint_len <= room {
+            let (l, h) = fit_name(label, hint, room - len(prefix));
+            return (format!("{prefix}{l}{h}"), None);
+        }
+    }
+    let bottom = hint.map(|h| truncate(&format!("folder {h}"), room));
+    let prefix = if len(&long) + len(label) <= room {
+        &long
+    } else {
+        &short
+    };
+    let top = if len(prefix) + len(label) <= room {
+        format!("{prefix}{label}")
+    } else {
+        truncate(label, room) // the name beats the "preview" word
+    };
+    (top, bottom)
+}
+
+/// An agent row's name cell: its branch (the tmux window name outside a worktree), plus
+/// the worktree folder when it differs from the branch (see `folder_hint`).
+pub fn agent_name(a: &Agent) -> (String, Option<String>) {
+    let label = a
+        .worktree
+        .as_ref()
+        .and_then(|w| w.branch.clone())
+        .unwrap_or_else(|| a.pane.window_name.clone());
+    let hint = a
+        .worktree
+        .as_ref()
+        .and_then(|w| folder_hint(w.branch.as_deref(), &w.root, &w.repo_name));
+    (label, hint)
+}
+
+/// An idle worktree row's name cell: `worktree_label` plus the folder hint.
+pub fn worktree_name(wt: &IdleWorktree) -> (String, Option<String>) {
+    (
+        worktree_label(wt),
+        folder_hint(wt.branch.as_deref(), &wt.path, &wt.repo_name),
+    )
+}
+
 /// Last non-empty path segment, or `None` for a path with none (`"/"`, `""`).
-fn basename(path: &str) -> Option<&str> {
+pub fn basename(path: &str) -> Option<&str> {
     path.trim_end_matches('/')
         .rsplit('/')
         .find(|s| !s.is_empty())
 }
 
-/// Filter predicate for an idle worktree (branch / repo / path).
+/// Filter predicate for an idle worktree (branch / repo / path — the path covers the
+/// folder name, which can differ from the branch).
 pub fn worktree_matches_filter(wt: &IdleWorktree, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -261,7 +483,8 @@ pub fn matches_scope(agent: &Agent, scope: &Scope) -> bool {
     }
 }
 
-/// Case-insensitive substring match against branch, repo, task summary and window name.
+/// Case-insensitive substring match against branch, repo, task summary, window name,
+/// session name and the worktree's folder name (which can differ from the branch).
 /// An empty query matches everything.
 pub fn matches_filter(agent: &Agent, query: &str) -> bool {
     if query.is_empty() {
@@ -280,7 +503,13 @@ pub fn matches_filter(agent: &Agent, query: &str) -> bool {
         .unwrap_or("");
     let summary = agent.state.task_summary.as_deref().unwrap_or("");
     let window = agent.pane.window_name.as_str();
-    [branch, repo, summary, window]
+    let session = agent.pane.session_name.as_str();
+    let folder = agent
+        .worktree
+        .as_ref()
+        .and_then(|w| basename(&w.root))
+        .unwrap_or("");
+    [branch, repo, summary, window, session, folder]
         .iter()
         .any(|field| field.to_lowercase().contains(&q))
 }
@@ -309,10 +538,30 @@ fn status_rank(s: Status) -> u8 {
 /// windows (killing them empties and destroys the dedicated session); in window mode it
 /// is just the single agent window.
 pub fn windows_under_path(panes: &[Pane], path: &str) -> Vec<(String, u32)> {
+    windows_under_path_except(panes, path, &[])
+}
+
+/// Whether `cwd` is `root` or under it on a path boundary.
+fn is_under(cwd: &str, root: &str) -> bool {
+    cwd == root
+        || cwd
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/') || root.ends_with('/'))
+}
+
+/// `windows_under_path`, minus panes that belong to a *more specific* worktree nested
+/// inside `path` (any of `others` strictly under it — `<repo>/.worktrees/x`, Claude Code's
+/// `<repo>/.claude/worktrees/x`): by longest-prefix match those panes are that worktree's,
+/// not `path`'s.
+fn windows_under_path_except(panes: &[Pane], path: &str, others: &[String]) -> Vec<(String, u32)> {
+    let nested: Vec<&str> = others
+        .iter()
+        .map(|o| o.trim_end_matches('/'))
+        .filter(|o| *o != path.trim_end_matches('/') && is_under(o, path))
+        .collect();
     let mut out: Vec<(String, u32)> = Vec::new();
-    let prefix = format!("{path}/");
     for p in panes {
-        if p.cwd == path || p.cwd.starts_with(&prefix) {
+        if is_under(&p.cwd, path) && !nested.iter().any(|n| is_under(&p.cwd, n)) {
             let key = (p.session_name.clone(), p.window_index);
             if !out.contains(&key) {
                 out.push(key);
@@ -322,31 +571,162 @@ pub fn windows_under_path(panes: &[Pane], path: &str) -> Vec<(String, u32)> {
     out
 }
 
-/// The full set of windows a worktree removal must tear down, in the order to kill them.
-///
-/// `windows_under_path` plus `own` (a live agent's own window, which must die even if its
-/// pane cwd has diverged from the worktree — we never `git worktree remove` from under a
-/// running agent). Note `own` is the *only* reason to pass anything here: a row without a
-/// live agent still occupies windows (an idle worktree in session mode keeps its shell and
-/// agent windows), and skipping the teardown for those is what orphans a session on a
-/// directory git is about to delete.
-///
-/// Sorted by descending window index: with `renumber-windows on`, killing a low index
-/// renumbers the higher windows down and invalidates the indices we still hold, so we
-/// always take the top window off first.
-pub fn windows_to_kill(
-    panes: &[Pane],
-    path: &str,
+/// The live (session, window) of the pane `pane_id`, resolved against `panes` — the
+/// listing taken right before a kill. A window *index* is not a stable id: with
+/// `renumber-windows on` it shifts whenever a lower window closes, so a (session, index)
+/// captured when the user pressed a key can name an unrelated window by the time they
+/// confirm. The pane id is stable; `None` when the pane is gone.
+pub fn own_window(panes: &[Pane], pane_id: Option<&str>) -> Option<(String, u32)> {
+    let id = pane_id?;
+    panes
+        .iter()
+        .find(|p| p.pane_id == id)
+        .map(|p| (p.session_name.clone(), p.window_index))
+}
+
+/// Push `own` onto `wins` unless already there, then sort top window first (with
+/// `renumber-windows on`, killing a low index renumbers the higher windows down and
+/// invalidates the indices still held, so the top window always goes first).
+fn with_own_top_first(
+    mut wins: Vec<(String, u32)>,
     own: Option<(String, u32)>,
 ) -> Vec<(String, u32)> {
-    let mut out = windows_under_path(panes, path);
     if let Some(own) = own {
-        if !out.contains(&own) {
-            out.push(own);
+        if !wins.contains(&own) {
+            wins.push(own);
         }
     }
-    out.sort_by_key(|w| std::cmp::Reverse(w.1));
-    out
+    wins.sort_by_key(|w| std::cmp::Reverse(w.1));
+    wins
+}
+
+/// The full set of windows a worktree removal must tear down, in the order to kill them.
+///
+/// `windows_under_path` plus the window of `own_pane` (a live agent's pane, which must die
+/// even if its cwd has diverged from the worktree — we never `git worktree remove` from
+/// under a running agent). The agent's window is looked up by pane id in `panes` (see
+/// `own_window`), so a stale index can never pick an unrelated window; a pane that is
+/// already gone adds nothing. A row without a live agent still occupies windows (an idle
+/// worktree in session mode keeps its shell and agent windows), and skipping the teardown
+/// for those is what orphans a session on a directory git is about to delete.
+///
+/// Sorted by descending window index (see `with_own_top_first`).
+pub fn windows_to_kill(panes: &[Pane], path: &str, own_pane: Option<&str>) -> Vec<(String, u32)> {
+    with_own_top_first(windows_under_path(panes, path), own_window(panes, own_pane))
+}
+
+/// Why closing a worktree's windows (`X`, close without removing) was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseRefusal {
+    /// No tmux window is rooted in the worktree — there is nothing to close.
+    NothingOpen,
+    /// One of the windows hosts Hydra's own pane; closing it would kill Hydra itself.
+    HostsSelf,
+    /// The windows are every window of the session the popup's client is attached to:
+    /// killing them destroys that session, which detaches the client and takes the popup
+    /// (Hydra) down with it.
+    WholeClientSession,
+}
+
+impl CloseRefusal {
+    /// The user-facing message for this refusal; `label` names the worktree.
+    pub fn message(&self, label: &str) -> String {
+        match self {
+            CloseRefusal::NothingOpen => format!("no open windows for {label}"),
+            CloseRefusal::HostsSelf => "can't close the window Hydra is running in".into(),
+            CloseRefusal::WholeClientSession => {
+                format!(
+                    "can't close {label}: it's the session you're attached to — switch away first"
+                )
+            }
+        }
+    }
+}
+
+/// Live tmux context a close is planned against, besides the pane listing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CloseGuard<'a> {
+    /// Other known worktree roots: panes under one nested inside the closed path belong
+    /// to it and are left alone (see `windows_under_path_except`).
+    pub other_roots: &'a [String],
+    /// Hydra's own pane id (`$TMUX_PANE`), when it runs in a pane rather than a popup.
+    pub self_pane: Option<&'a str>,
+    /// The session the popup's client is attached to (`tmux::current_session`) — the
+    /// guard that holds for a `display-popup`, which has no pane of its own.
+    pub client_session: Option<&'a str>,
+}
+
+/// Which windows count as a worktree's for a close (`X`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseScope<'a> {
+    /// Every window with a pane rooted in the worktree (minus nested worktrees) — the
+    /// same set as a removal. Right for a linked worktree: nothing but its own windows
+    /// lives there.
+    Rooted,
+    /// Only the windows Hydra owns for the worktree: the named dedicated session (session
+    /// mode's `session_name`, when it exists) plus the agent's own window. For the repo's
+    /// main checkout, where the user's own editor/shell windows usually sit too — a close
+    /// must not take those down just because they're `cd`'d into the repo.
+    Owned { session: &'a str },
+}
+
+/// The windows a close (`X`) tears down, top window first; the worktree itself is kept.
+///
+/// `scope` picks the base set (see `CloseScope`); the window of `own_pane` (a live
+/// agent's pane, resolved against `panes` by id — never a stale index) is always added.
+/// For `Rooted`, windows of worktrees nested inside the path (`guard.other_roots`) are
+/// excluded. Refused when a window to close holds Hydra's own pane (`guard.self_pane`),
+/// or when the set covers every window of the client's session (`guard.client_session`)
+/// — that would destroy the session the popup is open on. An empty set is
+/// `NothingOpen`, so the UI can say so instead of asking to confirm a no-op.
+pub fn windows_to_close(
+    panes: &[Pane],
+    path: &str,
+    own_pane: Option<&str>,
+    scope: CloseScope,
+    guard: CloseGuard,
+) -> Result<Vec<(String, u32)>, CloseRefusal> {
+    let base = match scope {
+        CloseScope::Rooted => windows_under_path_except(panes, path, guard.other_roots),
+        CloseScope::Owned { session } => {
+            let mut out: Vec<(String, u32)> = Vec::new();
+            for p in panes.iter().filter(|p| p.session_name == session) {
+                let key = (p.session_name.clone(), p.window_index);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+            out
+        }
+    };
+    let wins = with_own_top_first(base, own_window(panes, own_pane));
+    if wins.is_empty() {
+        return Err(CloseRefusal::NothingOpen);
+    }
+    if let Some(me) = guard
+        .self_pane
+        .and_then(|id| panes.iter().find(|p| p.pane_id == id))
+    {
+        if wins.contains(&(me.session_name.clone(), me.window_index)) {
+            return Err(CloseRefusal::HostsSelf);
+        }
+    }
+    if let Some(client) = guard.client_session {
+        let mut session_windows: Vec<u32> = panes
+            .iter()
+            .filter(|p| p.session_name == client)
+            .map(|p| p.window_index)
+            .collect();
+        session_windows.sort_unstable();
+        session_windows.dedup();
+        let covered = session_windows
+            .iter()
+            .all(|w| wins.contains(&(client.to_string(), *w)));
+        if !session_windows.is_empty() && covered {
+            return Err(CloseRefusal::WholeClientSession);
+        }
+    }
+    Ok(wins)
 }
 
 #[cfg(test)]
@@ -611,6 +991,125 @@ mod tests {
     }
 
     #[test]
+    fn filter_matches_the_worktree_folder_and_session_name() {
+        let mut a = agent_with(
+            "%1",
+            Status::Idle,
+            1,
+            Some(("/a/.git", "svc", Some("CET-1/feat/partner-service"))),
+        );
+        a.worktree.as_mut().unwrap().root = "/tree/CET-1-feat-partner-identity".into();
+        a.pane.session_name = "svc-CET-1-feat-partner-service".into();
+        assert!(matches_filter(&a, "IDENTITY"), "folder basename matches");
+        assert!(matches_filter(&a, "svc-cet-1"), "session name matches");
+        assert!(
+            !matches_filter(&a, "tree/"),
+            "only the folder name, not the path"
+        );
+    }
+
+    #[test]
+    fn folder_hint_only_when_the_folder_isnt_the_branch() {
+        // Folder named for another branch: worth showing.
+        assert_eq!(
+            folder_hint(
+                Some("CET-3200/feat/cet-3723-partner-service"),
+                "/w/tree/CET-3200-feat-cet-3723-partner-identity",
+                "svc"
+            ),
+            Some("CET-3200-feat-cet-3723-partner-identity".into())
+        );
+        // Folder is the sanitized branch (how hydra names them): redundant.
+        assert_eq!(
+            folder_hint(Some("feat/x y"), "/w/tree/feat-x-y/", "svc"),
+            None
+        );
+        // Main checkout: the folder is the repo name, already in the group header.
+        assert_eq!(folder_hint(Some("main"), "/code/svc", "svc"), None);
+        // Detached: the label already is the folder.
+        assert_eq!(folder_hint(None, "/w/tree/pr-1", "svc"), None);
+    }
+
+    #[test]
+    fn display_session_drops_the_repo_prefix_only() {
+        assert_eq!(
+            display_session("cet-services-CET-3200-feat-x", Some("cet-services")),
+            "CET-3200-feat-x"
+        );
+        // Dots in the repo name were made tmux-safe in the session name.
+        assert_eq!(display_session("my-app-feat", Some("my.app")), "feat");
+        assert_eq!(display_session("main", Some("cet-services")), "main");
+        assert_eq!(display_session("svc-", Some("svc")), "svc-");
+        assert_eq!(display_session("svc-x", None), "svc-x");
+    }
+
+    #[test]
+    fn row_widths_give_names_full_width_when_there_is_room() {
+        let w = row_widths(140, 30, 80);
+        assert_eq!(
+            w,
+            RowWidths {
+                place: 30,
+                name: 80,
+                detail: 30
+            }
+        );
+    }
+
+    #[test]
+    fn row_widths_shrink_place_then_detail_before_name() {
+        // 10 short: all taken from the place cell.
+        let w = row_widths(120, 30, 80);
+        assert_eq!((w.place, w.name, w.detail), (20, 80, ROW_DETAIL_MIN));
+        // Place bottoms out at its minimum, then the trailing cell yields down to its
+        // floor before the name loses a column.
+        let w = row_widths(60, 30, 80);
+        assert_eq!(w.place, ROW_PLACE_MIN);
+        assert_eq!(w.detail, ROW_DETAIL_FLOOR);
+        assert_eq!(w.name, 60 - ROW_PLACE_MIN - ROW_DETAIL_FLOOR);
+        // A 38-char branch fits once the place is at its minimum, at the cost of detail.
+        let w = row_widths(60, 40, 38);
+        assert_eq!((w.place, w.name, w.detail), (ROW_PLACE_MIN, 38, 14));
+        // Short wants are never padded up to the minimums.
+        let w = row_widths(100, 6, 10);
+        assert_eq!((w.place, w.name, w.detail), (6, 10, 84));
+    }
+
+    #[test]
+    fn row_widths_never_exceed_the_available_width() {
+        for avail in 0..80 {
+            let w = row_widths(avail, 40, 90);
+            assert_eq!(w.place + w.name + w.detail, avail, "avail {avail}");
+        }
+    }
+
+    #[test]
+    fn fit_place_keeps_the_window_suffix() {
+        assert_eq!(fit_place("feat-x", ":3", 20), "feat-x:3");
+        assert_eq!(fit_place("CET-3200-feat-partner", ":3", 10), "CET-320…:3");
+        assert!(fit_place("CET-3200-feat-partner", ":3", 10).chars().count() <= 10);
+    }
+
+    #[test]
+    fn fit_name_truncates_the_hint_before_the_label() {
+        let full = fit_name("feat/a", Some("folder-b"), 40);
+        assert_eq!(full, ("feat/a".into(), " · folder-b".into()));
+        let short = fit_name("feat/a", Some("folder-bbbbbbbb"), 14);
+        assert_eq!(short.0, "feat/a");
+        assert_eq!(short.0.chars().count() + short.1.chars().count(), 14);
+        // No useful room for the hint: dropped, label intact.
+        assert_eq!(
+            fit_name("feat/a", Some("folder-b"), 9),
+            ("feat/a".into(), String::new())
+        );
+        // Label too long: truncated, no hint.
+        assert_eq!(
+            fit_name("feat/abcdef", Some("x"), 6),
+            ("feat/…".into(), String::new())
+        );
+    }
+
+    #[test]
     fn joins_only_panes_that_still_exist() {
         let states = vec![
             state("%1", Status::Idle, 100),
@@ -740,13 +1239,21 @@ mod tests {
 
     #[test]
     fn windows_to_kill_adds_the_agents_own_window_when_its_cwd_diverged() {
-        let panes = vec![kill_pane("%1", "repo-feat", 1, "/root/wt-a")];
-        // Agent's pane reports a different cwd (symlink divergence), so it isn't matched
-        // by path — it still has to die before git removes the worktree.
-        let got = windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 7)));
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            // Agent's pane reports a different cwd (symlink divergence), so it isn't
+            // matched by path — it still has to die before git removes the worktree.
+            kill_pane("%7", "repo-feat", 7, "/private/root/wt-a"),
+        ];
+        let got = windows_to_kill(&panes, "/root/wt-a", Some("%7"));
         assert_eq!(
             got,
             vec![("repo-feat".to_string(), 7), ("repo-feat".to_string(), 1)]
+        );
+        // The agent's pane already gone: nothing extra is killed.
+        assert_eq!(
+            windows_to_kill(&panes[..1], "/root/wt-a", Some("%7")),
+            vec![("repo-feat".to_string(), 1)]
         );
     }
 
@@ -757,8 +1264,264 @@ mod tests {
             kill_pane("%2", "repo-feat", 2, "/root/wt-a/src"),
         ];
         assert_eq!(
-            windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 2))),
+            windows_to_kill(&panes, "/root/wt-a", Some("%1")),
             vec![("repo-feat".to_string(), 2)]
         );
+    }
+
+    #[test]
+    fn windows_to_close_returns_every_rooted_window_top_first() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"), // shell
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"), // extra window (diff)
+            kill_pane("%3", "repo-feat", 3, "/root/wt-a"), // agent
+            kill_pane("%4", "other", 1, "/elsewhere"),
+        ];
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Ok(vec![
+                ("repo-feat".to_string(), 3),
+                ("repo-feat".to_string(), 2),
+                ("repo-feat".to_string(), 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn windows_to_close_reports_nothing_open() {
+        let panes = vec![kill_pane("%1", "other", 1, "/elsewhere")];
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Err(CloseRefusal::NothingOpen)
+        );
+    }
+
+    #[test]
+    fn windows_to_close_includes_a_live_agents_own_window() {
+        let panes = vec![kill_pane("%4", "repo-feat", 4, "/somewhere/else")];
+        let got = windows_to_close(
+            &panes,
+            "/root/wt-a",
+            Some("%4"),
+            CloseScope::Rooted,
+            CloseGuard::default(),
+        );
+        assert_eq!(got, Ok(vec![("repo-feat".to_string(), 4)]));
+    }
+
+    #[test]
+    fn windows_to_close_refuses_to_kill_hydras_own_window() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            // Hydra itself runs in a pane of window 2 (cwd elsewhere, same window).
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"),
+            kill_pane("%9", "repo-feat", 2, "/tmp"),
+        ];
+        let me = CloseGuard {
+            self_pane: Some("%9"),
+            ..CloseGuard::default()
+        };
+        assert_eq!(
+            windows_to_close(&panes, "/root/wt-a", None, CloseScope::Rooted, me),
+            Err(CloseRefusal::HostsSelf)
+        );
+        // Hydra's pane in an unrelated window doesn't block the close.
+        let panes2 = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            kill_pane("%9", "home", 1, "/tmp"),
+        ];
+        assert!(windows_to_close(&panes2, "/root/wt-a", None, CloseScope::Rooted, me).is_ok());
+    }
+
+    #[test]
+    fn windows_to_close_on_the_main_checkout_spares_nested_worktrees() {
+        let panes = vec![
+            kill_pane("%1", "main", 1, "/repo"),
+            kill_pane("%2", "main", 2, "/repo/src"),
+            kill_pane("%3", "repo-x", 1, "/repo/.claude/worktrees/x"),
+            kill_pane("%4", "repo-y", 1, "/repo/.worktrees/y/src"),
+            kill_pane("%5", "other", 1, "/repo-other"),
+        ];
+        let others = vec![
+            "/repo".to_string(), // the closed path itself is not "nested"
+            "/repo/.claude/worktrees/x".to_string(),
+            "/repo/.worktrees/y".to_string(),
+        ];
+        let guard = CloseGuard {
+            other_roots: &others,
+            ..CloseGuard::default()
+        };
+        assert_eq!(
+            windows_to_close(&panes, "/repo", None, CloseScope::Rooted, guard),
+            Ok(vec![("main".to_string(), 2), ("main".to_string(), 1)])
+        );
+        // Closing the nested worktree itself still finds its window.
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/repo/.claude/worktrees/x",
+                None,
+                CloseScope::Rooted,
+                guard
+            ),
+            Ok(vec![("repo-x".to_string(), 1)])
+        );
+    }
+
+    #[test]
+    fn windows_to_close_refuses_to_destroy_the_client_session() {
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            kill_pane("%2", "repo-feat", 2, "/root/wt-a"),
+            kill_pane("%3", "home", 1, "/tmp"),
+        ];
+        let attached = |s| CloseGuard {
+            client_session: Some(s),
+            ..CloseGuard::default()
+        };
+        // The popup is open on the worktree's own session: every window would go.
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                attached("repo-feat")
+            ),
+            Err(CloseRefusal::WholeClientSession)
+        );
+        // Attached elsewhere: fine.
+        assert!(windows_to_close(
+            &panes,
+            "/root/wt-a",
+            None,
+            CloseScope::Rooted,
+            attached("home")
+        )
+        .is_ok());
+        // Attached to a session that keeps another window: fine too.
+        let mut more = panes.clone();
+        more.push(kill_pane("%4", "repo-feat", 3, "/elsewhere"));
+        assert!(windows_to_close(
+            &more,
+            "/root/wt-a",
+            None,
+            CloseScope::Rooted,
+            attached("repo-feat")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn windows_to_close_resolves_the_agents_window_from_the_fresh_listing() {
+        // When X was pressed the agent sat in window 4 and an editor in 5. Window 2
+        // closed during the prompt and `renumber-windows` shifted them to 3 and 4: the
+        // stale (work, 4) would now name the editor. Planning by pane id kills the
+        // agent's real window, never a stale index.
+        let panes = vec![
+            kill_pane("%1", "work", 1, "/home"),
+            kill_pane("%5", "work", 3, "/elsewhere"), // the agent, renumbered 4 -> 3
+            kill_pane("%6", "work", 4, "/home/editor"), // the editor, renumbered 5 -> 4
+        ];
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                Some("%5"),
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Ok(vec![("work".to_string(), 3)])
+        );
+        // The agent's pane is gone entirely: nothing to kill, not some other window.
+        let gone = vec![panes[0].clone(), panes[2].clone()];
+        assert_eq!(
+            windows_to_close(
+                &gone,
+                "/root/wt-a",
+                Some("%5"),
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Err(CloseRefusal::NothingOpen)
+        );
+    }
+
+    #[test]
+    fn owned_close_on_the_main_checkout_spares_the_users_own_windows() {
+        let panes = vec![
+            // The user's working session, rooted at the main checkout.
+            kill_pane("%1", "work", 1, "/repo"),
+            kill_pane("%2", "work", 2, "/repo/src"), // editor
+            kill_pane("%3", "work", 3, "/repo"),     // the agent (window mode)
+            kill_pane("%4", "home", 1, "/tmp"),
+        ];
+        let scope = CloseScope::Owned {
+            session: "repo-main",
+        };
+        assert_eq!(
+            windows_to_close(&panes, "/repo", Some("%3"), scope, CloseGuard::default()),
+            Ok(vec![("work".to_string(), 3)]),
+            "only the agent's window; the editor and shell stay"
+        );
+        // No agent and no dedicated session: nothing of Hydra's is open there.
+        assert_eq!(
+            windows_to_close(&panes, "/repo", None, scope, CloseGuard::default()),
+            Err(CloseRefusal::NothingOpen)
+        );
+        // Session mode: the dedicated session's windows all go, whatever their cwd.
+        let mut with_session = panes.clone();
+        with_session.push(kill_pane("%5", "repo-main", 1, "/repo"));
+        with_session.push(kill_pane("%6", "repo-main", 2, "/repo/sub"));
+        assert_eq!(
+            windows_to_close(&with_session, "/repo", None, scope, CloseGuard::default()),
+            Ok(vec![
+                ("repo-main".to_string(), 2),
+                ("repo-main".to_string(), 1)
+            ])
+        );
+    }
+
+    #[test]
+    fn close_refusal_messages() {
+        assert_eq!(
+            CloseRefusal::NothingOpen.message("feat"),
+            "no open windows for feat"
+        );
+        assert!(CloseRefusal::WholeClientSession
+            .message("feat")
+            .contains("attached"));
+    }
+
+    #[test]
+    fn preview_titles_keep_the_full_name_and_move_the_folder_down() {
+        let label = "CET-3200/feat/cet-3723-partner-service";
+        let folder = "CET-3200-feat-cet-3723-partner-identity";
+        let hint = Some(folder);
+        // Wide: everything on one line.
+        let (top, bottom) = preview_titles(Some(3), label, hint, 200);
+        assert_eq!(top, format!("preview · win 3 · {label} · {}", folder));
+        assert_eq!(bottom, None);
+        // The user's preview width (~54 columns of room): `win N` dropped, full label on
+        // top, the folder on the bottom border.
+        let (top, bottom) = preview_titles(Some(3), label, hint, 54);
+        assert_eq!(top, format!("preview · {label}"));
+        assert_eq!(bottom, Some(format!("folder {}", folder)));
+        // Too narrow even for the label: the label wins over the prefix.
+        let (top, _) = preview_titles(Some(3), label, None, 20);
+        assert_eq!(top.chars().count(), 20);
+        assert!(top.starts_with("CET-3200/"));
     }
 }

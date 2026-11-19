@@ -136,6 +136,7 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `n` | spawn a new agent: worktree + tmux window running `claude` (`name: prompt` gives it its first task) |
 | `c` | resume the selected idle worktree's last conversation (`claude --continue`) |
 | `x` | remove the selected worktree (confirm with `y`) |
+| `X` | close the selected worktree's tmux windows/session but keep the worktree (confirm with `y`) |
 | `p` | toggle the preview pane |
 | `s` | toggle scope: this repo (across all sessions) ⟷ every session on this tmux server |
 | `/` | filter (branch / repo / summary / window) |
@@ -176,6 +177,17 @@ Linux/BSD). Set `HYDRA_ALERTS=0` to disable.
 worktree has a running agent, its tmux window is killed first. Uncommitted changes are
 surfaced in the prompt and require confirming a forced removal. The **branch is kept**
 (`git worktree remove` only) and the main/current worktree can't be removed.
+
+### Closing without removing
+
+`X` closes the selected row's tmux windows — every window rooted in the worktree, so in
+`spawn_mode = "session"` the whole dedicated session (shell, extra windows, agent) goes —
+after a `y/N` confirm, and **keeps the worktree and branch on disk**. The row then shows
+up as an idle worktree, ready for `Enter`/`c` later. It works on agent and idle-worktree
+rows alike. On the repo's main checkout, where your own editor and shell windows usually
+live, it closes only what Hydra owns: the agent's window and the checkout's dedicated
+session, if any. If nothing is open for that worktree Hydra says so instead of asking. It refuses to close the worktree Hydra is running in or the
+window hosting Hydra's own pane.
 
 ### Spawning agents
 
@@ -275,10 +287,10 @@ command = "revdiff --no-confirm-reload {base}"
 
 That gives each worktree session three windows: shell (1), diff (2), agent (3). `{base}`
 expands to the repo's default branch, so the diff covers everything the branch changed,
-committed or not. Each command runs under `/bin/sh` (not your login shell) in a restart
-loop: quitting the tool relaunches it with fresh state instead of closing the window,
-and `Ctrl-C` exits the loop. Entries are created in order; one with an empty `command`
-is skipped.
+committed or not. Each command runs once under `/bin/sh` (not your login shell):
+quitting the tool closes its window. Set `restart = true` on an entry to relaunch the
+tool with fresh state whenever it exits instead (a restart loop; `Ctrl-C` exits it).
+Entries are created in order; one with an empty `command` is skipped.
 
 ## How it works
 
