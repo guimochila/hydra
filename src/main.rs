@@ -225,13 +225,10 @@ fn list_command() -> std::io::Result<()> {
     let now = now_secs();
     let width = term_width();
     for a in &overview.agents {
-        // Branch, falling back to the tmux window name for an agent outside a worktree —
-        // same fallback the popup's rows use.
-        let branch = a
-            .worktree
-            .as_ref()
-            .and_then(|w| w.branch.clone())
-            .unwrap_or_else(|| a.pane.window_name.clone());
+        // Branch (the tmux window name outside a worktree) plus a differing worktree
+        // folder — the same name cell the popup's rows use.
+        let (label, hint) = agent::agent_name(a);
+        let branch = ls_name(&label, hint.as_deref());
         let dirty = if a.dirty > 0 {
             format!("Δ{}", a.dirty)
         } else {
@@ -258,7 +255,10 @@ fn list_command() -> std::io::Result<()> {
                 "○",
                 "—",
                 "—",
-                &agent::worktree_label(w),
+                &{
+                    let (label, hint) = agent::worktree_name(w);
+                    ls_name(&label, hint.as_deref())
+                },
                 &ls_badge(w.state),
                 &w.path,
                 width,
@@ -266,6 +266,15 @@ fn list_command() -> std::io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The name cell as plain text: `label · folder` when the folder differs. The label
+/// comes first, so the cell's truncation eats the folder before the branch.
+fn ls_name(label: &str, hint: Option<&str>) -> String {
+    match hint {
+        Some(h) => format!("{label} · {h}"),
+        None => label.to_string(),
+    }
 }
 
 /// The cleanup badge as plain text, matching the popup's wording.

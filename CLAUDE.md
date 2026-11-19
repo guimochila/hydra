@@ -96,7 +96,7 @@ Module map (`src/`):
   `matches_scope` (per-agent predicate; a worktree-less agent never matches `Repo`).
   Also `idle_from` (project worktrees − occupied),
   `matches_filter`/`worktree_matches_filter`, `worktree_label` (branch name, or the
-  directory basename for a detached worktree), `format_age`, and `one_line` (which
+  directory basename for a detached worktree), the list-row name/layout helpers (`folder_hint` — the folder when it isn't the sanitized branch; `display_session` — drops the `<repo>-` prefix for display only; `row_widths`/`fit_place`/`fit_name` — cells sized from the widest value in view, place shrinking before the name), `format_age`, and `one_line` (which
   `detail_text` applies — summaries can be multi-line, and every consumer of that column
   renders a single line).
 - `ui.rs` — the ratatui popup: `Mode` (Normal/Filter/Send/Spawn/Confirm), vim keys, a

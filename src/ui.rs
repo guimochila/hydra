@@ -1165,16 +1165,16 @@ impl App {
             frame.render_widget(empty, list_area);
         } else {
             let now = now_secs();
-            let width = list_area.width;
+            let widths = self.row_widths(list_area.width);
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
                 .map(|row| match row {
                     Row::Header { label, count } => header_row(label, *count, &self.colors),
                     Row::Agent(i) => {
-                        agent_row(&self.view[*i], now, &self.colors, self.all_sessions, width)
+                        agent_row(&self.view[*i], now, &self.colors, self.all_sessions, widths)
                     }
-                    Row::Worktree(i) => worktree_row(&self.idle_view[*i], &self.colors),
+                    Row::Worktree(i) => worktree_row(&self.idle_view[*i], &self.colors, widths),
                 })
                 .collect();
             let list = List::new(items).block(block).highlight_style(
@@ -1196,13 +1196,28 @@ impl App {
         let Some(target) = self.preview_target_for_selection() else {
             return;
         };
-        let title = if let Some(a) = self.selected_agent() {
-            format!(" preview · win {} ", a.pane.window_index)
+        // The title carries the selection's full name (branch + differing folder), so a
+        // name the list row had to truncate is always readable somewhere. Only the
+        // preview pane's own width limits it.
+        let (prefix, name) = if let Some(a) = self.selected_agent() {
+            (
+                format!("preview · win {} · ", a.pane.window_index),
+                Some(agent::agent_name(a)),
+            )
         } else if let Some(w) = self.selected_worktree() {
-            let label = w.branch.clone().unwrap_or_else(|| w.path.clone());
-            format!(" preview · {} ", agent::truncate(&label, 30))
+            ("preview · ".to_string(), Some(agent::worktree_name(w)))
         } else {
-            " preview ".to_string()
+            ("preview".to_string(), None)
+        };
+        let room = (area.width as usize)
+            .saturating_sub(4) // borders + the title's padding spaces
+            .saturating_sub(prefix.chars().count());
+        let title = match name {
+            Some((label, hint)) => {
+                let (label, hint) = agent::fit_name(&label, hint.as_deref(), room);
+                format!(" {prefix}{label}{hint} ")
+            }
+            None => format!(" {prefix} "),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1226,6 +1241,33 @@ impl App {
         let tail: Vec<Line> = text.lines.into_iter().skip(skip).collect();
         let para = ratatui::widgets::Paragraph::new(tail).block(block);
         frame.render_widget(para, area);
+    }
+
+    /// Column widths for the list rows, sized from the widest place/name actually in
+    /// view so every row lines up, then fitted to the list's inner width (see
+    /// `agent::row_widths`): full branch names whenever they fit.
+    fn row_widths(&self, width: u16) -> agent::RowWidths {
+        let mut place_want = 1; // idle rows' "—"
+        let mut name_want = 0;
+        for row in &self.rows {
+            let (label, hint) = match row {
+                Row::Header { .. } => continue,
+                Row::Agent(i) => {
+                    let a = &self.view[*i];
+                    let (session, suffix) = agent_place(a, self.all_sessions);
+                    place_want = place_want.max(session.chars().count() + suffix.chars().count());
+                    agent::agent_name(a)
+                }
+                Row::Worktree(i) => agent::worktree_name(&self.idle_view[*i]),
+            };
+            let hint_len = hint.map_or(0, |h| 3 + h.chars().count());
+            name_want = name_want.max(label.chars().count() + hint_len);
+        }
+        agent::row_widths(
+            (width as usize).saturating_sub(ROW_OVERHEAD),
+            place_want,
+            name_want,
+        )
     }
 
     fn title(&self) -> String {
@@ -1395,20 +1437,63 @@ fn header_row(label: &str, count: usize, colors: &TuiColors) -> ListItem<'static
     ListItem::new(line)
 }
 
+/// Columns a list row spends outside its three variable cells: block borders (2),
+/// indent + glyph (3), the age cell (5) and the two gutters after place and name (2+2).
+const ROW_OVERHEAD: usize = 2 + 3 + 5 + 2 + 2;
+
+/// An agent row's place cell as `(session_or_"win", suffix)`. In all-sessions view it's
+/// `session:window`, with the `<repo>-` prefix dropped (the row already sits under its
+/// repo header — display only, tmux targets keep the real name); otherwise `win N`.
+fn agent_place(a: &Agent, show_session: bool) -> (String, String) {
+    if show_session {
+        let repo = a.worktree.as_ref().map(|w| w.repo_name.as_str());
+        (
+            agent::display_session(&a.pane.session_name, repo).to_string(),
+            format!(":{}", a.pane.window_index),
+        )
+    } else {
+        ("win".to_string(), format!(" {:>2}", a.pane.window_index))
+    }
+}
+
+/// The name cell as spans: the label in `label_style`, then the dimmed ` · folder` hint,
+/// fitted into and padded to `width` (+ the 2-col gutter) so the next column aligns.
+fn name_spans(
+    label: &str,
+    hint: Option<&str>,
+    width: usize,
+    label_style: Style,
+) -> Vec<Span<'static>> {
+    let (label, hint) = agent::fit_name(label, hint, width);
+    let used = label.chars().count() + hint.chars().count();
+    let pad = " ".repeat(width.saturating_sub(used) + 2);
+    vec![
+        Span::styled(label, label_style),
+        Span::raw(hint).dim(),
+        Span::raw(pad),
+    ]
+}
+
 /// An idle worktree with no agent: dimmed, with a "start ⏎" affordance and a badge for
 /// how its HEAD stands against the default branch. `merged` is the strongest "safe to
 /// remove" signal the list can give, so it's reserved for an actual merge — a branch with
 /// no commits yet reads `no commits` instead (see `worktree::BranchState`).
-fn worktree_row(w: &IdleWorktree, colors: &TuiColors) -> ListItem<'static> {
-    let label = agent::worktree_label(w);
+fn worktree_row(
+    w: &IdleWorktree,
+    colors: &TuiColors,
+    widths: agent::RowWidths,
+) -> ListItem<'static> {
+    let (label, hint) = agent::worktree_name(w);
     let mut spans = vec![
         Span::styled("  ○", Style::default().fg(colors.worktree_row)),
-        Span::raw("  —   —      "),
-        Span::styled(
-            format!("{:<24}", agent::truncate(&label, 23)),
-            Style::default().fg(colors.branch).dim(),
-        ),
+        Span::raw(format!("   — {:<pw$}  ", "—", pw = widths.place)),
     ];
+    spans.extend(name_spans(
+        &label,
+        hint.as_deref(),
+        widths.name,
+        Style::default().fg(colors.branch).dim(),
+    ));
     let badge = match w.state {
         Some(BranchState::Merged) => Some(("merged".to_string(), colors.working)),
         Some(BranchState::NoCommits) => Some(("no commits".to_string(), colors.unknown)),
@@ -1441,7 +1526,7 @@ fn agent_row(
     now: u64,
     colors: &TuiColors,
     show_session: bool,
-    width: u16,
+    widths: agent::RowWidths,
 ) -> ListItem<'static> {
     let (color, glyph) = match a.effective_status {
         Status::NeedsInput => (colors.needs_input, a.effective_status.glyph()),
@@ -1450,31 +1535,18 @@ fn agent_row(
         Status::Unknown => (colors.unknown, a.effective_status.glyph()),
     };
 
-    let branch = a
-        .worktree
-        .as_ref()
-        .and_then(|w| w.branch.clone())
-        .unwrap_or_else(|| a.pane.window_name.clone());
-
+    let (label, hint) = agent::agent_name(a);
     let age = agent::format_age(now.saturating_sub(a.state.updated_at));
     // In all-sessions view each row says which session it lives in.
-    let place = if show_session {
-        format!("{}:{}  ", a.pane.session_name, a.pane.window_index)
-    } else {
-        format!("win {:>2}  ", a.pane.window_index)
-    };
+    let (session, suffix) = agent_place(a, show_session);
+    let place = agent::fit_place(&session, &suffix, widths.place);
     let dirty = (a.dirty > 0).then(|| format!("Δ{} ", a.dirty));
 
-    // Truncate the variable cells to the row's actual width: the branch to its
-    // 24-char cell, the detail to whatever is left (long text otherwise overflows
-    // off-screen instead of wrapping — List items are single lines).
-    let branch_cell = format!("{:<24}", agent::truncate(&branch, 23));
-    let fixed = 2 + 1 + 5 // indent + glyph + " age "
-        + place.chars().count()
-        + branch_cell.chars().count()
-        + dirty.as_deref().map_or(0, |d| d.chars().count())
-        + 2; // block borders
-    let budget = (width as usize).saturating_sub(fixed);
+    // Every variable cell is fitted to the row's actual width (List items are single
+    // lines: overflow would run off-screen instead of wrapping).
+    let budget = widths
+        .detail
+        .saturating_sub(dirty.as_deref().map_or(0, |d| d.chars().count()));
     let detail = agent::truncate(&agent::detail_text(a).unwrap_or_default(), budget);
     // The attention message ("needs permission to run Bash") is the row's most
     // actionable text — color it like the status instead of dimming it away.
@@ -1491,9 +1563,14 @@ fn agent_row(
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" {age:>3} "), Style::default().fg(color)),
-        Span::raw(place),
-        Span::styled(branch_cell, Style::default().fg(colors.branch)),
+        Span::raw(format!("{place:<pw$}  ", pw = widths.place)),
     ];
+    spans.extend(name_spans(
+        &label,
+        hint.as_deref(),
+        widths.name,
+        Style::default().fg(colors.branch),
+    ));
     if let Some(d) = dirty {
         spans.push(Span::styled(d, Style::default().fg(colors.dirty)));
     }
@@ -2162,6 +2239,124 @@ mod tests {
             .collect();
         assert!(text.contains("abc123 fix the api"), "preview text rendered");
         assert!(text.contains("feat-x"), "worktree preview titled by branch");
+    }
+
+    /// Render the app into a `w`×`h` in-memory terminal; one String per screen row.
+    fn render_lines(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// The user's real layout: session-per-worktree names, long branches, and a folder
+    /// that holds a different branch than its name says.
+    fn long_name_app() -> App {
+        let mut a = agent(
+            "%1",
+            Status::Working,
+            3,
+            Some((
+                "/svc/.git",
+                "cet-services",
+                "CET-3200/feat/cet-3723-partner-service",
+                "/w/tree/CET-3200-feat-cet-3723-partner-identity",
+            )),
+        );
+        a.pane.session_name = "cet-services-CET-3200-feat-cet-3723-partner-service".into();
+        let mut app = app_with(
+            vec![a],
+            vec![idle_wt(
+                "/w/tree/CET-3200-feat-cet-3723-partner-service",
+                "CET-3200/feat/cet-3723-partner-rpcs",
+                "/svc/.git",
+                "cet-services",
+            )],
+        );
+        app.all_sessions = true;
+        app.show_preview = false;
+        app
+    }
+
+    #[test]
+    fn long_branch_names_render_in_full_at_a_reasonable_width() {
+        let mut app = long_name_app();
+        let text = render_lines(&mut app, 160, 12).join("\n");
+        assert!(
+            text.contains("CET-3200/feat/cet-3723-partner-service"),
+            "agent branch in full:\n{text}"
+        );
+        assert!(
+            text.contains("CET-3200/feat/cet-3723-partner-rpcs"),
+            "idle branch in full:\n{text}"
+        );
+        // The session drops its redundant repo prefix (the row is under that header)
+        // and keeps its window index.
+        assert!(
+            text.contains(" CET-3200-feat-cet-3723-partner-service:3 "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("cet-services-CET"),
+            "repo prefix dropped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_folder_named_for_another_branch_is_shown() {
+        let mut app = long_name_app();
+        let text = render_lines(&mut app, 160, 12).join("\n");
+        assert!(
+            text.contains("· CET-3200-feat-cet-3723-partner-identity"),
+            "agent row names its folder:\n{text}"
+        );
+        // The idle worktree's folder also doesn't match its branch.
+        assert!(
+            text.contains("rpcs · CET-3200-feat-cet-3723-partner-service"),
+            "idle row names its folder:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rows_stay_aligned_and_inside_a_narrow_list() {
+        let mut app = long_name_app();
+        let lines = render_lines(&mut app, 70, 12);
+        for l in &lines {
+            assert_eq!(l.chars().count(), 70);
+        }
+        let text = lines.join("\n");
+        // The branch survives (possibly truncated) and "start ⏎" still fits.
+        assert!(text.contains("CET-3200/feat/"), "{text}");
+        assert!(text.contains("start ⏎"), "{text}");
+    }
+
+    #[test]
+    fn preview_title_shows_the_full_name_of_the_selection() {
+        let mut app = long_name_app();
+        app.show_preview = true;
+        app.move_by(1); // the idle worktree (no tmux capture needed)
+        let text = render_lines(&mut app, 200, 12).join("\n");
+        assert!(
+            text.contains(
+                "preview · CET-3200/feat/cet-3723-partner-rpcs · CET-3200-feat-cet-3723-partner-service"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn filter_finds_an_agent_by_its_folder_name() {
+        let mut app = long_name_app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "partner-identity".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view.len(), 1, "the agent in that folder matches");
+        assert!(app.idle_view.is_empty(), "the other worktree doesn't");
+        assert_eq!(selected_key_of(&app).as_deref(), Some("%1"));
     }
 
     #[test]

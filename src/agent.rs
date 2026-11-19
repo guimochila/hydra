@@ -195,14 +195,170 @@ pub fn worktree_label(wt: &IdleWorktree) -> String {
     }
 }
 
+/// The worktree directory's name when it tells the user something the branch doesn't:
+/// a folder whose name isn't just the branch with `/`/whitespace turned into `-` (the
+/// way hydra names the folders it creates). A worktree checked out into a folder named
+/// for a *different* branch is otherwise unrecognizable — the folder the user sees on
+/// disk appears nowhere in the row. `None` for a detached worktree (its label already
+/// is the folder) and for the repo's main checkout (the folder is the repo name, which
+/// the group header already shows).
+pub fn folder_hint(branch: Option<&str>, path: &str, repo_name: &str) -> Option<String> {
+    let branch = branch?;
+    let folder = basename(path)?;
+    if folder == repo_name || folder == path_safe(branch) {
+        return None;
+    }
+    Some(folder.to_string())
+}
+
+/// Branch → folder-name form (`/` and whitespace → `-`), mirroring how a spawned
+/// worktree's directory is named.
+fn path_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '/' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// The session name as shown under its repo header: a session-per-worktree name is
+/// `<repo>-<branch>` (see `ui::session_name`), and the `<repo>-` half only repeats the
+/// group header while eating the row. Display only — tmux targets keep the real name.
+/// Returned unchanged when the prefix doesn't match or would leave nothing.
+pub fn display_session<'a>(session: &'a str, repo_name: Option<&str>) -> &'a str {
+    let Some(repo) = repo_name else {
+        return session;
+    };
+    // `session_name` turns `.`/`:`/`/`/whitespace in the repo name into `-`.
+    let safe: String = repo
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '.' || c == ':' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    match session.strip_prefix(&format!("{safe}-")) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => session,
+    }
+}
+
+/// Minimum widths the list row's cells shrink to before the trailing text gives way.
+pub const ROW_PLACE_MIN: usize = 8;
+pub const ROW_NAME_MIN: usize = 16;
+/// Floor for the trailing cell (task summary / badge + "start ⏎"): the point of an agent
+/// row, so the place and name cells yield to it first.
+pub const ROW_DETAIL_MIN: usize = 20;
+
+/// Widths of a list row's three variable cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowWidths {
+    pub place: usize,
+    pub name: usize,
+    pub detail: usize,
+}
+
+/// Split `avail` columns between the place, name and trailing cells. Place and name get
+/// what they want (the widest value in the column) when it fits alongside a
+/// `ROW_DETAIL_MIN` trailing cell; otherwise place shrinks first (toward `ROW_PLACE_MIN`)
+/// because the name is how the user recognizes a worktree, then the name (toward
+/// `ROW_NAME_MIN`). On a terminal too narrow even for that, the trailing cell goes first
+/// and place/name are clamped into what's left. Always `place + name + detail <= avail`.
+pub fn row_widths(avail: usize, place_want: usize, name_want: usize) -> RowWidths {
+    let mut place = place_want;
+    let mut name = name_want;
+    let mut over = (place + name + ROW_DETAIL_MIN).saturating_sub(avail);
+    let cut = over.min(place.saturating_sub(ROW_PLACE_MIN));
+    place -= cut;
+    over -= cut;
+    let cut = over.min(name.saturating_sub(ROW_NAME_MIN));
+    name -= cut;
+    place = place.min(avail);
+    name = name.min(avail - place);
+    RowWidths {
+        place,
+        name,
+        detail: avail - place - name,
+    }
+}
+
+/// Fit a `session:window` place into `width`, truncating the session but never the
+/// `:window` suffix (the part that tells two windows of one session apart).
+pub fn fit_place(session: &str, suffix: &str, width: usize) -> String {
+    let full = format!("{session}{suffix}");
+    if full.chars().count() <= width {
+        return full;
+    }
+    let room = width.saturating_sub(suffix.chars().count());
+    if room < 2 {
+        return truncate(&full, width);
+    }
+    format!("{}{suffix}", truncate(session, room))
+}
+
+/// Fit a name cell (`label`, plus an optional folder `hint` rendered as ` · hint`) into
+/// `width`. The label has priority: the hint is truncated (or dropped when there's no
+/// useful room for it) before the label loses a character. Returns `(label, hint_part)`
+/// where `hint_part` already carries its ` · ` separator, so the caller can style the
+/// halves apart and their combined length is `<= width`.
+pub fn fit_name(label: &str, hint: Option<&str>, width: usize) -> (String, String) {
+    let label_len = label.chars().count();
+    if label_len >= width {
+        return (truncate(label, width), String::new());
+    }
+    let Some(hint) = hint else {
+        return (label.to_string(), String::new());
+    };
+    let room = width - label_len;
+    // " · " plus at least a few chars of the hint, or it's just noise.
+    if room < 3 + 4 {
+        return (label.to_string(), String::new());
+    }
+    (
+        label.to_string(),
+        format!(" · {}", truncate(hint, room - 3)),
+    )
+}
+
+/// An agent row's name cell: its branch (the tmux window name outside a worktree), plus
+/// the worktree folder when it differs from the branch (see `folder_hint`).
+pub fn agent_name(a: &Agent) -> (String, Option<String>) {
+    let label = a
+        .worktree
+        .as_ref()
+        .and_then(|w| w.branch.clone())
+        .unwrap_or_else(|| a.pane.window_name.clone());
+    let hint = a
+        .worktree
+        .as_ref()
+        .and_then(|w| folder_hint(w.branch.as_deref(), &w.root, &w.repo_name));
+    (label, hint)
+}
+
+/// An idle worktree row's name cell: `worktree_label` plus the folder hint.
+pub fn worktree_name(wt: &IdleWorktree) -> (String, Option<String>) {
+    (
+        worktree_label(wt),
+        folder_hint(wt.branch.as_deref(), &wt.path, &wt.repo_name),
+    )
+}
+
 /// Last non-empty path segment, or `None` for a path with none (`"/"`, `""`).
-fn basename(path: &str) -> Option<&str> {
+pub fn basename(path: &str) -> Option<&str> {
     path.trim_end_matches('/')
         .rsplit('/')
         .find(|s| !s.is_empty())
 }
 
-/// Filter predicate for an idle worktree (branch / repo / path).
+/// Filter predicate for an idle worktree (branch / repo / path — the path covers the
+/// folder name, which can differ from the branch).
 pub fn worktree_matches_filter(wt: &IdleWorktree, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -261,7 +417,8 @@ pub fn matches_scope(agent: &Agent, scope: &Scope) -> bool {
     }
 }
 
-/// Case-insensitive substring match against branch, repo, task summary and window name.
+/// Case-insensitive substring match against branch, repo, task summary, window name,
+/// session name and the worktree's folder name (which can differ from the branch).
 /// An empty query matches everything.
 pub fn matches_filter(agent: &Agent, query: &str) -> bool {
     if query.is_empty() {
@@ -280,7 +437,13 @@ pub fn matches_filter(agent: &Agent, query: &str) -> bool {
         .unwrap_or("");
     let summary = agent.state.task_summary.as_deref().unwrap_or("");
     let window = agent.pane.window_name.as_str();
-    [branch, repo, summary, window]
+    let session = agent.pane.session_name.as_str();
+    let folder = agent
+        .worktree
+        .as_ref()
+        .and_then(|w| basename(&w.root))
+        .unwrap_or("");
+    [branch, repo, summary, window, session, folder]
         .iter()
         .any(|field| field.to_lowercase().contains(&q))
 }
@@ -608,6 +771,121 @@ mod tests {
         assert!(matches_filter(&a, "alpha"));
         assert!(matches_filter(&a, "cursor"));
         assert!(!matches_filter(&a, "nonexistent"));
+    }
+
+    #[test]
+    fn filter_matches_the_worktree_folder_and_session_name() {
+        let mut a = agent_with(
+            "%1",
+            Status::Idle,
+            1,
+            Some(("/a/.git", "svc", Some("CET-1/feat/partner-service"))),
+        );
+        a.worktree.as_mut().unwrap().root = "/tree/CET-1-feat-partner-identity".into();
+        a.pane.session_name = "svc-CET-1-feat-partner-service".into();
+        assert!(matches_filter(&a, "IDENTITY"), "folder basename matches");
+        assert!(matches_filter(&a, "svc-cet-1"), "session name matches");
+        assert!(
+            !matches_filter(&a, "tree/"),
+            "only the folder name, not the path"
+        );
+    }
+
+    #[test]
+    fn folder_hint_only_when_the_folder_isnt_the_branch() {
+        // Folder named for another branch: worth showing.
+        assert_eq!(
+            folder_hint(
+                Some("CET-3200/feat/cet-3723-partner-service"),
+                "/w/tree/CET-3200-feat-cet-3723-partner-identity",
+                "svc"
+            ),
+            Some("CET-3200-feat-cet-3723-partner-identity".into())
+        );
+        // Folder is the sanitized branch (how hydra names them): redundant.
+        assert_eq!(
+            folder_hint(Some("feat/x y"), "/w/tree/feat-x-y/", "svc"),
+            None
+        );
+        // Main checkout: the folder is the repo name, already in the group header.
+        assert_eq!(folder_hint(Some("main"), "/code/svc", "svc"), None);
+        // Detached: the label already is the folder.
+        assert_eq!(folder_hint(None, "/w/tree/pr-1", "svc"), None);
+    }
+
+    #[test]
+    fn display_session_drops_the_repo_prefix_only() {
+        assert_eq!(
+            display_session("cet-services-CET-3200-feat-x", Some("cet-services")),
+            "CET-3200-feat-x"
+        );
+        // Dots in the repo name were made tmux-safe in the session name.
+        assert_eq!(display_session("my-app-feat", Some("my.app")), "feat");
+        assert_eq!(display_session("main", Some("cet-services")), "main");
+        assert_eq!(display_session("svc-", Some("svc")), "svc-");
+        assert_eq!(display_session("svc-x", None), "svc-x");
+    }
+
+    #[test]
+    fn row_widths_give_names_full_width_when_there_is_room() {
+        let w = row_widths(140, 30, 80);
+        assert_eq!(
+            w,
+            RowWidths {
+                place: 30,
+                name: 80,
+                detail: 30
+            }
+        );
+    }
+
+    #[test]
+    fn row_widths_shrink_place_before_name_and_keep_a_detail_floor() {
+        // 10 short: all taken from the place cell.
+        let w = row_widths(120, 30, 80);
+        assert_eq!((w.place, w.name, w.detail), (20, 80, ROW_DETAIL_MIN));
+        // Place bottoms out at its minimum, then the name gives way.
+        let w = row_widths(60, 30, 80);
+        assert_eq!(w.place, ROW_PLACE_MIN);
+        assert_eq!(w.name, 60 - ROW_PLACE_MIN - ROW_DETAIL_MIN);
+        assert_eq!(w.detail, ROW_DETAIL_MIN);
+        // Short wants are never padded up to the minimums.
+        let w = row_widths(100, 6, 10);
+        assert_eq!((w.place, w.name, w.detail), (6, 10, 84));
+    }
+
+    #[test]
+    fn row_widths_never_exceed_the_available_width() {
+        for avail in 0..80 {
+            let w = row_widths(avail, 40, 90);
+            assert_eq!(w.place + w.name + w.detail, avail, "avail {avail}");
+        }
+    }
+
+    #[test]
+    fn fit_place_keeps_the_window_suffix() {
+        assert_eq!(fit_place("feat-x", ":3", 20), "feat-x:3");
+        assert_eq!(fit_place("CET-3200-feat-partner", ":3", 10), "CET-320…:3");
+        assert!(fit_place("CET-3200-feat-partner", ":3", 10).chars().count() <= 10);
+    }
+
+    #[test]
+    fn fit_name_truncates_the_hint_before_the_label() {
+        let full = fit_name("feat/a", Some("folder-b"), 40);
+        assert_eq!(full, ("feat/a".into(), " · folder-b".into()));
+        let short = fit_name("feat/a", Some("folder-bbbbbbbb"), 14);
+        assert_eq!(short.0, "feat/a");
+        assert_eq!(short.0.chars().count() + short.1.chars().count(), 14);
+        // No useful room for the hint: dropped, label intact.
+        assert_eq!(
+            fit_name("feat/a", Some("folder-b"), 9),
+            ("feat/a".into(), String::new())
+        );
+        // Label too long: truncated, no hint.
+        assert_eq!(
+            fit_name("feat/abcdef", Some("x"), 6),
+            ("feat/…".into(), String::new())
+        );
     }
 
     #[test]
