@@ -571,31 +571,48 @@ fn windows_under_path_except(panes: &[Pane], path: &str, others: &[String]) -> V
     out
 }
 
-/// The full set of windows a worktree removal must tear down, in the order to kill them.
-///
-/// `windows_under_path` plus `own` (a live agent's own window, which must die even if its
-/// pane cwd has diverged from the worktree — we never `git worktree remove` from under a
-/// running agent). Note `own` is the *only* reason to pass anything here: a row without a
-/// live agent still occupies windows (an idle worktree in session mode keeps its shell and
-/// agent windows), and skipping the teardown for those is what orphans a session on a
-/// directory git is about to delete.
-///
-/// Sorted by descending window index: with `renumber-windows on`, killing a low index
-/// renumbers the higher windows down and invalidates the indices we still hold, so we
-/// always take the top window off first.
-pub fn windows_to_kill(
-    panes: &[Pane],
-    path: &str,
+/// The live (session, window) of the pane `pane_id`, resolved against `panes` — the
+/// listing taken right before a kill. A window *index* is not a stable id: with
+/// `renumber-windows on` it shifts whenever a lower window closes, so a (session, index)
+/// captured when the user pressed a key can name an unrelated window by the time they
+/// confirm. The pane id is stable; `None` when the pane is gone.
+pub fn own_window(panes: &[Pane], pane_id: Option<&str>) -> Option<(String, u32)> {
+    let id = pane_id?;
+    panes
+        .iter()
+        .find(|p| p.pane_id == id)
+        .map(|p| (p.session_name.clone(), p.window_index))
+}
+
+/// Push `own` onto `wins` unless already there, then sort top window first (with
+/// `renumber-windows on`, killing a low index renumbers the higher windows down and
+/// invalidates the indices still held, so the top window always goes first).
+fn with_own_top_first(
+    mut wins: Vec<(String, u32)>,
     own: Option<(String, u32)>,
 ) -> Vec<(String, u32)> {
-    let mut out = windows_under_path(panes, path);
     if let Some(own) = own {
-        if !out.contains(&own) {
-            out.push(own);
+        if !wins.contains(&own) {
+            wins.push(own);
         }
     }
-    out.sort_by_key(|w| std::cmp::Reverse(w.1));
-    out
+    wins.sort_by_key(|w| std::cmp::Reverse(w.1));
+    wins
+}
+
+/// The full set of windows a worktree removal must tear down, in the order to kill them.
+///
+/// `windows_under_path` plus the window of `own_pane` (a live agent's pane, which must die
+/// even if its cwd has diverged from the worktree — we never `git worktree remove` from
+/// under a running agent). The agent's window is looked up by pane id in `panes` (see
+/// `own_window`), so a stale index can never pick an unrelated window; a pane that is
+/// already gone adds nothing. A row without a live agent still occupies windows (an idle
+/// worktree in session mode keeps its shell and agent windows), and skipping the teardown
+/// for those is what orphans a session on a directory git is about to delete.
+///
+/// Sorted by descending window index (see `with_own_top_first`).
+pub fn windows_to_kill(panes: &[Pane], path: &str, own_pane: Option<&str>) -> Vec<(String, u32)> {
+    with_own_top_first(windows_under_path(panes, path), own_window(panes, own_pane))
 }
 
 /// Why closing a worktree's windows (`X`, close without removing) was refused.
@@ -639,28 +656,50 @@ pub struct CloseGuard<'a> {
     pub client_session: Option<&'a str>,
 }
 
-/// The windows a close (`X`) tears down: the same set as a removal (`windows_to_kill`,
-/// so session mode loses the whole dedicated session), but the worktree itself is kept.
+/// Which windows count as a worktree's for a close (`X`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseScope<'a> {
+    /// Every window with a pane rooted in the worktree (minus nested worktrees) — the
+    /// same set as a removal. Right for a linked worktree: nothing but its own windows
+    /// lives there.
+    Rooted,
+    /// Only the windows Hydra owns for the worktree: the named dedicated session (session
+    /// mode's `session_name`, when it exists) plus the agent's own window. For the repo's
+    /// main checkout, where the user's own editor/shell windows usually sit too — a close
+    /// must not take those down just because they're `cd`'d into the repo.
+    Owned { session: &'a str },
+}
+
+/// The windows a close (`X`) tears down, top window first; the worktree itself is kept.
 ///
-/// Unlike removal, a close is allowed on the repo's main checkout, so windows of worktrees
-/// nested inside the path (`guard.other_roots`) are excluded. Refused when a window to
-/// close holds Hydra's own pane (`guard.self_pane`), or when the set covers every window
-/// of the client's session (`guard.client_session`) — that would destroy the session
-/// the popup is open on. An empty set is `NothingOpen`, so the UI can say so instead of
-/// asking to confirm a no-op.
+/// `scope` picks the base set (see `CloseScope`); the window of `own_pane` (a live
+/// agent's pane, resolved against `panes` by id — never a stale index) is always added.
+/// For `Rooted`, windows of worktrees nested inside the path (`guard.other_roots`) are
+/// excluded. Refused when a window to close holds Hydra's own pane (`guard.self_pane`),
+/// or when the set covers every window of the client's session (`guard.client_session`)
+/// — that would destroy the session the popup is open on. An empty set is
+/// `NothingOpen`, so the UI can say so instead of asking to confirm a no-op.
 pub fn windows_to_close(
     panes: &[Pane],
     path: &str,
-    own: Option<(String, u32)>,
+    own_pane: Option<&str>,
+    scope: CloseScope,
     guard: CloseGuard,
 ) -> Result<Vec<(String, u32)>, CloseRefusal> {
-    let mut wins = windows_under_path_except(panes, path, guard.other_roots);
-    if let Some(own) = own {
-        if !wins.contains(&own) {
-            wins.push(own);
+    let base = match scope {
+        CloseScope::Rooted => windows_under_path_except(panes, path, guard.other_roots),
+        CloseScope::Owned { session } => {
+            let mut out: Vec<(String, u32)> = Vec::new();
+            for p in panes.iter().filter(|p| p.session_name == session) {
+                let key = (p.session_name.clone(), p.window_index);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+            out
         }
-    }
-    wins.sort_by_key(|w| std::cmp::Reverse(w.1));
+    };
+    let wins = with_own_top_first(base, own_window(panes, own_pane));
     if wins.is_empty() {
         return Err(CloseRefusal::NothingOpen);
     }
@@ -1200,13 +1239,21 @@ mod tests {
 
     #[test]
     fn windows_to_kill_adds_the_agents_own_window_when_its_cwd_diverged() {
-        let panes = vec![kill_pane("%1", "repo-feat", 1, "/root/wt-a")];
-        // Agent's pane reports a different cwd (symlink divergence), so it isn't matched
-        // by path — it still has to die before git removes the worktree.
-        let got = windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 7)));
+        let panes = vec![
+            kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
+            // Agent's pane reports a different cwd (symlink divergence), so it isn't
+            // matched by path — it still has to die before git removes the worktree.
+            kill_pane("%7", "repo-feat", 7, "/private/root/wt-a"),
+        ];
+        let got = windows_to_kill(&panes, "/root/wt-a", Some("%7"));
         assert_eq!(
             got,
             vec![("repo-feat".to_string(), 7), ("repo-feat".to_string(), 1)]
+        );
+        // The agent's pane already gone: nothing extra is killed.
+        assert_eq!(
+            windows_to_kill(&panes[..1], "/root/wt-a", Some("%7")),
+            vec![("repo-feat".to_string(), 1)]
         );
     }
 
@@ -1217,7 +1264,7 @@ mod tests {
             kill_pane("%2", "repo-feat", 2, "/root/wt-a/src"),
         ];
         assert_eq!(
-            windows_to_kill(&panes, "/root/wt-a", Some(("repo-feat".into(), 2))),
+            windows_to_kill(&panes, "/root/wt-a", Some("%1")),
             vec![("repo-feat".to_string(), 2)]
         );
     }
@@ -1231,7 +1278,13 @@ mod tests {
             kill_pane("%4", "other", 1, "/elsewhere"),
         ];
         assert_eq!(
-            windows_to_close(&panes, "/root/wt-a", None, CloseGuard::default()),
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
             Ok(vec![
                 ("repo-feat".to_string(), 3),
                 ("repo-feat".to_string(), 2),
@@ -1244,17 +1297,25 @@ mod tests {
     fn windows_to_close_reports_nothing_open() {
         let panes = vec![kill_pane("%1", "other", 1, "/elsewhere")];
         assert_eq!(
-            windows_to_close(&panes, "/root/wt-a", None, CloseGuard::default()),
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
             Err(CloseRefusal::NothingOpen)
         );
     }
 
     #[test]
     fn windows_to_close_includes_a_live_agents_own_window() {
+        let panes = vec![kill_pane("%4", "repo-feat", 4, "/somewhere/else")];
         let got = windows_to_close(
-            &[],
+            &panes,
             "/root/wt-a",
-            Some(("repo-feat".into(), 4)),
+            Some("%4"),
+            CloseScope::Rooted,
             CloseGuard::default(),
         );
         assert_eq!(got, Ok(vec![("repo-feat".to_string(), 4)]));
@@ -1273,7 +1334,7 @@ mod tests {
             ..CloseGuard::default()
         };
         assert_eq!(
-            windows_to_close(&panes, "/root/wt-a", None, me),
+            windows_to_close(&panes, "/root/wt-a", None, CloseScope::Rooted, me),
             Err(CloseRefusal::HostsSelf)
         );
         // Hydra's pane in an unrelated window doesn't block the close.
@@ -1281,7 +1342,7 @@ mod tests {
             kill_pane("%1", "repo-feat", 1, "/root/wt-a"),
             kill_pane("%9", "home", 1, "/tmp"),
         ];
-        assert!(windows_to_close(&panes2, "/root/wt-a", None, me).is_ok());
+        assert!(windows_to_close(&panes2, "/root/wt-a", None, CloseScope::Rooted, me).is_ok());
     }
 
     #[test]
@@ -1303,12 +1364,18 @@ mod tests {
             ..CloseGuard::default()
         };
         assert_eq!(
-            windows_to_close(&panes, "/repo", None, guard),
+            windows_to_close(&panes, "/repo", None, CloseScope::Rooted, guard),
             Ok(vec![("main".to_string(), 2), ("main".to_string(), 1)])
         );
         // Closing the nested worktree itself still finds its window.
         assert_eq!(
-            windows_to_close(&panes, "/repo/.claude/worktrees/x", None, guard),
+            windows_to_close(
+                &panes,
+                "/repo/.claude/worktrees/x",
+                None,
+                CloseScope::Rooted,
+                guard
+            ),
             Ok(vec![("repo-x".to_string(), 1)])
         );
     }
@@ -1326,15 +1393,105 @@ mod tests {
         };
         // The popup is open on the worktree's own session: every window would go.
         assert_eq!(
-            windows_to_close(&panes, "/root/wt-a", None, attached("repo-feat")),
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                None,
+                CloseScope::Rooted,
+                attached("repo-feat")
+            ),
             Err(CloseRefusal::WholeClientSession)
         );
         // Attached elsewhere: fine.
-        assert!(windows_to_close(&panes, "/root/wt-a", None, attached("home")).is_ok());
+        assert!(windows_to_close(
+            &panes,
+            "/root/wt-a",
+            None,
+            CloseScope::Rooted,
+            attached("home")
+        )
+        .is_ok());
         // Attached to a session that keeps another window: fine too.
         let mut more = panes.clone();
         more.push(kill_pane("%4", "repo-feat", 3, "/elsewhere"));
-        assert!(windows_to_close(&more, "/root/wt-a", None, attached("repo-feat")).is_ok());
+        assert!(windows_to_close(
+            &more,
+            "/root/wt-a",
+            None,
+            CloseScope::Rooted,
+            attached("repo-feat")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn windows_to_close_resolves_the_agents_window_from_the_fresh_listing() {
+        // When X was pressed the agent sat in window 4 and an editor in 5. Window 2
+        // closed during the prompt and `renumber-windows` shifted them to 3 and 4: the
+        // stale (work, 4) would now name the editor. Planning by pane id kills the
+        // agent's real window, never a stale index.
+        let panes = vec![
+            kill_pane("%1", "work", 1, "/home"),
+            kill_pane("%5", "work", 3, "/elsewhere"), // the agent, renumbered 4 -> 3
+            kill_pane("%6", "work", 4, "/home/editor"), // the editor, renumbered 5 -> 4
+        ];
+        assert_eq!(
+            windows_to_close(
+                &panes,
+                "/root/wt-a",
+                Some("%5"),
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Ok(vec![("work".to_string(), 3)])
+        );
+        // The agent's pane is gone entirely: nothing to kill, not some other window.
+        let gone = vec![panes[0].clone(), panes[2].clone()];
+        assert_eq!(
+            windows_to_close(
+                &gone,
+                "/root/wt-a",
+                Some("%5"),
+                CloseScope::Rooted,
+                CloseGuard::default()
+            ),
+            Err(CloseRefusal::NothingOpen)
+        );
+    }
+
+    #[test]
+    fn owned_close_on_the_main_checkout_spares_the_users_own_windows() {
+        let panes = vec![
+            // The user's working session, rooted at the main checkout.
+            kill_pane("%1", "work", 1, "/repo"),
+            kill_pane("%2", "work", 2, "/repo/src"), // editor
+            kill_pane("%3", "work", 3, "/repo"),     // the agent (window mode)
+            kill_pane("%4", "home", 1, "/tmp"),
+        ];
+        let scope = CloseScope::Owned {
+            session: "repo-main",
+        };
+        assert_eq!(
+            windows_to_close(&panes, "/repo", Some("%3"), scope, CloseGuard::default()),
+            Ok(vec![("work".to_string(), 3)]),
+            "only the agent's window; the editor and shell stay"
+        );
+        // No agent and no dedicated session: nothing of Hydra's is open there.
+        assert_eq!(
+            windows_to_close(&panes, "/repo", None, scope, CloseGuard::default()),
+            Err(CloseRefusal::NothingOpen)
+        );
+        // Session mode: the dedicated session's windows all go, whatever their cwd.
+        let mut with_session = panes.clone();
+        with_session.push(kill_pane("%5", "repo-main", 1, "/repo"));
+        with_session.push(kill_pane("%6", "repo-main", 2, "/repo/sub"));
+        assert_eq!(
+            windows_to_close(&with_session, "/repo", None, scope, CloseGuard::default()),
+            Ok(vec![
+                ("repo-main".to_string(), 2),
+                ("repo-main".to_string(), 1)
+            ])
+        );
     }
 
     #[test]

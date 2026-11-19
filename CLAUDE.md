@@ -112,7 +112,10 @@ Module map (`src/`):
   branch), `X` to close a worktree's windows/session but keep the worktree (confirm;
   same window set via the shared `kill_windows` + `agent::windows_to_close`, which
   refuses an empty set or one containing Hydra's own `$TMUX_PANE`; also refuses Hydra's
-  own cwd, but allows the main worktree), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
+  own cwd, but allows the main worktree — there `CloseScope::Owned` limits it to the
+  agent's window + the dedicated session, sparing the user's own windows in the repo;
+  the agent's window is always re-resolved from its pane id at confirm time via
+  `agent::own_window`, never a stale window index), `s` scope toggle (repo-scoped ⟷ all-sessions), and a colored preview
   (agent screen or idle-worktree git summary). The header scope label AND the preview
   text come from the snapshot (`scope_label` / `preview`) — the UI thread does no
   git/tmux work at all; it only tells the worker which `PreviewTarget` is selected.

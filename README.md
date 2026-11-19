@@ -184,8 +184,9 @@ surfaced in the prompt and require confirming a forced removal. The **branch is 
 `spawn_mode = "session"` the whole dedicated session (shell, extra windows, agent) goes —
 after a `y/N` confirm, and **keeps the worktree and branch on disk**. The row then shows
 up as an idle worktree, ready for `Enter`/`c` later. It works on agent and idle-worktree
-rows alike (including the main worktree); if nothing is open for that worktree Hydra
-says so instead of asking. It refuses to close the worktree Hydra is running in or the
+rows alike. On the repo's main checkout, where your own editor and shell windows usually
+live, it closes only what Hydra owns: the agent's window and the checkout's dedicated
+session, if any. If nothing is open for that worktree Hydra says so instead of asking. It refuses to close the worktree Hydra is running in or the
 window hosting Hydra's own pane.
 
 ### Spawning agents
