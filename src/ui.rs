@@ -327,6 +327,8 @@ struct App {
     /// Test seam for the session the popup's client is attached to on a socket;
     /// `None` = `tmux::current_session`.
     client_session_fn: Option<fn(&str) -> Option<String>>,
+    /// Test seam for the pane Hydra itself runs in; `None` = the `TMUX_PANE` env var.
+    self_pane_fn: Option<fn() -> Option<String>>,
     /// Test seam for killing one window (socket, session, index); `None` =
     /// `tmux::kill_window`.
     kill_window_fn: Option<KillWindowFn>,
@@ -1140,7 +1142,10 @@ impl App {
         owned_session: Option<&str>,
     ) -> Result<Vec<(String, u32)>, agent::CloseRefusal> {
         let panes = self.panes_on(socket);
-        let self_pane = std::env::var("TMUX_PANE").ok();
+        let self_pane = match self.self_pane_fn {
+            Some(f) => f(),
+            None => std::env::var("TMUX_PANE").ok(),
+        };
         let client_session = if self.popup_socket().as_deref() == Some(socket) {
             match self.client_session_fn {
                 Some(f) => f(socket),
@@ -1999,6 +2004,8 @@ mod tests {
             // known session, no panes, and kills that are only recorded.
             current_socket_fn: Some(test_socket),
             client_session_fn: Some(|_| None),
+            // Not inside any pane, whatever `TMUX_PANE` the test runner inherited.
+            self_pane_fn: Some(|| None),
             list_panes_fn: Some(no_panes),
             kill_window_fn: Some(record_kill),
             ..App::default()
@@ -2411,6 +2418,23 @@ mod tests {
         assert!(text.contains("worktree is kept"), "{text}");
         press(&mut app, KeyCode::Char('n'));
         assert!(app.mode == Mode::Normal && app.pending_close.is_none());
+    }
+
+    #[test]
+    fn close_refuses_when_hydra_runs_in_one_of_the_windows() {
+        let mut app = app_with(
+            vec![],
+            vec![idle_wt("/wt/feat", "feat", "/repo/main/.git", "main-repo")],
+        );
+        app.list_panes_fn = Some(session_panes);
+        app.self_pane_fn = Some(|| Some("%11".into()));
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.mode != Mode::Confirm && app.pending_close.is_none());
+        let text = rendered(&mut app, 100, 24);
+        assert!(
+            text.contains("can't close the window Hydra is running in"),
+            "{text}"
+        );
     }
 
     #[test]
