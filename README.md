@@ -40,6 +40,9 @@ leaving the popup.
   an agent in it (optionally with its first task: `name: prompt`); `c` resumes an idle
   worktree's last conversation; a `merged`/`↑↓` badge shows which worktrees are safe to
   reap with `x`.
+- 🔀 **Spawn on a pull request** — paste a PR URL into `n` and hydra fetches it into a
+  local branch and gives it the same worktree + windows + agent treatment, forks
+  included. No `gh` needed.
 - 🔔 **Attention alerts** — a desktop notification the moment an agent needs your input,
   so you don't have to babysit the popup.
 - 📊 **Status-line indicator** — a daemon-free `⚠ N NEEDS INPUT` badge in your tmux status
@@ -133,7 +136,7 @@ Open the popup with **`prefix` + `a`** (your tmux prefix, then `a`).
 | `1`–`9` | pick option N of a multi-option prompt (sends the digit) |
 | `i` | send a message to the agent |
 | `I` | interrupt a working agent — sends Escape after a `y/N` confirm |
-| `n` | spawn a new agent: worktree + tmux window running `claude` (`name: prompt` gives it its first task) |
+| `n` | spawn a new agent: worktree + tmux window running `claude` (`name: prompt` gives it its first task; a PR URL fetches that PR first) |
 | `c` | resume the selected idle worktree's last conversation (`claude --continue`) |
 | `x` | remove the selected worktree (confirm with `y`) |
 | `X` | close the selected worktree's tmux windows/session but keep the worktree (confirm with `y`) |
@@ -199,6 +202,35 @@ it is checked out instead of erroring. Worktrees go under `~/work/tree/<name>` b
 default; override with `HYDRA_WORKTREE_ROOT`. Spawning anchors on an existing agent to
 locate the repo and session — or, when there is none yet, on the directory the popup
 was opened from (it just has to be inside a git repo).
+
+### Spawning an agent on a pull request
+
+`n` also takes a pull request, so reviewing one is the same single step as starting a
+feature — paste the URL straight from the browser:
+
+```
+n https://github.com/guimochila/hydra/pull/36
+n https://github.com/guimochila/hydra/pull/36: summarize what this changes and why
+n #36                      # a PR of the repo you are already in
+```
+
+Hydra fetches `refs/pull/36/head` into a local `pr-36` branch, then spawns on that
+branch exactly as it would any other — so in session mode you get the full set:
+worktree, shell, your `extra_windows` (a diff of the PR, if you configured one), and
+`claude`. PRs from forks work: `refs/pull/N/head` lives on the base repo.
+
+Details worth knowing:
+
+- **The remote is chosen by the URL's `owner/repo`, not assumed to be `origin`.** In a
+  fork checkout a PR of the upstream project is fetched from `upstream`. If no remote
+  points at that `owner/repo`, the spawn fails rather than fetching a different repo's
+  PR N. The `#N` form names no repo, so it always means `origin`.
+- **The fetch is not forced.** If the PR was force-pushed since you last fetched it,
+  git rejects the update instead of rewriting your local `pr-36`; delete that branch and
+  spawn again.
+- The branch is named after the PR number, not its head branch: `refs/pull/N/head`
+  doesn't carry the head branch's name, and looking it up would mean a GitHub API call.
+- The URL's host is not hard-coded, so GitHub Enterprise URLs work too.
 
 ## Configuration
 

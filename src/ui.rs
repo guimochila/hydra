@@ -736,15 +736,28 @@ impl App {
     /// agent of a session can be spawned from Hydra too. Input is `name[: prompt]`:
     /// with a prompt, the agent is launched with it as its first task.
     fn spawn_agent(&mut self, input: &str) {
-        let (name, prompt) = parse_spawn_input(input);
-        if name.is_empty() {
-            self.message = Some("spawn needs a name (name[: prompt])".into());
+        let (target, prompt) = parse_spawn_input(input);
+        if matches!(target, SpawnTarget::Name("")) {
+            self.message = Some("spawn needs a name or PR (name|pr-url[: prompt])".into());
             return;
         }
         let Some((socket, session, cwd)) = self.spawn_context() else {
             self.message = Some("spawn needs an agent, or open the popup from a git repo".into());
             return;
         };
+        // A PR becomes an ordinary local branch first; everything below then treats it
+        // exactly like a named spawn whose branch happens to exist already.
+        let name = match target {
+            SpawnTarget::Name(n) => n.to_string(),
+            SpawnTarget::Pr(pr) => match crate::worktree::fetch_pr(&cwd, &pr) {
+                Ok(branch) => branch,
+                Err(e) => {
+                    self.message = Some(format!("fetch failed: {e}"));
+                    return;
+                }
+            },
+        };
+        let name = name.as_str();
         let command = agent_command_with_prompt(&self.config.agent.command, prompt);
         let path = worktree_root(&self.config).join(sanitize(name));
         let path_str = path.display().to_string();
@@ -1550,7 +1563,7 @@ impl App {
                 Span::raw(self.spawn_input.clone()),
                 Span::styled("▊", Style::default().fg(Color::Blue)),
                 Span::raw("  ").dim(),
-                Span::raw("name[: prompt]  ⏎ create worktree+agent  Esc cancel").dim(),
+                Span::raw("name|pr-url[: prompt]  ⏎ create worktree+agent  Esc cancel").dim(),
             ]),
             Mode::Confirm => {
                 let mut spans = if let Some((_, _, window)) = &self.pending_interrupt {
@@ -1910,17 +1923,35 @@ fn sanitize(name: &str) -> String {
     agent::path_safe(name)
 }
 
-/// Split Spawn-mode input into `name` and an optional initial prompt: everything
+/// What a Spawn-mode line asked for: a branch to create, or a pull request to fetch
+/// and then branch from.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnTarget<'a> {
+    Name(&'a str),
+    Pr(crate::pr::PrRef),
+}
+
+/// Split Spawn-mode input into its target and an optional initial prompt: everything
 /// after the FIRST `:` is the task the new agent starts with (branch names can't
 /// contain `:`, so the split is unambiguous). Both sides are trimmed; an empty
 /// prompt means none.
-fn parse_spawn_input(input: &str) -> (&str, Option<&str>) {
+///
+/// A PR reference is matched BEFORE that split, because a pasted URL carries a `:` of
+/// its own in `https://` — splitting first would spawn a branch called `https`.
+fn parse_spawn_input(input: &str) -> (SpawnTarget<'_>, Option<&str>) {
+    if let Some((pr, rest)) = crate::pr::parse_pr_ref(input) {
+        let prompt = rest.trim().trim_start_matches(':').trim();
+        return (SpawnTarget::Pr(pr), (!prompt.is_empty()).then_some(prompt));
+    }
     match input.split_once(':') {
         Some((name, prompt)) => {
             let prompt = prompt.trim();
-            (name.trim(), (!prompt.is_empty()).then_some(prompt))
+            (
+                SpawnTarget::Name(name.trim()),
+                (!prompt.is_empty()).then_some(prompt),
+            )
         }
-        None => (input.trim(), None),
+        None => (SpawnTarget::Name(input.trim()), None),
     }
 }
 
@@ -3288,18 +3319,52 @@ mod tests {
 
     #[test]
     fn parse_spawn_input_splits_name_and_optional_prompt() {
-        assert_eq!(parse_spawn_input("feat-x"), ("feat-x", None));
+        let name = |n| SpawnTarget::Name(n);
+        assert_eq!(parse_spawn_input("feat-x"), (name("feat-x"), None));
         assert_eq!(
             parse_spawn_input("feat-x: fix the api tests"),
-            ("feat-x", Some("fix the api tests"))
+            (name("feat-x"), Some("fix the api tests"))
         );
         // Only the FIRST colon splits; the prompt may contain more.
         assert_eq!(
             parse_spawn_input("feat-x: update README: add usage"),
-            ("feat-x", Some("update README: add usage"))
+            (name("feat-x"), Some("update README: add usage"))
         );
         // Whitespace around both parts is trimmed; an empty prompt is no prompt.
-        assert_eq!(parse_spawn_input("  feat-x :  "), ("feat-x", None));
+        assert_eq!(parse_spawn_input("  feat-x :  "), (name("feat-x"), None));
+    }
+
+    #[test]
+    fn parse_spawn_input_recognizes_a_pull_request() {
+        let pr = |number| {
+            SpawnTarget::Pr(crate::pr::PrRef {
+                repo: Some(("guimochila".into(), "hydra".into())),
+                number,
+            })
+        };
+        // The whole point: the `:` in `https://` must not split the line.
+        assert_eq!(
+            parse_spawn_input("https://github.com/guimochila/hydra/pull/36"),
+            (pr(36), None)
+        );
+        assert_eq!(
+            parse_spawn_input("https://github.com/guimochila/hydra/pull/36: review it"),
+            (pr(36), Some("review it"))
+        );
+        assert_eq!(
+            parse_spawn_input("https://github.com/guimochila/hydra/pull/36/files review it"),
+            (pr(36), Some("review it"))
+        );
+        assert_eq!(
+            parse_spawn_input("#36: review it"),
+            (
+                SpawnTarget::Pr(crate::pr::PrRef {
+                    repo: None,
+                    number: 36
+                }),
+                Some("review it")
+            )
+        );
     }
 
     #[test]
